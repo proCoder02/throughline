@@ -128,7 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks (user_id, status);
 -- Partial index for the email_reminder_worker's hot query -- it only ever
 -- looks at rows where email_sent is still false, so indexing only those
 -- rows keeps the index small and the scan fast even with a large task
--- history built up over time.
+-- history built up over time. testing dev branch
 CREATE INDEX IF NOT EXISTS idx_tasks_pending_email
     ON tasks (reminder_at)
     WHERE email_sent = FALSE AND reminder_at IS NOT NULL;
