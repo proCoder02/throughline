@@ -82,6 +82,19 @@ Notes:
 - For Gmail, use an app password rather than a normal account password if SMTP authentication is required.
 - The app reads these values at startup through python-dotenv.
 
+## Microphone test on Windows
+
+If you want to run the standalone microphone example in [mic_test.py](mic_test.py), use a supported Python version and create a fresh virtual environment:
+
+```bat
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install SpeechRecognition==3.10.3
+```
+
+If the current interpreter is not working, reinstall Python 3.11 or 3.12 from python.org and rerun the commands above.
+
 ## Running the app
 
 Start the Flask application:

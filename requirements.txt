@@ -1,4 +1,12 @@
-Flask==3.0.3
-SpeechRecognition==3.10.3
-python-dotenv==1.0.1
-requests==2.32.3
+flask
+flask-sock
+simple-websocket
+websocket-client
+pyopenssl
+cryptography
+requests
+python-dotenv
+av
+numpy
+tensorflow
+tensorflow-hub
