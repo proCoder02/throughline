@@ -1,4 +1,4 @@
-<!-- <!doctype html>
+﻿<!-- <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1052,6 +1052,8 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-wrap: wrap;
+    gap: 8px 14px;
     padding: 14px 20px;
     background: var(--surface);
     border-bottom: 1px solid var(--line);
@@ -1066,8 +1068,8 @@
   .topbar-brand .mini-wave span:nth-child(2) { height: 14px; animation-delay: -0.3s; }
   .topbar-brand .mini-wave span:nth-child(3) { height: 9px; animation-delay: -0.1s; }
 
-  #userBar { display: flex; align-items: center; gap: 12px; }
-  #whoami { font-size: 13px; color: var(--ink-soft); font-family: var(--font-mono); }
+  #userBar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+  #whoami { font-size: 13px; color: var(--ink-soft); font-family: var(--font-mono); max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .tabs { display: flex; gap: 4px; padding: 10px 20px 0; background: var(--surface); border-bottom: 1px solid var(--line); }
   .tab {
@@ -1105,6 +1107,24 @@
   }
   #newSpeakerLabel { font-family: var(--font-mono); }
 
+  #sessionSpeakers { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  #sessionSpeakers:empty { margin-top: 0; }
+  .speaker-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 6px 5px 12px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 12.5px;
+    background: var(--surface);
+  }
+  .speaker-chip button {
+    padding: 4px 10px;
+    font-size: 11px;
+    min-height: 0;
+  }
+
   #transcript {
     margin-top: 16px;
     padding: 18px;
@@ -1137,6 +1157,31 @@
   .msg.user { background: var(--signal-tint); margin-left: auto; color: var(--signal-dark); }
   .msg.assistant { background: var(--surface); border: 1px solid var(--line); }
 
+  /* ---------- Chat panel (floating, works from any tab) ---------- */
+  #chatToggleBtn.active { background: var(--signal-tint); color: var(--signal-dark); border-color: var(--signal); }
+  #chatPanel {
+    display: none;
+    position: fixed;
+    flex-direction: column;
+    top: 70px;
+    right: 20px;
+    width: 360px;
+    max-width: calc(100vw - 40px);
+    max-height: 70vh;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 20px 48px rgba(20, 22, 31, 0.18);
+    z-index: 30;
+    overflow: hidden;
+    padding: 14px 16px 16px;
+  }
+  #chatPanel:not(.hidden) { display: flex; }
+  #chatPanelHeader { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-display); }
+  #chatPanelHeader button { padding: 4px 10px; min-height: 0; font-size: 15px; }
+  #chatPanelHint { margin-top: 4px; }
+  #chatPanel #chatbox { flex: 1; min-height: 0; }
+
   .task-item, .profile-item {
     border: 1px solid var(--line);
     border-radius: var(--radius-md);
@@ -1160,6 +1205,8 @@
     border: 1.5px solid var(--line);
     background: var(--surface);
     font-size: 13px;
+    min-height: 40px;
+    cursor: pointer;
   }
 
   /* ---------- Mobile ---------- */
@@ -1180,6 +1227,18 @@
       justify-content: space-around;
       z-index: 20;
     }
+
+    #chatPanel {
+      top: auto;
+      bottom: calc(58px + env(safe-area-inset-bottom));
+      left: 0;
+      right: 0;
+      width: 100%;
+      max-width: 100%;
+      max-height: 65vh;
+      border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+      box-shadow: 0 -8px 32px rgba(20, 22, 31, 0.18);
+    }
     .tab {
       flex-direction: column;
       gap: 3px;
@@ -1195,6 +1254,27 @@
     .pipeline-step { width: 100%; max-width: 280px; }
     .auth-form-card { padding: 22px 18px; }
     #app-content textarea#prompt { font-size: 16px; } /* prevents iOS zoom-on-focus */
+    #userBar { width: 100%; justify-content: space-between; }
+    .task-item { flex-wrap: wrap; }
+    .task-item > button { width: 100%; }
+  }
+
+  /* ---------- Very small phones ---------- */
+  @media (max-width: 380px) {
+    .brand { font-size: 28px; }
+    .auth-hero { margin-bottom: 24px; }
+    button { padding: 10px 16px; font-size: 13px; }
+    .panel { padding: 14px; }
+    #whoami { max-width: 40vw; }
+  }
+
+  /* ---------- Desktop / large screens ---------- */
+  @media (min-width: 1024px) {
+    .content { max-width: 880px; padding: 32px 24px 48px; }
+    .panel { padding: 32px; }
+    .topbar { padding: 16px 32px; }
+    #transcript { max-height: 420px; }
+    #chatbox { max-height: 340px; }
   }
 </style>
 </head>
@@ -1252,6 +1332,14 @@
       Throughline
     </div>
     <div id="userBar">
+      <button id="chatToggleBtn" class="secondary small" aria-label="Toggle chat" title="Chat about this conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="width:15px;height:15px;vertical-align:-3px;margin-right:4px;"><path d="M4 4h16v12H8l-4 4V4z"/></svg>Chat
+      </button>
+      <select id="personalizationSelect" title="Personalisation mode">
+        <option value="personal">Personal</option>
+        <option value="office">Office</option>
+        <option value="study">Study</option>
+      </select>
       <span id="whoami"></span>
       <button id="logoutBtn" class="secondary small">Log out</button>
     </div>
@@ -1270,20 +1358,31 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="3.2"/><path d="M5.5 20a6.5 6.5 0 0113 0"/></svg>
       <span class="tab-label">Profiles</span>
     </div>
+    <div class="tab" data-tab="friends" role="tab">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8.5" cy="8" r="3"/><circle cx="17" cy="10" r="2.4"/><path d="M2.5 20a6 6 0 0112 0M13.5 20a5 5 0 018.5-3.5"/></svg>
+      <span class="tab-label">Friends</span>
+    </div>
+    <div class="tab" data-tab="conversations" role="tab">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+      <span class="tab-label">History</span>
+    </div>
   </nav>
 
   <main class="content">
     <section class="panel" id="tab-live">
-      <h1>Speech to text + chatbot</h1>
-      <p class="hint">Click Start Listening and just talk — transcription, speaker detection, and task/profile extraction all happen automatically in the background.</p>
-
+      <h1>Live</h1>
       <div class="row">
         <button id="toggle">Start Listening</button>
         <span id="listeningStatus" class="hint"></span>
       </div>
 
       <div id="newSpeakerPrompt" class="hidden">
-        <strong id="newSpeakerLabel"></strong> — new voice detected. Add their name?
+        <strong id="newSpeakerLabel"></strong> <span id="newSpeakerPromptText">— new voice detected. Who is this?</span>
+        <div class="row" style="margin-top: 10px;">
+          <select id="newSpeakerExisting">
+            <option value="">Someone new...</option>
+          </select>
+        </div>
         <div class="row" style="margin-top: 10px;">
           <input type="text" id="newSpeakerName" placeholder="Name" style="margin-top:0;" />
           <button id="newSpeakerSaveBtn" class="small">Save name</button>
@@ -1291,17 +1390,10 @@
         </div>
       </div>
 
+      <div id="sessionSpeakers"></div>
+
       <div id="transcript" contenteditable="true">Click "Start Listening" to begin.</div>
       <div id="bgStatus" class="hint"></div>
-
-      <h3 style="margin-top: 26px; font-size: 16px;">Chat</h3>
-      <p class="hint" style="margin-top: 2px;">Ask about what's being said so far — it uses the live transcript as context.</p>
-      <div id="chatbox"></div>
-      <div class="row" style="align-items: flex-end;">
-        <textarea id="prompt" rows="2" placeholder="Ask about the ongoing conversation... (Enter to send, Shift+Enter for a new line)" style="flex: 1;"></textarea>
-        <button id="sendBtn" class="small" aria-label="Send" style="width: 44px; height: 44px; font-size: 18px; flex-shrink: 0; padding: 0;">&#8594;</button>
-      </div>
-      <input type="file" id="fileInput" accept=".txt,text/plain" style="margin-top: 10px;" />
     </section>
 
     <section class="panel hidden" id="tab-tasks">
@@ -1326,7 +1418,43 @@
       </div>
       <div id="profileList" style="margin-top: 16px;"></div>
     </section>
+
+    <section class="panel hidden" id="tab-friends">
+      <h1>Friends</h1>
+      <p class="hint">Share your code so a friend can add you, or enter theirs to add them. Once you are friends, you can see how their mood has moved through the day, based on their conversations.</p>
+      <div class="row">
+        <span class="hint">Your code: <strong id="myFriendCode" style="font-family: var(--font-mono);">...</strong></span>
+      </div>
+      <div class="row" style="margin-top: 14px;">
+        <input type="text" id="friendCodeInput" placeholder="Friend's code" style="margin-top:0; max-width: 200px;" />
+        <button id="addFriendBtn" class="small">Add friend</button>
+      </div>
+      <p id="friendAddStatus" class="hint"></p>
+      <div id="friendList" style="margin-top: 16px;"></div>
+    </section>
+
+    <section class="panel hidden" id="tab-conversations">
+      <h1>Conversations</h1>
+      <p class="hint">Every past listening session, kept permanently. Open one to view its transcript and continue chatting about it, or delete it for good.</p>
+      <div class="row">
+        <button id="refreshConversationsBtn" class="secondary small">Refresh</button>
+      </div>
+      <div id="conversationList" style="margin-top: 16px;"></div>
+    </section>
   </main>
+</div>
+
+<div id="chatPanel" class="hidden">
+  <div id="chatPanelHeader">
+    <strong>Chat</strong>
+    <button id="chatPanelCloseBtn" class="secondary small" aria-label="Close chat">&times;</button>
+  </div>
+  <p class="hint" id="chatPanelHint">Ask about what's being said so far — it uses the live transcript as context.</p>
+  <div id="chatbox"></div>
+  <div class="row" style="align-items: flex-end;">
+    <textarea id="prompt" rows="2" placeholder="Ask about the ongoing conversation... (Enter to send, Shift+Enter for a new line)" style="flex: 1;"></textarea>
+    <button id="sendBtn" class="small" aria-label="Send" style="width: 44px; height: 44px; font-size: 18px; flex-shrink: 0; padding: 0;">&#8594;</button>
+  </div>
 </div>
 
 <script>
@@ -1403,6 +1531,10 @@
       appContent.classList.remove('hidden');
       whoami.textContent = 'Logged in as ' + username;
       loadTasks();
+      loadSettings();
+      loadFriends();
+      loadConversations();
+      loadSpeakers();
     }
 
     (async function checkSession() {
@@ -1432,36 +1564,233 @@
     };
 
     // --- Tabs ---
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+      document.querySelectorAll('[id^="tab-"]').forEach(el => el.classList.add('hidden'));
+      document.getElementById('tab-' + name).classList.remove('hidden');
+      if (name === 'tasks') loadTasks();
+      if (name === 'profiles') loadProfiles();
+      if (name === 'friends') loadFriends();
+      if (name === 'conversations') loadConversations();
+    }
     document.querySelectorAll('.tab').forEach(tab => {
-      tab.onclick = () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        document.querySelectorAll('[id^="tab-"]').forEach(el => el.classList.add('hidden'));
-        document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
-        if (tab.dataset.tab === 'tasks') loadTasks();
-        if (tab.dataset.tab === 'profiles') loadProfiles();
-      };
+      tab.onclick = () => switchTab(tab.dataset.tab);
     });
+
+    // --- Personalisation ---
+    const personalizationSelect = document.getElementById('personalizationSelect');
+    personalizationSelect.onchange = async () => {
+      try {
+        await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ personalization: personalizationSelect.value })
+        });
+      } catch (e) {
+        // silent -- next loadSettings() call will reflect the real saved value
+      }
+    };
+
+    async function loadSettings() {
+      try {
+        const res = await fetch('/settings');
+        if (!res.ok) return;
+        const data = await res.json();
+        personalizationSelect.value = data.personalization;
+        document.getElementById('myFriendCode').textContent = data.friend_code;
+      } catch (e) {
+        // leave defaults in place
+      }
+    }
+
+    // --- Friends (mood monitoring) ---
+    const friendList = document.getElementById('friendList');
+    const friendCodeInput = document.getElementById('friendCodeInput');
+    const friendAddStatus = document.getElementById('friendAddStatus');
+    const addFriendBtn = document.getElementById('addFriendBtn');
+
+    addFriendBtn.onclick = async () => {
+      const friend_code = friendCodeInput.value.trim();
+      if (!friend_code) return;
+      addFriendBtn.disabled = true;
+      friendAddStatus.textContent = '';
+      try {
+        const res = await fetch('/friends/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ friend_code })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          friendCodeInput.value = '';
+          friendAddStatus.textContent = 'Added ' + data.friend.username + '.';
+          loadFriends();
+        } else {
+          friendAddStatus.textContent = data.error || 'Could not add that friend.';
+        }
+      } catch (e) {
+        friendAddStatus.textContent = 'Request failed.';
+      } finally {
+        addFriendBtn.disabled = false;
+      }
+    };
+
+    async function loadFriendMood(friendId, container) {
+      try {
+        const res = await fetch(`/friends/${friendId}/mood`);
+        const data = await res.json();
+        const entries = data.entries || [];
+        if (!entries.length) {
+          container.innerHTML = '<span class="empty">No mood data logged yet today.</span>';
+          return;
+        }
+        container.innerHTML = entries.map(e =>
+          new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' -- ' + e.mood_label
+        ).join(' &middot; ');
+      } catch (e) {
+        container.innerHTML = '<span class="empty">Failed to load mood.</span>';
+      }
+    }
+
+    async function loadFriends() {
+      friendList.innerHTML = 'Loading...';
+      try {
+        const res = await fetch('/friends');
+        const friends = await res.json();
+        if (!friends.length) {
+          friendList.innerHTML = '<p class="empty">No friends added yet.</p>';
+          return;
+        }
+        friendList.innerHTML = '';
+        friends.forEach(f => {
+          const div = document.createElement('div');
+          div.className = 'profile-item';
+          div.style.flexDirection = 'column';
+          div.style.alignItems = 'flex-start';
+          div.innerHTML = `<div class="speaker-name">${f.username}</div><div class="task-meta" style="margin-top: 4px;">Mood today: <span id="mood-${f.id}">Loading...</span></div>`;
+          friendList.appendChild(div);
+          loadFriendMood(f.id, div.querySelector(`#mood-${f.id}`));
+        });
+      } catch (e) {
+        friendList.innerHTML = '<p class="empty">Failed to load friends.</p>';
+      }
+    }
 
     // --- Live listening (single button, streams to Deepgram via our backend) ---
     const btn = document.getElementById('toggle');
     const listeningStatus = document.getElementById('listeningStatus');
     const transcript = document.getElementById('transcript');
     const bgStatus = document.getElementById('bgStatus');
+    const chatPanel = document.getElementById('chatPanel');
+    const chatToggleBtn = document.getElementById('chatToggleBtn');
+    const chatPanelCloseBtn = document.getElementById('chatPanelCloseBtn');
     const chatBox = document.getElementById('chatbox');
     const promptInput = document.getElementById('prompt');
-    const fileInput = document.getElementById('fileInput');
     const sendBtn = document.getElementById('sendBtn');
     const newSpeakerPrompt = document.getElementById('newSpeakerPrompt');
     const newSpeakerLabel = document.getElementById('newSpeakerLabel');
     const newSpeakerName = document.getElementById('newSpeakerName');
     const newSpeakerSaveBtn = document.getElementById('newSpeakerSaveBtn');
     const newSpeakerSkipBtn = document.getElementById('newSpeakerSkipBtn');
+    const newSpeakerExisting = document.getElementById('newSpeakerExisting');
+    const newSpeakerPromptText = document.getElementById('newSpeakerPromptText');
+    const sessionSpeakers = document.getElementById('sessionSpeakers');
+    const conversationList = document.getElementById('conversationList');
+
+    // --- Chat panel: a floating overlay (top-right dropdown on desktop,
+    // bottom sheet on phones -- see CSS) reachable from any tab instead of
+    // being stuck inside the Live tab. ---
+    function openChatPanel() {
+      chatPanel.classList.remove('hidden');
+      chatToggleBtn.classList.add('active');
+    }
+    function closeChatPanel() {
+      chatPanel.classList.add('hidden');
+      chatToggleBtn.classList.remove('active');
+    }
+    chatToggleBtn.onclick = () => {
+      if (chatPanel.classList.contains('hidden')) openChatPanel();
+      else closeChatPanel();
+    };
+    chatPanelCloseBtn.onclick = closeChatPanel;
+
+    // --- Conversations (past sessions) ---
+    // Nothing here ever deletes a conversation silently -- only an
+    // explicit Delete click does, and only after confirmation.
+    document.getElementById('refreshConversationsBtn').onclick = loadConversations;
+
+    async function loadConversations() {
+      conversationList.innerHTML = 'Loading...';
+      try {
+        const res = await fetch('/conversations');
+        const conversations = await res.json();
+        if (!conversations.length) {
+          conversationList.innerHTML = '<p class="empty">No conversations yet.</p>';
+          return;
+        }
+        conversationList.innerHTML = '';
+        conversations.forEach(c => {
+          const div = document.createElement('div');
+          div.className = 'task-item';
+          div.innerHTML = `
+            <div>
+              <div>${c.title || 'Untitled conversation'}</div>
+              <div class="task-meta">${new Date(c.created_at).toLocaleString()}</div>
+            </div>
+            <div class="row" style="gap: 6px;">
+              <button class="small" data-action="open">Open</button>
+              <button class="secondary small" data-action="delete">Delete</button>
+            </div>
+          `;
+          div.querySelector('[data-action="open"]').onclick = () => openConversation(c.id);
+          div.querySelector('[data-action="delete"]').onclick = () => deleteConversation(c.id);
+          conversationList.appendChild(div);
+        });
+      } catch (e) {
+        conversationList.innerHTML = '<p class="empty">Failed to load conversations.</p>';
+      }
+    }
+
+    async function openConversation(conversationId) {
+      chatBox.innerHTML = '';
+      currentConversationId = conversationId;
+      switchTab('live');
+      try {
+        const convRes = await fetch(`/conversations/${conversationId}`);
+        if (convRes.ok) {
+          const conv = await convRes.json();
+          transcript.textContent = conv.raw_transcript || '(no transcript)';
+        }
+        const chatRes = await fetch(`/conversations/${conversationId}/chat`);
+        if (chatRes.ok) {
+          const messages = await chatRes.json();
+          messages.forEach(m => addMessage(m.role === 'assistant' ? 'assistant' : 'user', m.content));
+        }
+      } catch (e) {
+        // silent -- transcript/chat panes just stay empty
+      }
+      openChatPanel();
+    }
+
+    async function deleteConversation(conversationId) {
+      if (!confirm('Delete this conversation permanently? This cannot be undone.')) return;
+      try {
+        const res = await fetch(`/conversations/${conversationId}`, { method: 'DELETE' });
+        if (res.ok) {
+          if (currentConversationId === conversationId) {
+            currentConversationId = null;
+            chatBox.innerHTML = '';
+          }
+          loadConversations();
+        }
+      } catch (e) {
+        // silent -- list just stays as it was, user can retry
+      }
+    }
 
     let socket = null;
     let mediaRecorder = null;
     let isListening = false;
-    let uploadedText = '';
     let currentConversationId = null;
     let hadListeningError = false;
 
@@ -1470,17 +1799,71 @@
     let lines = [];
     let speakerNames = {}; // speakerIndex -> name
     let pendingSpeakerIndex = null;
+    let seenSpeakerIndices = new Set();
+    let knownSpeakers = []; // [{id, name}] -- this user's previously-named speakers, across all sessions
 
+    // Newest line at the top -- `lines` itself stays in chronological
+    // order (other code, like the chat context and the final relabeling
+    // on stop, relies on that), only the displayed text is reversed so the
+    // latest speech is visible without scrolling.
     function renderTranscript() {
       transcript.textContent = lines
+        .slice()
+        .reverse()
         .map(l => `${speakerNames[l.speakerIndex] || ('Speaker ' + l.speakerIndex)}: ${l.text}`)
         .join('\n') || 'Click "Start Listening" to begin.';
     }
 
-    function showNewSpeakerPrompt(speakerIndex) {
+    async function loadSpeakers() {
+      try {
+        const res = await fetch('/speakers');
+        if (res.ok) knownSpeakers = await res.json();
+      } catch (e) {
+        // keep whatever list we already had
+      }
+    }
+
+    function populateSpeakerSelect() {
+      newSpeakerExisting.innerHTML = '<option value="">Someone new...</option>';
+      knownSpeakers.forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.name;
+        opt.textContent = s.name;
+        newSpeakerExisting.appendChild(opt);
+      });
+    }
+
+    // Chips for every speaker index detected so far this session, each with
+    // a "Change" button -- covers both fixing a missed/skipped prompt and
+    // remapping a speaker diarization mislabeled mid-conversation, not just
+    // the first-detection moment.
+    function renderSessionSpeakers() {
+      sessionSpeakers.innerHTML = '';
+      [...seenSpeakerIndices].sort((a, b) => a - b).forEach(idx => {
+        const chip = document.createElement('div');
+        chip.className = 'speaker-chip';
+        const span = document.createElement('span');
+        span.textContent = speakerNames[idx] || ('Speaker ' + idx);
+        const changeBtn = document.createElement('button');
+        changeBtn.type = 'button';
+        changeBtn.className = 'secondary small';
+        changeBtn.textContent = 'Change';
+        changeBtn.onclick = () => showNewSpeakerPrompt(
+          idx, '\u2014 who is this, really? Pick the existing person if diarization mislabeled them.'
+        );
+        chip.appendChild(span);
+        chip.appendChild(changeBtn);
+        sessionSpeakers.appendChild(chip);
+      });
+    }
+
+    function showNewSpeakerPrompt(speakerIndex, promptText) {
       pendingSpeakerIndex = speakerIndex;
       newSpeakerLabel.textContent = 'Speaker ' + speakerIndex;
+      newSpeakerPromptText.textContent = promptText || '\u2014 new voice detected. Who is this?';
       newSpeakerName.value = '';
+      populateSpeakerSelect();
+      newSpeakerExisting.value = '';
       newSpeakerPrompt.classList.remove('hidden');
     }
 
@@ -1491,11 +1874,24 @@
 
     function sendRename(speakerIndex, name) {
       speakerNames[speakerIndex] = name;
+      seenSpeakerIndices.add(speakerIndex);
       renderTranscript();
+      renderSessionSpeakers();
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: 'rename_speaker', speaker_index: speakerIndex, name }));
       }
+      // Refresh the known-speakers list so this name (new or existing) is
+      // offered as an option the next time a speaker needs (re)naming.
+      loadSpeakers();
     }
+
+    newSpeakerExisting.onchange = () => {
+      const name = newSpeakerExisting.value;
+      if (name && pendingSpeakerIndex !== null) {
+        sendRename(pendingSpeakerIndex, name);
+        hideNewSpeakerPrompt();
+      }
+    };
 
     newSpeakerSaveBtn.onclick = () => {
       const name = newSpeakerName.value.trim();
@@ -1574,7 +1970,15 @@
             hadListeningError = false;
             lines = [];
             speakerNames = {};
+            seenSpeakerIndices = new Set();
             renderTranscript();
+            renderSessionSpeakers();
+            loadSpeakers(); // refresh known-speaker options for a new session
+            // Starting a live session always begins a brand-new
+            // conversation server-side -- mirror that as a fresh chat pane
+            // (previous chat is not lost, it stays reachable from the
+            // Conversations tab once loadConversations() picks it up).
+            chatBox.innerHTML = '';
           };
 
           socket.onmessage = (event) => {
@@ -1583,7 +1987,21 @@
               lines.push({ speakerIndex: msg.speaker_index, text: msg.line.split(': ').slice(1).join(': ') });
               renderTranscript();
             } else if (msg.type === 'new_speaker') {
-              showNewSpeakerPrompt(msg.speaker_index);
+              seenSpeakerIndices.add(msg.speaker_index);
+              renderSessionSpeakers();
+              // Don't reset a prompt the user is already filling out for
+              // this same index (e.g. they picked it proactively at
+              // session start, before this backend event even arrived).
+              if (pendingSpeakerIndex !== msg.speaker_index) {
+                showNewSpeakerPrompt(msg.speaker_index);
+              }
+            } else if (msg.type === 'session_started') {
+              currentConversationId = msg.conversation_id;
+              loadConversations();
+              // Let the user pick who's talking from their existing
+              // speaker list right away, instead of waiting for the first
+              // words to be transcribed.
+              showNewSpeakerPrompt(0, '— who’s speaking? Pick from your speakers, or skip for now.');
             } else if (msg.type === 'background_update') {
               bgStatus.textContent = `Auto-extracted ${msg.tasks_found} task(s) and notes on ${msg.speakers_found} speaker(s) just now.`;
             } else if (msg.type === 'error') {
@@ -1630,12 +2048,6 @@
       }
     };
 
-    fileInput.onchange = async () => {
-      const file = fileInput.files[0];
-      if (!file) return;
-      uploadedText = await file.text();
-    };
-
     function addMessage(role, text) {
       const div = document.createElement('div');
       div.className = 'msg ' + role;
@@ -1657,7 +2069,6 @@
           body: JSON.stringify({
             prompt,
             transcript: lines.map(l => `${speakerNames[l.speakerIndex] || ('Speaker ' + l.speakerIndex)}: ${l.text}`).join('\n'),
-            uploadedText,
             conversation_id: currentConversationId
           })
         });

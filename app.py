@@ -2381,6 +2381,7 @@
 import os
 import re
 import json
+import secrets
 import threading
 import time
 import smtplib
@@ -2409,9 +2410,6 @@ sock = Sock(app)
 # Set a real, stable secret in your .env for anything beyond local POC use:
 # FLASK_SECRET_KEY=<a long random string>
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
-
-CHAT_HISTORY_DIR = os.path.join(os.path.dirname(__file__), "chat_history")
-os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2484,7 +2482,7 @@ def verify_db_connection():
             )
             tables = {row[0] for row in cur.fetchall()}
             cur.close()
-            required = {"users", "conversations", "tasks", "personality_notes"}
+            required = {"users", "conversations", "tasks", "personality_notes", "mood_logs", "friendships", "chat_messages", "speaker_profiles"}
             missing = required - tables
             if missing:
                 raise RuntimeError(
@@ -2515,6 +2513,82 @@ def serialize_row(row):
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Personalisation modes
+#
+# One mode per user, stored on users.personalization. It steers both the
+# background/analyze LLM prompt (build_analysis_prompt) and the chat system
+# prompt (build_chat_system_prompt) toward the kind of tasks/observations
+# that mode cares about, without touching the underlying extraction pipeline.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PERSONALIZATION = "personal"
+PERSONALIZATION_MODES = {"personal", "office", "study"}
+
+PERSONALIZATION_GUIDANCE = {
+    "personal": (
+        "Personal-use mode: treat tasks as personal to-dos or promises made to "
+        "friends/family, and speaker notes as relationship and communication-style "
+        "observations."
+    ),
+    "office": (
+        "Office-use mode: treat tasks as work action items -- favor clear owners "
+        "and deadlines -- and speaker notes as workplace collaboration behavior "
+        "(e.g. decisiveness, follow-through, meeting conduct)."
+    ),
+    "study": (
+        "Study-use mode: treat tasks as study to-dos (topics to review, "
+        "assignments, exam prep with deadlines), and speaker notes as learning "
+        "behavior (concepts struggled with, questions asked, study habits "
+        "mentioned)."
+    ),
+}
+
+
+def normalize_personalization(value):
+    return value if value in PERSONALIZATION_MODES else DEFAULT_PERSONALIZATION
+
+
+def get_user_personalization(cur, user_id):
+    cur.execute("SELECT personalization FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    mode = row["personalization"] if row else None
+    return normalize_personalization(mode)
+
+
+# ---------------------------------------------------------------------------
+# Friends (mood monitoring)
+#
+# Each user has a short numeric friend_code; entering someone else's code
+# adds both directions of the friendship immediately (no pending/accept
+# step, matching how a code is typically shared -- if you have it, you were
+# meant to have it). Friendship is required before a user's mood_logs can
+# be read by anyone else.
+# ---------------------------------------------------------------------------
+
+FRIEND_CODE_LENGTH = 6
+
+
+def generate_unique_friend_code(cur):
+    for _ in range(20):
+        code = f"{secrets.randbelow(10 ** FRIEND_CODE_LENGTH):0{FRIEND_CODE_LENGTH}d}"
+        cur.execute("SELECT 1 FROM users WHERE friend_code = %s", (code,))
+        if not cur.fetchone():
+            return code
+    raise RuntimeError("Could not generate a unique friend code")
+
+
+def get_or_create_friend_code(db, cur, user_id):
+    cur.execute("SELECT friend_code FROM users WHERE id = %s", (user_id,))
+    code = cur.fetchone()["friend_code"]
+    if code:
+        return code
+    code = generate_unique_friend_code(cur)
+    cur.execute("UPDATE users SET friend_code = %s WHERE id = %s", (code, user_id))
+    db.commit()
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -2785,6 +2859,7 @@ def register():
     username = (data.get("username") or "").strip()
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
+    personalization = normalize_personalization(data.get("personalization"))
 
     if not username or not password:
         return jsonify({"error": "Username and password are required"}), 400
@@ -2800,16 +2875,24 @@ def register():
         return jsonify({"error": "Username is already taken"}), 409
 
     password_hash = generate_password_hash(password)
+    friend_code = generate_unique_friend_code(cur)
     cur.execute(
-        "INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s) RETURNING id",
-        (username, email, password_hash),
+        "INSERT INTO users (username, email, password_hash, personalization, friend_code) "
+        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (username, email, password_hash, personalization, friend_code),
     )
     user_id = cur.fetchone()["id"]
     db.commit()
 
     session["user_id"] = user_id
     session["username"] = username
-    return jsonify({"id": user_id, "username": username, "email": email})
+    return jsonify({
+        "id": user_id,
+        "username": username,
+        "email": email,
+        "personalization": personalization,
+        "friend_code": friend_code,
+    })
 
 
 @app.route("/login", methods=["POST"])
@@ -2847,11 +2930,56 @@ def me():
     return jsonify({"id": session["user_id"], "username": session.get("username")})
 
 
+@app.route("/settings", methods=["GET"])
+@login_required
+def get_settings():
+    db = get_db()
+    cur = dict_cursor(db)
+    user_id = current_user_id()
+    cur.execute("SELECT personalization FROM users WHERE id = %s", (user_id,))
+    personalization = normalize_personalization(cur.fetchone()["personalization"])
+    friend_code = get_or_create_friend_code(db, cur, user_id)
+    return jsonify({"personalization": personalization, "friend_code": friend_code})
+
+
+@app.route("/settings", methods=["POST"])
+@login_required
+def update_settings():
+    data = request.get_json(silent=True) or {}
+    if "personalization" not in data:
+        return jsonify({"error": "personalization is required"}), 400
+    personalization = data.get("personalization")
+    if personalization not in PERSONALIZATION_MODES:
+        return jsonify({"error": f"personalization must be one of {sorted(PERSONALIZATION_MODES)}"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE users SET personalization = %s WHERE id = %s",
+        (personalization, current_user_id()),
+    )
+    db.commit()
+    return jsonify({"ok": True, "personalization": personalization})
+
+
 # ---------------------------------------------------------------------------
 # Speaker parsing
 # ---------------------------------------------------------------------------
 
 SPEAKER_LINE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 _'-]{0,30}):\s+(.*)$")
+
+
+def remember_speaker_profile(cur, user_id, name):
+    """Record `name` as a known speaker for this user, so future "new
+    speaker detected" prompts (in this session or a later one) can offer it
+    as an existing option instead of relying on the name being retyped
+    identically. Safe to call on every rename -- ON CONFLICT DO NOTHING
+    means re-using an existing name is a no-op, not a duplicate/error."""
+    cur.execute(
+        "INSERT INTO speaker_profiles (user_id, name) VALUES (%s, %s) "
+        "ON CONFLICT (user_id, name) DO NOTHING",
+        (user_id, name),
+    )
 
 
 def parse_speakers(raw_text):
@@ -2929,13 +3057,16 @@ def extract_json(text):
 BACKGROUND_ANALYSIS_BATCH_SIZE = int(os.getenv("BACKGROUND_ANALYSIS_BATCH_SIZE", "12"))
 MIN_WORDS_FOR_ANALYSIS = int(os.getenv("MIN_WORDS_FOR_ANALYSIS", "8"))
 
-def build_analysis_prompt():
+def build_analysis_prompt(personalization=DEFAULT_PERSONALIZATION):
     # Injecting the real current time lets the model resolve relative phrases
     # ("Friday", "tomorrow", "in an hour") into an actual timestamp we can
     # schedule a browser reminder against -- without this, "due_date" is just
     # a display string with nothing a scheduler could act on.
     now_local = datetime.now().astimezone()
+    mode_guidance = PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
     return f"""Today is {now_local.strftime('%A, %Y-%m-%d')}, current time {now_local.strftime('%H:%M %Z')}.
+
+{mode_guidance}
 
 Extract from this conversation transcript:
 1. "tasks": action items/commitments. Each:
@@ -2948,11 +3079,71 @@ day is given with no time). Else null. Do not guess if nothing time-related was 
 2. "speakers": per speaker label, up to 3 short behavioral observations grounded only in what \
 they said/how they said it (e.g. "proposed the deadline", "hedged twice"). No diagnoses or \
 clinical/mental-health terms, no motive speculation.
+3. "mood": one object describing the overall emotional tone of THIS transcript for the person \
+recording it -- "label" (a single plain word, e.g. "happy", "stressed", "calm", "frustrated", \
+"excited", "neutral", "sad", "anxious") and "score" (0.0-1.0 intensity/confidence). Base this \
+only on tone and word choice actually present, no diagnoses.
 
 Reply with ONLY this JSON, no preamble/fences:
 {{"tasks": [{{"description": "", "owner": null, "due_date": null, "reminder_at": null}}], \
-"speakers": [{{"label": "", "observations": [""]}}]}}
-Empty lists if none found."""
+"speakers": [{{"label": "", "observations": [""]}}], \
+"mood": {{"label": "neutral", "score": 0.5}}}}
+Empty lists if none found. "mood" is always required."""
+
+
+# Cap how much transcript gets sent for titling -- a topic is normally clear
+# from the opening portion, and this keeps the call cheap even for a very
+# long session.
+TITLE_MAX_CHARS = 6000
+
+
+def generate_conversation_title(raw_transcript):
+    """Asks the LLM for a short (3-4 word) title. Returns None on any
+    failure (missing key, empty transcript, unparseable reply) so the
+    caller can simply leave the existing title (typically null/"Untitled
+    conversation" in the UI) untouched rather than erroring."""
+    text = (raw_transcript or "").strip()
+    if not text:
+        return None
+    try:
+        content = call_llm([
+            {"role": "system", "content": (
+                "Reply with ONLY a short title for this conversation transcript -- "
+                "3 to 4 words maximum, no quotes, no trailing punctuation, no preamble. "
+                "Capture its main topic or purpose."
+            )},
+            {"role": "user", "content": text[:TITLE_MAX_CHARS]},
+        ])
+    except Exception:
+        return None
+    title = (content or "").strip().strip('"').strip("'")
+    title = title.splitlines()[0].strip() if title else ""
+    return title[:80] or None
+
+
+def run_conversation_titling(conversation_id, raw_transcript):
+    """Runs in its own thread with its own pooled connection, same pattern
+    as run_background_analysis -- generating the title is an LLM call and
+    shouldn't hold up the websocket teardown it's triggered from."""
+    title = generate_conversation_title(raw_transcript)
+    if not title:
+        return
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        # title IS NULL guards against overwriting a title this ran on
+        # before (or one a user renames, if that's ever added later).
+        cur.execute(
+            "UPDATE conversations SET title = %s WHERE id = %s AND title IS NULL",
+            (title, conversation_id),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[run_conversation_titling] DB error: {e!r}")
+        conn.rollback()
+    finally:
+        release_raw_connection(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -3057,9 +3248,16 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     websocket so the UI can show it without the user clicking Analyze."""
     if not delta_text.strip():
         return
+
+    conn = get_raw_connection()
+    try:
+        mode = get_user_personalization(dict_cursor(conn), user_id)
+    finally:
+        release_raw_connection(conn)
+
     try:
         content = call_llm([
-            {"role": "system", "content": build_analysis_prompt()},
+            {"role": "system", "content": build_analysis_prompt(mode)},
             {"role": "user", "content": delta_text},
         ])
     except Exception:
@@ -3071,6 +3269,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
 
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
+    mood = parsed.get("mood") or {}
 
     conn = get_raw_connection()
     try:
@@ -3098,6 +3297,13 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
                     "VALUES (%s, %s, %s, %s)",
                     (user_id, conversation_id, label, obs),
                 )
+        mood_label = (mood.get("label") or "").strip()
+        if mood_label:
+            cur.execute(
+                "INSERT INTO mood_logs (user_id, conversation_id, mood_label, mood_score) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, conversation_id, mood_label, mood.get("score")),
+            )
         conn.commit()
         cur.close()
     except Exception as e:
@@ -3136,6 +3342,11 @@ def ws_listen(ws):
     )
     conversation_id = cur.fetchone()["id"]
     db.commit()
+
+    # Tell the frontend which conversation this session writes to, so chat
+    # messages sent during this session get tied to (and permanently stored
+    # under) the right conversation_id instead of going nowhere.
+    ws.send(json.dumps({"type": "session_started", "conversation_id": conversation_id}))
 
     dg_url = (
         "wss://api.deepgram.com/v1/listen"
@@ -3265,6 +3476,12 @@ def ws_listen(ws):
                     if name:
                         with lock:
                             state["known_speakers"][idx] = name
+                        try:
+                            remember_speaker_profile(dict_cursor(db), user_id, name)
+                            db.commit()
+                        except Exception as e:
+                            print(f"[ws_listen] Could not save speaker profile: {e!r}")
+                            db.rollback()
                         push({"type": "speaker_renamed", "speaker_index": idx, "name": name})
                 continue
             try:
@@ -3296,17 +3513,26 @@ def ws_listen(ws):
             leftover = "\n".join(state["pending_lines"])
 
         if final_lines:
+            full_transcript = "\n".join(final_lines)
             conn = get_raw_connection()
             try:
                 cur = conn.cursor()
                 cur.execute(
                     "UPDATE conversations SET raw_transcript = %s WHERE id = %s",
-                    ("\n".join(final_lines), conversation_id),
+                    (full_transcript, conversation_id),
                 )
                 conn.commit()
                 cur.close()
             finally:
                 release_raw_connection(conn)
+            # The conversation just ended -- generate its title now rather
+            # than leaving it null (shown as "Untitled conversation" in the
+            # Conversations tab) forever.
+            threading.Thread(
+                target=run_conversation_titling,
+                args=(conversation_id, full_transcript),
+                daemon=True,
+            ).start()
             if leftover.strip():
                 threading.Thread(
                     target=run_background_analysis,
@@ -3346,10 +3572,11 @@ def analyze_conversation():
     else:
         return jsonify({"error": "transcript or conversation_id is required"}), 400
 
+    mode = get_user_personalization(cur, user_id)
     try:
         content = call_llm(
             [
-                {"role": "system", "content": build_analysis_prompt()},
+                {"role": "system", "content": build_analysis_prompt(mode)},
                 {"role": "user", "content": raw_transcript},
             ]
         )
@@ -3369,6 +3596,7 @@ def analyze_conversation():
 
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
+    mood = parsed.get("mood") or {}
 
     for task in tasks:
         description = (task.get("description") or "").strip()
@@ -3395,6 +3623,14 @@ def analyze_conversation():
                 (user_id, conversation_id, label, obs),
             )
 
+    mood_label = (mood.get("label") or "").strip()
+    if mood_label:
+        cur.execute(
+            "INSERT INTO mood_logs (user_id, conversation_id, mood_label, mood_score) "
+            "VALUES (%s, %s, %s, %s)",
+            (user_id, conversation_id, mood_label, mood.get("score")),
+        )
+
     db.commit()
 
     return jsonify(
@@ -3402,6 +3638,7 @@ def analyze_conversation():
             "conversation_id": conversation_id,
             "tasks": tasks,
             "speakers": speakers,
+            "mood": mood,
         }
     )
 
@@ -3496,71 +3733,217 @@ def list_profiles():
     return jsonify(profiles)
 
 
-CHAT_SYSTEM_PROMPT = (
-    "You are a concise assistant answering questions about a live or saved "
-    "conversation transcript. Be direct: answer what was asked, no restating "
-    "the question, no unnecessary preamble or filler, no padding a short "
-    "answer to sound thorough. Ground every answer in the transcript/context "
-    "provided; if something isn't in it, say so briefly rather than "
-    "guessing. Use the prior exchanges in this chat to resolve follow-up "
-    "references ('he', 'that', 'earlier') instead of asking for "
-    "clarification when it's inferable from context."
-)
+@app.route("/speakers", methods=["GET"])
+@login_required
+def list_speakers():
+    """Every person this user has ever named a speaker as, across all their
+    conversations -- the pick-list the "new speaker detected" prompt (and
+    mid-session remapping) draws from, so diarization mistakenly splitting
+    one real person into a second session-local index doesn't require
+    retyping their name from scratch."""
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id, name FROM speaker_profiles WHERE user_id = %s ORDER BY name",
+        (current_user_id(),),
+    )
+    return jsonify([dict(r) for r in cur.fetchall()])
 
-# Keep only the last N exchanges per conversation -- bounds both the file
-# size and the tokens sent to the LLM on every turn as a chat runs long.
+
+# ---------------------------------------------------------------------------
+# Friends
+# ---------------------------------------------------------------------------
+
+@app.route("/friends", methods=["GET"])
+@login_required
+def list_friends():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT users.id, users.username FROM friendships "
+        "JOIN users ON users.id = friendships.friend_id "
+        "WHERE friendships.user_id = %s ORDER BY users.username",
+        (current_user_id(),),
+    )
+    return jsonify([dict(r) for r in cur.fetchall()])
+
+
+@app.route("/friends/add", methods=["POST"])
+@login_required
+def add_friend():
+    data = request.get_json(silent=True) or {}
+    friend_code = (data.get("friend_code") or "").strip()
+    if not friend_code:
+        return jsonify({"error": "friend_code is required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT id, username FROM users WHERE friend_code = %s", (friend_code,))
+    target = cur.fetchone()
+    if not target:
+        return jsonify({"error": "No user found with that friend code"}), 404
+    if target["id"] == user_id:
+        return jsonify({"error": "You can't add yourself as a friend"}), 400
+
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, target["id"]),
+    )
+    if cur.fetchone():
+        return jsonify({"error": "Already friends"}), 409
+
+    # Both directions, in one transaction -- either both rows land or neither does.
+    cur.execute(
+        "INSERT INTO friendships (user_id, friend_id) VALUES (%s, %s), (%s, %s)",
+        (user_id, target["id"], target["id"], user_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "friend": {"id": target["id"], "username": target["username"]}})
+
+
+@app.route("/friends/<int:friend_id>/mood", methods=["GET"])
+@login_required
+def friend_mood(friend_id):
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    # "Through the day" -- everything logged since local midnight, oldest
+    # first, so the frontend can render it as a timeline rather than just
+    # the latest snapshot.
+    since_local_midnight = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    cur.execute(
+        "SELECT mood_label, mood_score, created_at FROM mood_logs "
+        "WHERE user_id = %s AND created_at >= %s ORDER BY created_at ASC",
+        (friend_id, since_local_midnight),
+    )
+    entries = [serialize_row(r) for r in cur.fetchall()]
+    return jsonify({"friend_id": friend_id, "entries": entries})
+
+
+def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION):
+    return (
+        "You are a concise assistant answering questions about a live or saved "
+        "conversation transcript. Be direct: answer what was asked, no restating "
+        "the question, no unnecessary preamble or filler, no padding a short "
+        "answer to sound thorough. Ground every answer in the transcript/context "
+        "provided; if something isn't in it, say so briefly rather than "
+        "guessing. Use the prior exchanges in this chat to resolve follow-up "
+        "references ('he', 'that', 'earlier') instead of asking for "
+        "clarification when it's inferable from context. "
+        + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
+    )
+
+# Chat history lives permanently in the chat_messages table -- nothing here
+# ever deletes a row. CHAT_HISTORY_MAX_TURNS only bounds how many of the
+# most recent messages get re-sent to the LLM as context on each new turn
+# (cost control), completely separate from what GET /conversations/<id>/chat
+# can read back, which is always the full, untrimmed history.
 CHAT_HISTORY_MAX_TURNS = int(os.getenv("CHAT_HISTORY_MAX_TURNS", "6"))
-_chat_history_lock = threading.Lock()
-
-# In-memory cache in front of the JSON files: a chat that goes back and
-# forth several times would otherwise hit disk on every single turn just to
-# re-read the same handful of messages it wrote a second ago. Cache is
-# per-process (fine here -- one Flask process, multiple threads), keyed by
-# (user_id, conversation_id), holding the same trimmed list that's on disk.
-_chat_history_cache = {}
 
 
-def _chat_history_path(user_id, conversation_id):
-    # Namespaced by user_id so one user can never read or overwrite
-    # another's history file, even if they passed someone else's
-    # conversation_id (the route-level query already blocks reading their
-    # transcript; this just makes the same guarantee hold for history too).
-    return os.path.join(CHAT_HISTORY_DIR, f"{user_id}_{conversation_id}.json")
+def load_chat_context(cur, user_id, conversation_id):
+    cur.execute(
+        "SELECT role, content FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id = %s "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, conversation_id, CHAT_HISTORY_MAX_TURNS * 2),
+    )
+    rows = cur.fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
-def load_chat_history(user_id, conversation_id):
-    cache_key = (user_id, conversation_id)
-    with _chat_history_lock:
-        cached = _chat_history_cache.get(cache_key)
-        if cached is not None:
-            return list(cached)  # copy -- caller mutates this list, cache shouldn't see that until save_chat_history
-
-    path = _chat_history_path(user_id, conversation_id)
-    if not os.path.exists(path):
-        history = []
-    else:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[chat-history] Could not read {path}: {e!r}")
-            history = []
-
-    with _chat_history_lock:
-        _chat_history_cache[cache_key] = list(history)
-    return history
+def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
+    cur.execute(
+        "INSERT INTO chat_messages (user_id, conversation_id, role, content) "
+        "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
+        (user_id, conversation_id, prompt, user_id, conversation_id, reply),
+    )
 
 
-def save_chat_history(user_id, conversation_id, history):
-    path = _chat_history_path(user_id, conversation_id)
-    trimmed = history[-(CHAT_HISTORY_MAX_TURNS * 2):]  # 2 messages (user+assistant) per turn
-    with _chat_history_lock:
-        _chat_history_cache[(user_id, conversation_id)] = list(trimmed)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(trimmed, f)
-        except OSError as e:
-            print(f"[chat-history] Could not write {path}: {e!r}")
+@app.route("/conversations", methods=["GET"])
+@login_required
+def list_conversations():
+    """Past sessions/chats, newest first -- lets the frontend offer a
+    ChatGPT-style history list instead of losing access to a chat the moment
+    a new live-listening session starts (each session is its own
+    conversation row; none of them are ever deleted here)."""
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id, created_at, title FROM conversations WHERE user_id = %s ORDER BY created_at DESC",
+        (current_user_id(),),
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
+
+
+@app.route("/conversations/<int:conversation_id>", methods=["GET"])
+@login_required
+def get_conversation(conversation_id):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id, created_at, title, raw_transcript FROM conversations WHERE id = %s AND user_id = %s",
+        (conversation_id, current_user_id()),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Conversation not found"}), 404
+    return jsonify(serialize_row(row))
+
+
+@app.route("/conversations/<int:conversation_id>/chat", methods=["GET"])
+@login_required
+def get_conversation_chat(conversation_id):
+    """Full, untrimmed chat history for one conversation -- separate from
+    the LLM-context slice /chat uses, so old messages remain readable here
+    no matter how long the chat has run."""
+    db = get_db()
+    cur = dict_cursor(db)
+    user_id = current_user_id()
+    cur.execute(
+        "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
+        (conversation_id, user_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Conversation not found"}), 404
+    cur.execute(
+        "SELECT role, content, created_at FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id = %s ORDER BY created_at ASC",
+        (user_id, conversation_id),
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
+
+
+@app.route("/conversations/<int:conversation_id>", methods=["DELETE"])
+@login_required
+def delete_conversation(conversation_id):
+    """Permanently deletes a conversation and everything scoped to it.
+    chat_messages cascade automatically (FK ON DELETE CASCADE); tasks,
+    personality_notes, and mood_logs keep existing (their conversation_id
+    just goes NULL via ON DELETE SET NULL) since those are meant to
+    outlive any one conversation -- only the conversation/transcript/chat
+    itself goes away."""
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "DELETE FROM conversations WHERE id = %s AND user_id = %s RETURNING id",
+        (conversation_id, current_user_id()),
+    )
+    deleted = cur.fetchone()
+    db.commit()
+    if not deleted:
+        return jsonify({"error": "Conversation not found"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/chat", methods=["POST"])
@@ -3569,7 +3952,6 @@ def chat():
     data = request.get_json(silent=True) or {}
     prompt = (data.get("prompt") or "").strip()
     transcript = (data.get("transcript") or "").strip()
-    uploaded_text = (data.get("uploadedText") or "").strip()
     conversation_id = data.get("conversation_id")
     user_id = current_user_id()
 
@@ -3584,10 +3966,12 @@ def chat():
     def recent(text):
         return text[-MAX_CONTEXT_CHARS:] if len(text) > MAX_CONTEXT_CHARS else text
 
+    db = get_db()
+    cur = dict_cursor(db)
+    mode = get_user_personalization(cur, user_id)
+
     context_parts = []
     if conversation_id:
-        db = get_db()
-        cur = dict_cursor(db)
         cur.execute(
             "SELECT raw_transcript FROM conversations WHERE id = %s AND user_id = %s",
             (conversation_id, user_id),
@@ -3598,17 +3982,15 @@ def chat():
 
     if transcript:
         context_parts.append(f"Live transcript from speech (most recent portion):\n{recent(transcript)}")
-    if uploaded_text:
-        context_parts.append(f"Uploaded text:\n{uploaded_text}")
     context_parts.append(f"User question:\n{prompt}")
     current_turn_content = "\n\n".join(context_parts)
 
-    # Prior exchanges for this conversation, read back from its JSON file --
-    # this is what lets the model resolve "what did he mean by that" style
-    # follow-ups instead of treating every message as a fresh, isolated call.
-    history = load_chat_history(user_id, conversation_id) if conversation_id else []
+    # Prior exchanges for this conversation, read back from the DB -- this is
+    # what lets the model resolve "what did he mean by that" style follow-ups
+    # instead of treating every message as a fresh, isolated call.
+    history = load_chat_context(cur, user_id, conversation_id) if conversation_id else []
 
-    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": build_chat_system_prompt(mode)}]
     messages.extend(history)
     messages.append({"role": "user", "content": current_turn_content})
 
@@ -3635,9 +4017,9 @@ def chat():
         # Store the clean question, not the transcript-laden context blob --
         # the transcript gets freshly re-attached to every call already, so
         # saving it into history too would just duplicate it on every turn.
-        history.append({"role": "user", "content": prompt})
-        history.append({"role": "assistant", "content": reply})
-        save_chat_history(user_id, conversation_id, history)
+        # This insert is permanent; nothing ever prunes chat_messages.
+        append_chat_messages(cur, user_id, conversation_id, prompt, reply)
+        db.commit()
 
     return jsonify({"reply": reply})
 
