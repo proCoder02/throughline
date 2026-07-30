@@ -1,4 +1,7 @@
 flask
+flask-cors
+PyJWT
+psycopg2-binary
 flask-sock
 simple-websocket
 websocket-client

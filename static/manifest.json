@@ -1,0 +1,14 @@
+{
+  "name": "Throughline",
+  "short_name": "Throughline",
+  "description": "Conversation intelligence: live transcription, tasks, and speaker profiles.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F5F6FA",
+  "theme_color": "#5B5FEF",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "/static/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

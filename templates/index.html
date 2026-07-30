@@ -880,6 +880,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Throughline — conversation intelligence</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#5B5FEF">
+<link rel="icon" href="/static/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icons/icon.svg">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1483,6 +1489,39 @@
       authError.textContent = '';
     };
 
+    // --- Token auth (mobile/Capacitor) ---
+    // The web app works fine on the session cookie alone. This token only
+    // matters when the page is loaded from a different origin than the
+    // API (a Capacitor-wrapped build), where that cookie can't cross the
+    // origin boundary -- storing it lets every request carry identity via
+    // an Authorization header instead.
+    const AUTH_TOKEN_KEY = 'authToken';
+    const getAuthToken = () => localStorage.getItem(AUTH_TOKEN_KEY);
+    const setAuthToken = (token) => {
+      if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
+    };
+    const clearAuthToken = () => localStorage.removeItem(AUTH_TOKEN_KEY);
+
+    // Wrap fetch globally, before anything else calls it: attach the
+    // bearer token if we have one, and if a call comes back 401 (session
+    // expired / logged out elsewhere / bad token), drop back to the login
+    // screen instead of silently failing deeper in the app.
+    const _rawFetch = window.fetch;
+    window.fetch = async (input, init = {}) => {
+      const token = getAuthToken();
+      if (token) {
+        init = { ...init, headers: { ...(init.headers || {}), 'Authorization': 'Bearer ' + token } };
+      }
+      const res = await _rawFetch(input, init);
+      if (res.status === 401 && input !== '/me') {
+        clearAuthToken();
+        appContent.classList.add('hidden');
+        authCard.classList.remove('hidden');
+        authError.textContent = 'Session expired, please log in again.';
+      }
+      return res;
+    };
+
     authSubmitBtn.onclick = async () => {
       const username = authUsername.value.trim();
       const email = authEmail.value.trim();
@@ -1506,6 +1545,7 @@
         });
         const data = await res.json();
         if (res.ok) {
+          setAuthToken(data.token);
           showApp(data.username);
         } else {
           authError.textContent = data.error || 'Something went wrong.';
@@ -1519,6 +1559,7 @@
 
     logoutBtn.onclick = async () => {
       await fetch('/logout', { method: 'POST' });
+      clearAuthToken();
       appContent.classList.add('hidden');
       authCard.classList.remove('hidden');
       authUsername.value = '';
@@ -1548,20 +1589,6 @@
         // stay on login screen
       }
     })();
-
-    // Wrap fetch globally: if any call comes back 401 (session expired /
-    // logged out elsewhere), drop back to the login screen instead of
-    // silently failing deeper in the app.
-    const _rawFetch = window.fetch;
-    window.fetch = async (...args) => {
-      const res = await _rawFetch(...args);
-      if (res.status === 401 && args[0] !== '/me') {
-        appContent.classList.add('hidden');
-        authCard.classList.remove('hidden');
-        authError.textContent = 'Session expired, please log in again.';
-      }
-      return res;
-    };
 
     // --- Tabs ---
     function switchTab(name) {
@@ -1952,7 +1979,12 @@
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-          socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/listen`);
+          // WebSocket() can't set an Authorization header, so the token
+          // (when there is one -- mobile/Capacitor) rides as a query param
+          // instead; harmless no-op for the cookie-authenticated web app.
+          const wsToken = getAuthToken();
+          const wsUrl = `${wsProtocol}//${window.location.host}/ws/listen` + (wsToken ? `?token=${encodeURIComponent(wsToken)}` : '');
+          socket = new WebSocket(wsUrl);
 
           socket.onopen = () => {
             mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
@@ -2259,6 +2291,16 @@
       }
     }
   
+
+    // --- PWA install support ---
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {
+          // silent -- app still works fully without an active SW, just
+          // without the offline-reload shell cache
+        });
+      });
+    }
 </script>
 </body>
 </html>
