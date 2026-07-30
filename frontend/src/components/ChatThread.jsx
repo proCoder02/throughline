@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import MessageBubble from './MessageBubble.jsx';
 import Composer from './Composer.jsx';
-import { InfoIcon, TrashIcon, MicIcon } from '../icons.jsx';
+import { BackIcon, InfoIcon, TrashIcon, MicIcon } from '../icons.jsx';
 
 export default function ChatThread({
   title, isLive, liveStatus, seenIndices, speakerNames,
   pendingSpeakerIndex, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
-  messages, onSend, sending, onToggleInfo, onDelete, onListen, onStopListen,
+  messages, onSend, sending, onToggleInfo, onDelete, onListen, onStopListen, onBack,
 }) {
   const scrollRef = useRef(null);
   useEffect(() => {
@@ -16,6 +16,7 @@ export default function ChatThread({
   return (
     <div className="chat-panel">
       <div className="chat-header">
+        <button className="back-btn" title="Back" onClick={onBack}><BackIcon /></button>
         <span className="avatar">{(title || '?')[0]}</span>
         <div className="chat-header-info">
           <div className="chat-header-name">{title}</div>

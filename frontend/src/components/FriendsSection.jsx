@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
-import { apiJson, post } from '../api.js';
+import { BackIcon, TrashIcon } from '../icons.jsx';
+import { apiJson, post, del } from '../api.js';
 
 export default function FriendsSection() {
   const [friends, setFriends] = useState([]);
@@ -11,6 +12,12 @@ export default function FriendsSection() {
 
   const load = () => apiJson('/friends').then(setFriends).catch(() => {});
   useEffect(() => { load(); }, []);
+
+  // See ChatsSection's identical effect -- swaps list/detail on mobile widths.
+  useEffect(() => {
+    document.body.classList.toggle('has-active', !!selected);
+    return () => document.body.classList.remove('has-active');
+  }, [selected]);
 
   const addFriend = async () => {
     if (!code.trim()) return;
@@ -29,6 +36,13 @@ export default function FriendsSection() {
     setSelected(f);
     const data = await apiJson(`/friends/${f.id}/mood`).catch(() => ({ entries: [] }));
     setMood(data.entries || []);
+  };
+
+  const removeFriend = async (f) => {
+    if (!confirm(`Remove ${f.username} from your friends? This cannot be undone.`)) return;
+    await del(`/friends/${f.id}`);
+    if (selected?.id === f.id) setSelected(null);
+    load();
   };
 
   return (
@@ -51,10 +65,18 @@ export default function FriendsSection() {
           </div>
         ))}
       </ListPane>
-      <div className="detail-pane" style={{ flex: 1 }}>
+      <div className="detail-pane detail-view" style={{ flex: 1 }}>
         {selected ? (
           <div className="detail-card">
-            <div className="detail-title">{selected.username}'s mood today</div>
+            <div className="detail-title-row">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <button className="back-btn" title="Back" onClick={() => setSelected(null)}><BackIcon /></button>
+                <div className="detail-title">{selected.username}'s mood today</div>
+              </div>
+              <button className="conv-link-btn" title="Remove friend" onClick={() => removeFriend(selected)}>
+                <TrashIcon />
+              </button>
+            </div>
             {mood && mood.length ? mood.map((m, i) => (
               <div key={i} className="detail-meta">
                 {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — {m.mood_label}

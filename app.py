@@ -1634,7 +1634,7 @@ def list_profiles():
         )
 
     for label, entry in profiles.items():
-        pid = entry.pop("profile_id")
+        pid = entry["profile_id"]
         cats = categories_by_profile.get(pid)
         if cats:
             cats_sorted = sorted(cats, key=lambda c: c[1], reverse=True)
@@ -1652,6 +1652,28 @@ def list_profiles():
             entry["last_seen"] = entry["notes"][0]["created_at"] if entry["notes"] else None
 
     return jsonify(profiles)
+
+
+@app.route("/profiles/<int:profile_id>", methods=["DELETE"])
+@login_required
+def delete_profile(profile_id):
+    """Deletes a person's profile entirely -- their identity row plus every
+    observation and category association tied to it (both FKs are ON DELETE
+    CASCADE), not just a rename/unlink. Deleting only the identity and
+    leaving notes behind would let the free-text speaker_label resurface
+    the same person right back into the list via list_profiles()'s legacy
+    fallback grouping."""
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "DELETE FROM speaker_profiles WHERE id = %s AND user_id = %s RETURNING id",
+        (profile_id, current_user_id()),
+    )
+    deleted = cur.fetchone()
+    db.commit()
+    if not deleted:
+        return jsonify({"error": "Profile not found"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/speakers", methods=["GET"])
@@ -1721,6 +1743,26 @@ def add_friend():
     )
     db.commit()
     return jsonify({"ok": True, "friend": {"id": target["id"], "username": target["username"]}})
+
+
+@app.route("/friends/<int:friend_id>", methods=["DELETE"])
+@login_required
+def remove_friend(friend_id):
+    """Unfriend -- removes both directions of the relationship, same
+    transaction, mirroring how add_friend() creates both at once."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "DELETE FROM friendships WHERE (user_id = %s AND friend_id = %s) "
+        "OR (user_id = %s AND friend_id = %s) RETURNING id",
+        (user_id, friend_id, friend_id, user_id),
+    )
+    deleted = cur.fetchall()
+    db.commit()
+    if not deleted:
+        return jsonify({"error": "Not friends with that user"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
@@ -1947,6 +1989,14 @@ def chat():
 
 
 verify_db_connection()
+
+# Under a WSGI server (gunicorn etc.) this module is imported, not run as
+# __main__ -- the dev-server startup block below never executes there, so
+# the reminder-email worker needs its own start path here instead. Only
+# safe with a single worker process; running multiple gunicorn workers
+# would start one thread per worker and send duplicate reminder emails.
+if __name__ != "__main__":
+    threading.Thread(target=email_reminder_worker, daemon=True).start()
 
 if __name__ == "__main__":
     # Mic access (getUserMedia) only works over "secure contexts" -- https,

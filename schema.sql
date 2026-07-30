@@ -121,10 +121,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_speaker_profiles_user_name_ci
 -- case-insensitively), instead of only the free-text label captured at
 -- analysis time -- lets one real person be tracked across every
 -- conversation they appear in, however their name was capitalized that
--- session. Nullable/ON DELETE SET NULL since old rows predate this column
--- and a profile can be deleted independently of its notes.
+-- session.
 ALTER TABLE personality_notes ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES speaker_profiles (id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_notes_profile ON personality_notes (profile_id);
+
+-- Deleting a profile (DELETE /profiles/<id>) should purge that person's
+-- observations along with their identity -- not just unlink them, which
+-- would leave the notes' free-text speaker_label to resurface the "deleted"
+-- person right back in the list via the legacy fallback grouping in
+-- list_profiles(). CASCADE (not the original SET NULL) makes delete mean
+-- delete. Idempotent: drops+recreates only if the old SET NULL behavior is
+-- still in place.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'personality_notes_profile_id_fkey' AND confdeltype != 'c'
+    ) THEN
+        ALTER TABLE personality_notes DROP CONSTRAINT personality_notes_profile_id_fkey;
+        ALTER TABLE personality_notes
+            ADD CONSTRAINT personality_notes_profile_id_fkey
+            FOREIGN KEY (profile_id) REFERENCES speaker_profiles (id) ON DELETE CASCADE;
+    END IF;
+END $$;
 
 -- The actual many-to-many mapping between people and categories, stored
 -- explicitly rather than only derived by joining personality_notes ->
