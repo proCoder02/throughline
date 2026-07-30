@@ -1,14 +1,30 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
-import { ChatIcon } from '../icons.jsx';
-import { apiJson } from '../api.js';
+import { BackIcon, ChatIcon, TrashIcon } from '../icons.jsx';
+import { apiJson, del } from '../api.js';
 
 export default function ProfilesSection({ onOpenConversation }) {
   const [profiles, setProfiles] = useState({});
   const [selected, setSelected] = useState(null);
   const [query, setQuery] = useState('');
 
-  useEffect(() => { apiJson('/profiles').then(setProfiles).catch(() => {}); }, []);
+  const load = () => apiJson('/profiles').then(setProfiles).catch(() => {});
+  useEffect(() => { load(); }, []);
+
+  // See ChatsSection's identical effect -- swaps list/detail on mobile widths.
+  useEffect(() => {
+    document.body.classList.toggle('has-active', !!selected);
+    return () => document.body.classList.remove('has-active');
+  }, [selected]);
+
+  const deleteProfile = async (label) => {
+    const profileId = profiles[label]?.profile_id;
+    if (!profileId) return;
+    if (!confirm(`Delete ${label}'s profile permanently? This removes every observation about them. This cannot be undone.`)) return;
+    await del(`/profiles/${profileId}`);
+    if (selected === label) setSelected(null);
+    load();
+  };
 
   const labels = Object.keys(profiles).filter((l) => l.toLowerCase().includes(query.trim().toLowerCase()));
 
@@ -44,10 +60,18 @@ export default function ProfilesSection({ onOpenConversation }) {
           );
         })}
       </ListPane>
-      <div className="detail-pane" style={{ flex: 1 }}>
+      <div className="detail-pane detail-view" style={{ flex: 1 }}>
         {selected ? (
           <div className="detail-card">
-            <div className="detail-title">{selected}</div>
+            <div className="detail-title-row">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <button className="back-btn" title="Back" onClick={() => setSelected(null)}><BackIcon /></button>
+                <div className="detail-title">{selected}</div>
+              </div>
+              <button className="conv-link-btn" title="Delete profile" onClick={() => deleteProfile(selected)}>
+                <TrashIcon />
+              </button>
+            </div>
             {profiles[selected].notes.map((n, i) => (
               <div key={i} className="detail-meta detail-meta-row">
                 <span><strong>{cap(n.category)}</strong> · {fmt(n.created_at)} — {n.observation}</span>

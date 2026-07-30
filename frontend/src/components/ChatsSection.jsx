@@ -50,6 +50,15 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Below the mobile breakpoint, the list and the open chat can't share the
+  // screen -- body.has-active swaps from the list to the full-screen thread
+  // (see theme.css's @media block). No-op above that width, where the CSS
+  // just shows both panes regardless.
+  useEffect(() => {
+    document.body.classList.toggle('has-active', !!selectedId);
+    return () => document.body.classList.remove('has-active');
+  }, [selectedId]);
+
   // Global "Listen" button: always visible, starts a brand-new conversation.
   const startNewChat = async () => {
     try { setSelectedTranscript(''); await live.start(); } catch (e) { alert('Could not access microphone: ' + e.message); }
@@ -143,6 +152,7 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           onDelete={() => deleteConversation(selectedId)}
           onListen={() => resumeListening(selectedId)}
           onStopListen={live.stop}
+          onBack={() => setSelectedId(null)}
         />
       ) : (
         <div className="chat-panel empty">Select a conversation, or click Listen to start one.</div>

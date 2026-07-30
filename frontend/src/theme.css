@@ -223,6 +223,10 @@ input, textarea { font-family: inherit; }
 .detail-meta-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .detail-meta-row .conv-link-btn { margin-top: 1px; }
 
+.detail-title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.detail-title-row .detail-title { margin-bottom: 0; }
+.detail-title-row .conv-link-btn:hover { color: var(--wa-danger); }
+
 /* ---------- Auth screen ---------- */
 .auth-screen { height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--wa-bg-app); }
 .auth-card { background: var(--wa-panel); border-radius: 10px; padding: 40px; width: 360px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
@@ -231,11 +235,64 @@ input, textarea { font-family: inherit; }
 .auth-error { color: var(--wa-danger); font-size: 13px; min-height: 16px; margin-top: 10px; }
 .auth-switch { text-align: center; margin-top: 14px; font-size: 13.5px; color: var(--wa-accent-dark); }
 
+.back-btn {
+  display: none; width: 38px; height: 38px; border-radius: 50%; align-items: center; justify-content: center;
+  color: var(--wa-rail-icon); flex-shrink: 0;
+}
+.back-btn:hover { background: var(--wa-hover); }
+.back-btn svg { width: 20px; height: 20px; }
+
 @media (max-width: 860px) {
-  .list-pane { width: 100%; }
-  .icon-rail { width: 56px; }
-  .chat-panel, .detail-pane-wrap { display: none; }
+  /* Dynamic viewport height, not the plain 100vh the desktop rule above
+     uses -- phone browsers show/hide their address bar as you scroll, and
+     100vh doesn't track that, so the composer/tab-bar can end up clipped
+     or jumping. 100dvh does. Browsers that don't support dvh simply ignore
+     this line and keep the 100vh already cascaded from the base rule. */
+  .app-shell { height: 100dvh; flex-direction: column; }
+
+  /* Below this width the 3-pane desktop layout (rail | list | detail) has
+     no room to coexist -- collapse to single-pane mobile nav instead: list
+     is the default view, and opening a chat/profile/friend swaps to its
+     detail view full-screen (toggled via body.has-active, set per-section
+     whenever something is selected) with a back button to return. Settings
+     has no list to swap from, so its .detail-pane deliberately has no
+     .detail-view marker and stays outside this rule -- always visible. */
+  .list-pane, .chat-panel, .detail-view {
+    width: 100%; flex: 1; min-width: 0; min-height: 0;
+  }
+  .chat-panel, .detail-view { display: none; }
   body.has-active .list-pane { display: none; }
-  body.has-active .chat-panel, body.has-active .detail-pane-wrap { display: flex; }
+  body.has-active .chat-panel { display: flex; }
+  body.has-active .detail-view { display: block; }
   .info-drawer { width: 100%; }
+  .back-btn { display: flex; }
+
+  /* Icon rail becomes a bottom tab bar (native mobile nav convention)
+     instead of staying a vertical sidebar pinned to the left edge, which
+     is a desktop pattern and awkward for one-handed thumb reach. `order`
+     puts it after the main content, which is earlier in DOM order. */
+  .icon-rail {
+    order: 2; width: 100%; height: 58px; flex-shrink: 0;
+    flex-direction: row; align-items: center; justify-content: space-evenly;
+    padding: 0; gap: 0;
+    border-right: none; border-top: 1px solid var(--wa-border);
+  }
+  .rail-spacer { display: none; }
+  .rail-btn, .rail-btn.avatar-btn { width: 48px; height: 48px; }
+
+  /* Touch targets sized for a mouse cursor on desktop (24-38px) are fiddly
+     to tap accurately with a fingertip -- bump these to a comfortable
+     ~44px minimum here without changing their desktop sizing. */
+  .list-header button { width: 44px; height: 44px; }
+  .conv-link-btn { width: 44px; height: 44px; }
+  .conv-link-btn svg { width: 18px; height: 18px; }
+  .back-btn { width: 44px; height: 44px; }
+  .composer .send-btn { width: 44px; height: 44px; }
+
+  /* iOS Safari auto-zooms the page when focusing any input/textarea with
+     a font-size under 16px -- both of these were below that on desktop,
+     which is fine there (no zoom behavior) but triggers an unwanted zoom
+     on iPhone the moment you tap to type. */
+  .composer textarea { font-size: 16px; }
+  .search-box input { font-size: 16px; }
 }
