@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py',encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'app\\\\.py' } | Select-Object ProcessId, CommandLine)",
+      "PowerShell(Stop-Process -Id 34524,22384,21648,22988,22236,31136,15016,26212 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'app\\\\.py' } | Select-Object ProcessId, CommandLine)",
+      "Bash(./.venv/Scripts/python.exe -c ' *)"
+    ]
+  }
+}

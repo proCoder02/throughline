@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     raw_transcript TEXT NOT NULL DEFAULT ''
 );
 
+-- Tags each conversation with the personalization mode active when it was
+-- started (personal/office/study), so the Chats list can be filtered down
+-- to just one category instead of always showing every conversation mixed
+-- together. Validated app-side, same reasoning as users.personalization.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'personal';
+CREATE INDEX IF NOT EXISTS idx_conversations_user_category ON conversations (user_id, category);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -101,6 +108,41 @@ CREATE TABLE IF NOT EXISTS speaker_profiles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (user_id, name)
 );
+
+-- Case-insensitive on top of the exact-match UNIQUE above, so "Kunal" and
+-- "kunal" resolve to one profile instead of forking into two -- app code
+-- looks profiles up via lower(name) (get_or_create_profile_id) before ever
+-- relying on this constraint, but the index makes that guarantee enforced
+-- at the DB layer too, not just by convention in application code.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_speaker_profiles_user_name_ci
+    ON speaker_profiles (user_id, lower(name));
+
+-- Links each observation to the canonical profile it's about (resolved
+-- case-insensitively), instead of only the free-text label captured at
+-- analysis time -- lets one real person be tracked across every
+-- conversation they appear in, however their name was capitalized that
+-- session. Nullable/ON DELETE SET NULL since old rows predate this column
+-- and a profile can be deleted independently of its notes.
+ALTER TABLE personality_notes ADD COLUMN IF NOT EXISTS profile_id INTEGER REFERENCES speaker_profiles (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_notes_profile ON personality_notes (profile_id);
+
+-- The actual many-to-many mapping between people and categories, stored
+-- explicitly rather than only derived by joining personality_notes ->
+-- conversations.category: one profile can appear under several categories
+-- (an office conversation one day, a personal one the next) and one
+-- category holds many profiles. Storing it here means the association
+-- survives even after the source conversation is deleted (conversation_id
+-- on personality_notes/tasks/mood_logs is ON DELETE SET NULL, which would
+-- otherwise erase the category link entirely).
+CREATE TABLE IF NOT EXISTS profile_categories (
+    id SERIAL PRIMARY KEY,
+    profile_id INTEGER NOT NULL REFERENCES speaker_profiles (id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (profile_id, category)
+);
+CREATE INDEX IF NOT EXISTS idx_profile_categories_profile ON profile_categories (profile_id);
 
 -- Full chat history, one row per message, permanent -- replaces the old
 -- per-conversation JSON file on disk. Nothing ever deletes from this table;

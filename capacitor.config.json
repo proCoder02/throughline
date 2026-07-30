@@ -1,0 +1,9 @@
+{
+  "appId": "com.throughline.app",
+  "appName": "Throughline",
+  "webDir": "static/app",
+  "server": {
+    "url": "https://REPLACE-WITH-YOUR-DEPLOYED-DOMAIN.example.com",
+    "cleartext": false
+  }
+}

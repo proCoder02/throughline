@@ -26,3 +26,6 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Capacitor / Node
+node_modules/

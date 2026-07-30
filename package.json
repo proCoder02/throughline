@@ -1,0 +1,19 @@
+{
+  "name": "throughline-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Capacitor shell that loads the deployed Throughline Flask app in a native iOS/Android WebView.",
+  "scripts": {
+    "cap:sync": "cap sync",
+    "cap:ios": "cap add ios && cap sync ios && cap open ios",
+    "cap:android": "cap add android && cap sync android && cap open android"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2",
+    "@capacitor/ios": "^6.1.2",
+    "@capacitor/android": "^6.1.2"
+  }
+}
