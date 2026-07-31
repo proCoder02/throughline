@@ -927,6 +927,20 @@ def record_profile_category(cur, profile_id, category):
     )
 
 
+def record_profile_conversation(cur, profile_id, conversation_id):
+    """Records that this profile appeared in this conversation -- the
+    reliable cross-session index /chat/global's retrieval uses, recorded
+    unconditionally (not just when the LLM happened to produce a
+    behavioral observation that pass, unlike personality_notes)."""
+    if not profile_id or not conversation_id:
+        return
+    cur.execute(
+        "INSERT INTO profile_conversations (profile_id, conversation_id) VALUES (%s, %s) "
+        "ON CONFLICT (profile_id, conversation_id) DO NOTHING",
+        (profile_id, conversation_id),
+    )
+
+
 def parse_speakers(raw_text):
     """Split transcript into (speaker_label, line) pairs.
 
@@ -1263,6 +1277,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
                 continue
             profile_id = get_or_create_profile_id(cur, user_id, label)
             record_profile_category(cur, profile_id, category)
+            record_profile_conversation(cur, profile_id, conversation_id)
             for obs in speaker.get("observations") or []:
                 obs = (obs or "").strip()
                 if not obs:
@@ -1693,6 +1708,7 @@ def analyze_conversation():
             continue
         profile_id = get_or_create_profile_id(cur, user_id, label)
         record_profile_category(cur, profile_id, category)
+        record_profile_conversation(cur, profile_id, conversation_id)
         for obs in speaker.get("observations") or []:
             obs = (obs or "").strip()
             if not obs:
@@ -2110,6 +2126,26 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_co
     )
     return base + (f" {persona_context}" if persona_context else "")
 
+
+def build_global_chat_system_prompt(persona_context="", speaker_name=None):
+    """For /chat/global -- answering from EXCERPTS OF SEVERAL past
+    conversations (not one), each labeled with its own date, so the model
+    needs to reason across sessions instead of treating everything as one
+    contiguous transcript."""
+    now_local = datetime.now().astimezone()
+    base = (
+        f"Today is {now_local.strftime('%A, %Y-%m-%d')}. You are answering a question using "
+        "excerpts from several of the user's own past recorded conversations, each labeled with "
+        "its own date/title/category. Use those dates to resolve relative time references "
+        "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
+        "continuous conversation. Ground your answer only in what's in these excerpts; if the "
+        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble."
+    )
+    if speaker_name:
+        base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
+    return base + (f" {persona_context}" if persona_context else "")
+
+
 # Chat history lives permanently in the chat_messages table -- nothing here
 # ever deletes a row. CHAT_HISTORY_MAX_TURNS only bounds how many of the
 # most recent messages get re-sent to the LLM as context on each new turn
@@ -2135,6 +2171,21 @@ def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
         "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
         (user_id, conversation_id, prompt, user_id, conversation_id, reply),
     )
+
+
+def load_global_chat_context(cur, user_id):
+    """Same idea as load_chat_context, but for /chat/global's thread --
+    conversation_id IS NULL there, and plain `= NULL` never matches in SQL
+    (three-valued logic), so this needs its own query rather than reusing
+    load_chat_context with conversation_id=None."""
+    cur.execute(
+        "SELECT role, content FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id IS NULL "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, CHAT_HISTORY_MAX_TURNS * 2),
+    )
+    rows = cur.fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
 @app.route("/conversations", methods=["GET"])
@@ -2291,6 +2342,124 @@ def chat():
         push_notification(user_id, {"type": "chat_message", "conversation_id": conversation_id})
 
     return jsonify({"reply": reply})
+
+
+# How many past conversations to pull into one /chat/global answer, and how
+# much of each to send -- keeps a multi-session answer's cost in the same
+# ballpark as a single-conversation /chat call instead of scaling with the
+# user's entire history.
+GLOBAL_CHAT_MAX_CONVERSATIONS = 6
+GLOBAL_CHAT_CHARS_PER_CONVERSATION = 1200
+
+
+@app.route("/chat/global", methods=["GET"])
+@login_required
+def get_global_chat_history():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT role, content, created_at FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id IS NULL ORDER BY created_at ASC",
+        (current_user_id(),),
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
+
+
+@app.route("/chat/global", methods=["POST"])
+@login_required
+def chat_global():
+    """Cross-session Q&A -- e.g. "What was the topic of discussion with
+    Rahul last week?" Not tied to one conversation_id: if the question
+    names a known person, retrieval is scoped to every conversation they've
+    ever appeared in (via profile_conversations); otherwise it falls back
+    to the user's most recent conversations overall. Persisted permanently
+    (conversation_id NULL, same table as per-conversation chat) so this
+    thread survives closing the panel, reloading, or logging out -- same
+    durability /chat already has, just not scoped to one conversation."""
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    persona_context = build_persona_context(get_user_persona(cur, user_id))
+
+    # Cheap local keyword match against this user's known people -- no extra
+    # LLM call just to figure out who the question is about.
+    cur.execute("SELECT id, name FROM speaker_profiles WHERE user_id = %s", (user_id,))
+    matched = None
+    prompt_lower = prompt.lower()
+    for p in cur.fetchall():
+        if re.search(r"\b" + re.escape(p["name"].lower()) + r"\b", prompt_lower):
+            matched = p
+            break
+
+    if matched:
+        cur.execute(
+            "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
+            "FROM profile_conversations pc JOIN conversations c ON c.id = pc.conversation_id "
+            "WHERE pc.profile_id = %s ORDER BY c.created_at DESC LIMIT %s",
+            (matched["id"], GLOBAL_CHAT_MAX_CONVERSATIONS),
+        )
+    else:
+        cur.execute(
+            "SELECT id, title, created_at, category, raw_transcript FROM conversations "
+            "WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+            (user_id, GLOBAL_CHAT_MAX_CONVERSATIONS),
+        )
+    conversations = cur.fetchall()
+
+    if not conversations:
+        reply = "I don't have any past conversations to draw from yet."
+        append_chat_messages(cur, user_id, None, prompt, reply)
+        db.commit()
+        return jsonify({"reply": reply, "matched_speaker": None, "conversations_used": 0})
+
+    blocks = []
+    for c in conversations:
+        excerpt = (c["raw_transcript"] or "")[:GLOBAL_CHAT_CHARS_PER_CONVERSATION]
+        when = c["created_at"].strftime("%A, %Y-%m-%d %H:%M") if isinstance(c["created_at"], datetime) else str(c["created_at"])
+        blocks.append(f"[{when} - {c['title'] or 'Untitled'} ({c['category']})]\n{excerpt}")
+
+    # Prior exchanges in this thread, read back from the DB -- same
+    # follow-up-resolution role load_chat_context plays for /chat.
+    history = load_global_chat_context(cur, user_id)
+
+    user_content = "\n\n---\n\n".join(blocks) + f"\n\n---\n\nUser question:\n{prompt}"
+    messages = [{"role": "system", "content": build_global_chat_system_prompt(persona_context, matched["name"] if matched else None)}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        reply = call_llm(messages)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        if status == 429:
+            return jsonify({
+                "reply": "Ollama quota is currently exhausted or rate limited. Please try again later or use a different API key."
+            })
+        try:
+            error_json = e.response.json()
+        except Exception:
+            error_json = {"error": str(e)}
+        return jsonify({"error": error_json}), status
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+
+    if reply:
+        # Store the clean question/reply, not the retrieval blob -- that
+        # gets freshly rebuilt from profile_conversations/conversations on
+        # every turn already, so saving it too would duplicate it forever.
+        append_chat_messages(cur, user_id, None, prompt, reply)
+        db.commit()
+
+    return jsonify({
+        "reply": reply,
+        "matched_speaker": matched["name"] if matched else None,
+        "conversations_used": len(conversations),
+    })
 
 
 verify_db_connection()

@@ -4,10 +4,11 @@ import Composer from './Composer.jsx';
 import { BackIcon, InfoIcon, TrashIcon, MicIcon, CloseIcon } from '../icons.jsx';
 
 export default function ChatThread({
-  title, isLive, liveStatus, seenIndices, speakerNames,
-  pendingSpeakerIndex, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
+  title, isLive, liveStatus, seenIndices = [], speakerNames,
+  pendingSpeakerIndex = null, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
   tags, onTagClick, onDismissTag,
   messages, onSend, sending, onToggleInfo, onDelete, onListen, onStopListen, onBack,
+  subtitle, placeholder, emptyHint,
 }) {
   const scrollRef = useRef(null);
   useEffect(() => {
@@ -22,11 +23,11 @@ export default function ChatThread({
         <div className="chat-header-info">
           <div className="chat-header-name">{title}</div>
           <div className="chat-header-sub">
-            {isLive ? <span className="live-badge"><span className="dot" />{liveStatus || 'Listening'}</span> : 'Ask about this conversation'}
+            {isLive ? <span className="live-badge"><span className="dot" />{liveStatus || 'Listening'}</span> : (subtitle || 'Ask about this conversation')}
           </div>
         </div>
         <div className="chat-header-actions">
-          <button title="Transcript" onClick={onToggleInfo}><InfoIcon /></button>
+          {onToggleInfo && <button title="Transcript" onClick={onToggleInfo}><InfoIcon /></button>}
           {onDelete && <button title="Delete conversation" onClick={onDelete}><TrashIcon /></button>}
         </div>
       </div>
@@ -56,7 +57,7 @@ export default function ChatThread({
           <MessageBubble key={i} role={m.role} content={m.content} />
         ))}
         {!messages.length && (
-          <div className="list-empty">Ask a question about this conversation to get started.</div>
+          <div className="list-empty">{emptyHint || 'Ask a question about this conversation to get started.'}</div>
         )}
       </div>
 
@@ -80,7 +81,7 @@ export default function ChatThread({
       <Composer
         onSend={onSend}
         disabled={sending}
-        placeholder="Ask about this conversation..."
+        placeholder={placeholder || 'Ask about this conversation...'}
         extraButton={onListen && (
           <button
             className="send-btn"

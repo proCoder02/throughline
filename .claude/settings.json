@@ -6,7 +6,12 @@
       "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'app\\\\.py' } | Select-Object ProcessId, CommandLine)",
       "PowerShell(Stop-Process -Id 34524,22384,21648,22988,22236,31136,15016,26212 -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'app\\\\.py' } | Select-Object ProcessId, CommandLine)",
       "Bash(./.venv/Scripts/python.exe -c ' *)",
-      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'app\\\\.py' } | Select-Object ProcessId)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_global_chat.py\")",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\backfill_profile_conversations.py\" ec2-user@rapexapi.nodexdata.click:~/throughline/backfill_pc.py)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_global_persist.py\")",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/ChatsSection.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/)"
     ]
   }
 }

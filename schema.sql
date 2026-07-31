@@ -177,6 +177,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- conversation_id NULL = a /chat/global message -- the cross-session
+-- assistant thread isn't scoped to any one conversation, so it needs a
+-- home in this same table that isn't tied to one. Safe/idempotent to
+-- rerun: DROP NOT NULL on an already-nullable column is a no-op.
+ALTER TABLE chat_messages ALTER COLUMN conversation_id DROP NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_chat_messages_global ON chat_messages (user_id, created_at)
+    WHERE conversation_id IS NULL;
+
 -- Standard per-user lookups (every list_tasks / list_profiles / conversation
 -- query filters by user_id first)
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id);
@@ -253,3 +261,23 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 -- its own row (see friendships above), so "the name *I* call this friend"
 -- naturally lives on *my* row without colliding with what they call me.
 ALTER TABLE friendships ADD COLUMN IF NOT EXISTS nickname TEXT;
+
+-- ============================================================================
+-- Cross-session topic threading -- the reliable record of every
+-- conversation a given profile (person) appeared in, recorded at
+-- extraction time regardless of whether that pass happened to produce a
+-- behavioral observation for them. personality_notes.conversation_id is
+-- NOT a complete substitute for this: a speaker can appear in a session
+-- with zero qualifying observations that batch, in which case no
+-- personality_notes row (and thus no conversation link) would exist for
+-- them at all. This table is the actual "which sessions was this person
+-- in" index that /chat/global's cross-conversation retrieval depends on.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS profile_conversations (
+    id SERIAL PRIMARY KEY,
+    profile_id INTEGER NOT NULL REFERENCES speaker_profiles (id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (profile_id, conversation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profile_conversations_profile ON profile_conversations (profile_id, created_at DESC);
