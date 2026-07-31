@@ -5,9 +5,9 @@ import InfoDrawer from './InfoDrawer.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
-import { post } from '../api.js';
+import { apiJson, post } from '../api.js';
 import { backfillConversationContent } from '../db.js';
-import { MicIcon } from '../icons.jsx';
+import { MicIcon, ChatIcon } from '../icons.jsx';
 
 export default function ChatsSection({ notify, openConversationId, onConsumeOpenConversationId }) {
   const conv = useConversations();
@@ -17,6 +17,21 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   const [showInfo, setShowInfo] = useState(false);
   const [sending, setSending] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState('all');
+  // Cross-session Q&A ("What did I discuss with Rahul last week?") -- not
+  // tied to one conversation_id, so it's kept entirely separate from the
+  // per-conversation selectedId/messages state above.
+  const [globalChatOpen, setGlobalChatOpen] = useState(false);
+  const [globalMessages, setGlobalMessages] = useState([]);
+  const [globalSending, setGlobalSending] = useState(false);
+
+  // Persisted server-side (chat_messages, conversation_id NULL) -- loads
+  // once per visit to this tab so the thread survives closing the panel,
+  // reloading the page, or logging out entirely.
+  useEffect(() => {
+    apiJson('/chat/global')
+      .then((rows) => setGlobalMessages(rows.map((r) => ({ role: r.role, content: r.content }))))
+      .catch(() => {});
+  }, []);
 
   const visibleChats = categoryFilter === 'all'
     ? conv.list
@@ -29,6 +44,7 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
 
   const openRow = async (id) => {
     if (live.isListening) live.stop();
+    setGlobalChatOpen(false);
     setSelectedId(id);
     setShowInfo(false);
     notify?.clearChat(id);
@@ -55,9 +71,28 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   // (see theme.css's @media block). No-op above that width, where the CSS
   // just shows both panes regardless.
   useEffect(() => {
-    document.body.classList.toggle('has-active', !!selectedId);
+    document.body.classList.toggle('has-active', !!selectedId || globalChatOpen);
     return () => document.body.classList.remove('has-active');
-  }, [selectedId]);
+  }, [selectedId, globalChatOpen]);
+
+  const openGlobalChat = () => {
+    setSelectedId(null);
+    setGlobalChatOpen(true);
+  };
+
+  const sendGlobalMessage = async (prompt) => {
+    setGlobalMessages((m) => [...m, { role: 'user', content: prompt }]);
+    setGlobalSending(true);
+    try {
+      const data = await post('/chat/global', { prompt });
+      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
+    } catch (e) {
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
+    } finally {
+      setGlobalSending(false);
+    }
+  };
 
   // Global "Listen" button: always visible, starts a brand-new conversation.
   const startNewChat = async () => {
@@ -91,6 +126,13 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     }
   };
 
+  // A tag click reuses the exact same send path as typing into the
+  // composer -- the tag text becomes the chat prompt, with full context.
+  const handleTagClick = (tag) => {
+    sendMessage(tag);
+    live.removeTag(tag);
+  };
+
   const deleteConversation = async (id) => {
     if (!confirm('Delete this conversation permanently? This cannot be undone.')) return;
     await conv.removeConv(id);
@@ -109,13 +151,18 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
         search={{ value: conv.query, onChange: conv.setQuery, placeholder: 'Search conversations' }}
         emptyText={categoryFilter === 'all' ? 'No conversations yet. Click Listen to start one.' : `No ${categoryFilter} conversations yet.`}
         fab={!selectedId && (
-          <button
-            className={'btn fab' + (live.isListening ? ' danger' : '')}
-            onClick={live.isListening ? live.stop : startNewChat}
-          >
-            <MicIcon />
-            {live.isListening ? 'Stop Listening' : 'Listen'}
-          </button>
+          <div className="fab-group">
+            <button className="btn fab-icon" title="Ask about your people & conversations" onClick={openGlobalChat}>
+              <ChatIcon />
+            </button>
+            <button
+              className={'btn fab' + (live.isListening ? ' danger' : '')}
+              onClick={live.isListening ? live.stop : startNewChat}
+            >
+              <MicIcon />
+              {live.isListening ? 'Stop Listening' : 'Listen'}
+            </button>
+          </div>
         )}
       >
         {visibleChats.map((c) => (
@@ -145,6 +192,9 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           onNameSpeaker={live.nameSpeaker}
           onSkipSpeaker={live.dismissPrompt}
           onReopenPrompt={live.openPrompt}
+          tags={live.tags}
+          onTagClick={handleTagClick}
+          onDismissTag={live.removeTag}
           messages={messages}
           onSend={sendMessage}
           sending={sending}
@@ -153,6 +203,17 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           onListen={() => resumeListening(selectedId)}
           onStopListen={live.stop}
           onBack={() => setSelectedId(null)}
+        />
+      ) : globalChatOpen ? (
+        <ChatThread
+          title="Ask about your people & conversations"
+          subtitle="Ask across everything you've recorded"
+          placeholder='e.g. "What did I discuss with Rahul last week?"'
+          emptyHint="Ask about a person or a past topic -- I'll pull in whichever conversations are relevant."
+          messages={globalMessages}
+          onSend={sendGlobalMessage}
+          sending={globalSending}
+          onBack={() => setGlobalChatOpen(false)}
         />
       ) : (
         <div className="chat-panel empty">Select a conversation, or click Listen to start one.</div>

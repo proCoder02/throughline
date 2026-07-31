@@ -1,14 +1,20 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
-import { BackIcon, TrashIcon } from '../icons.jsx';
+import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, CheckIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
 
-export default function FriendsSection() {
+export default function FriendsSection({ onStartCall }) {
   const [friends, setFriends] = useState([]);
   const [selected, setSelected] = useState(null);
   const [mood, setMood] = useState(null);
   const [code, setCode] = useState('');
   const [status, setStatus] = useState('');
+  const [renaming, setRenaming] = useState(false);
+  const [nicknameDraft, setNicknameDraft] = useState('');
+  // Group-call picker: toggled from the header, turns each row into a
+  // checkbox instead of opening their mood detail.
+  const [pickingCall, setPickingCall] = useState(false);
+  const [callSelection, setCallSelection] = useState([]);
 
   const load = () => apiJson('/friends').then(setFriends).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -45,25 +51,86 @@ export default function FriendsSection() {
     load();
   };
 
+  const startRename = () => {
+    setNicknameDraft(selected.nickname || '');
+    setRenaming(true);
+  };
+
+  const saveNickname = async () => {
+    const data = await post(`/friends/${selected.id}/nickname`, { nickname: nicknameDraft.trim() });
+    setSelected((s) => ({ ...s, nickname: data.nickname }));
+    setRenaming(false);
+    load();
+  };
+
+  const callFriend = (e, friendId) => {
+    e.stopPropagation();
+    onStartCall?.([friendId]).catch((err) => alert('Could not start call: ' + err.message));
+  };
+
+  const toggleCallSelection = (friendId) => {
+    setCallSelection((prev) => (prev.includes(friendId) ? prev.filter((id) => id !== friendId) : [...prev, friendId]));
+  };
+
+  const confirmGroupCall = () => {
+    if (!callSelection.length) return;
+    const ids = callSelection;
+    setPickingCall(false);
+    setCallSelection([]);
+    onStartCall?.(ids).catch((err) => alert('Could not start call: ' + err.message));
+  };
+
   return (
     <>
-      <ListPane title="Friends" emptyText="No friends added yet.">
+      <ListPane
+        title="Friends"
+        headerAction={
+          friends.length > 0 && (
+            <button
+              title={pickingCall ? 'Cancel group call' : 'Start a group call'}
+              onClick={() => { setPickingCall((v) => !v); setCallSelection([]); }}
+            >
+              <PhoneIcon />
+            </button>
+          )
+        }
+        emptyText="No friends added yet."
+      >
         <div style={{ padding: '4px 16px 12px' }}>
           <div className="row2" style={{ display: 'flex', gap: 6 }}>
             <input className="field" style={{ marginTop: 0 }} placeholder="Friend's code" value={code} onChange={(e) => setCode(e.target.value)} />
             <button className="btn" onClick={addFriend}>Add</button>
           </div>
           {status && <div className="hint">{status}</div>}
+          {pickingCall && <div className="hint">Pick who to call, then confirm below.</div>}
         </div>
         {friends.map((f) => (
-          <div key={f.id} className={'row' + (selected?.id === f.id ? ' active' : '')} onClick={() => openFriend(f)}>
-            <span className="avatar">{f.username[0]}</span>
+          <div
+            key={f.id}
+            className={'row' + (!pickingCall && selected?.id === f.id ? ' active' : '')}
+            onClick={() => (pickingCall ? toggleCallSelection(f.id) : openFriend(f))}
+          >
+            <span className="avatar">{(f.nickname || f.username)[0]}</span>
             <div className="row-main">
-              <div className="row-top"><span className="row-title">{f.username}</span></div>
+              <div className="row-top"><span className="row-title">{f.nickname || f.username}</span></div>
               <div className="row-sub"><span className="status-dot" />Mood tracked today</div>
             </div>
+            {pickingCall ? (
+              callSelection.includes(f.id) && <CheckIcon />
+            ) : (
+              <button className="conv-link-btn" title={`Call ${f.nickname || f.username}`} onClick={(e) => callFriend(e, f.id)}>
+                <PhoneIcon />
+              </button>
+            )}
           </div>
         ))}
+        {pickingCall && (
+          <div style={{ padding: '8px 16px' }}>
+            <button className="btn" style={{ width: '100%' }} disabled={!callSelection.length} onClick={confirmGroupCall}>
+              Call {callSelection.length || ''}
+            </button>
+          </div>
+        )}
       </ListPane>
       <div className="detail-pane detail-view" style={{ flex: 1 }}>
         {selected ? (
@@ -71,11 +138,32 @@ export default function FriendsSection() {
             <div className="detail-title-row">
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                 <button className="back-btn" title="Back" onClick={() => setSelected(null)}><BackIcon /></button>
-                <div className="detail-title">{selected.username}'s mood today</div>
+                {renaming ? (
+                  <input
+                    className="field" style={{ marginTop: 0 }} autoFocus
+                    placeholder={selected.username} value={nicknameDraft}
+                    onChange={(e) => setNicknameDraft(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && saveNickname()}
+                  />
+                ) : (
+                  <div className="detail-title">{(selected.nickname || selected.username)}'s mood today</div>
+                )}
               </div>
-              <button className="conv-link-btn" title="Remove friend" onClick={() => removeFriend(selected)}>
-                <TrashIcon />
-              </button>
+              {renaming ? (
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button className="btn" onClick={saveNickname}>Save</button>
+                  <button className="btn secondary" onClick={() => setRenaming(false)}>Cancel</button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex' }}>
+                  <button className="conv-link-btn" title="Set nickname" onClick={startRename}>
+                    <PencilIcon />
+                  </button>
+                  <button className="conv-link-btn" title="Remove friend" onClick={() => removeFriend(selected)}>
+                    <TrashIcon />
+                  </button>
+                </div>
+              )}
             </div>
             {mood && mood.length ? mood.map((m, i) => (
               <div key={i} className="detail-meta">

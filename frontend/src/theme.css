@@ -171,6 +171,18 @@ input, textarea { font-family: inherit; }
 .speaker-chip button { padding: 3px 8px; border-radius: 999px; background: var(--wa-hover); font-size: 11px; }
 .live-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #EA0038; }
 .live-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: #EA0038; animation: pulse 1.4s infinite; }
+
+/* Live topic chips -- click asks the assistant about it (via the normal
+   chat send path), the x just dismisses it. */
+.topic-tags { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px 0; flex-shrink: 0; }
+.topic-tag {
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 14px; border-radius: 999px;
+  background: var(--wa-panel); border: 1px solid var(--wa-border); font-size: 13px; color: var(--wa-text);
+}
+.topic-tag:hover { border-color: var(--wa-accent); color: var(--wa-accent-dark); }
+.topic-tag-x { display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; color: var(--wa-text-soft); }
+.topic-tag-x:hover { background: var(--wa-hover); color: var(--wa-danger); }
+.topic-tag-x svg { width: 11px; height: 11px; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* "Listen" control, pinned to the bottom-right of the chats list pane --
@@ -183,6 +195,18 @@ input, textarea { font-family: inherit; }
   box-shadow: 0 4px 14px rgba(0,0,0,0.25); font-size: 14.5px; font-weight: 600;
 }
 .fab svg { width: 18px; height: 18px; }
+
+/* Wraps the Listen fab + the "ask across conversations" icon button
+   together -- the group owns the corner positioning so the two buttons
+   just sit side by side inside it instead of both trying to self-position. */
+.fab-group { position: absolute; bottom: 20px; right: 20px; z-index: 5; display: flex; align-items: center; gap: 10px; }
+.fab-group .fab { position: static; }
+.fab-icon {
+  width: 52px; height: 52px; border-radius: 50%; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.25); background: var(--wa-panel); color: var(--wa-accent-dark);
+}
+.fab-icon svg { width: 22px; height: 22px; }
 
 .info-drawer {
   position: absolute; top: 0; right: 0; bottom: 0; width: 400px;
@@ -206,6 +230,28 @@ input, textarea { font-family: inherit; }
 .field { width: 100%; padding: 10px 12px; border: 1px solid var(--wa-border); border-radius: 6px; margin-top: 6px; font-size: 14px; }
 .hint { font-size: 12.5px; color: var(--wa-text-soft); margin: 4px 0 12px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--wa-accent); display: inline-block; margin-right: 6px; }
+
+/* ---------- Voice calling ---------- */
+.call-overlay {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.55);
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.call-card {
+  background: var(--wa-panel); border-radius: 12px; padding: 32px 28px; width: 320px; max-width: 100%;
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+}
+.call-card .avatar.lg { margin-bottom: 14px; }
+.call-title { font-size: 18px; font-weight: 600; }
+.call-sub { font-size: 13.5px; color: var(--wa-text-soft); margin-top: 2px; }
+.call-recording-notice { font-size: 12px; color: var(--wa-danger); margin: 10px 0 4px; }
+.call-audio-blocked { background: #FFF3CD; color: #7A5B00; width: 100%; margin-top: 10px; }
+.call-audio-blocked:hover { background: #FFE8A3; }
+.call-actions { display: flex; gap: 12px; margin-top: 18px; width: 100%; }
+.call-actions .btn { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.call-actions .btn svg { width: 16px; height: 16px; }
+.call-btn { color: var(--wa-accent); }
+.call-btn:hover { background: var(--wa-hover); }
 
 .email-sent-badge { display: inline-flex; align-items: center; margin-left: 6px; color: var(--wa-accent); flex-shrink: 0; }
 .email-sent-badge svg { width: 13px; height: 13px; }
@@ -234,6 +280,15 @@ input, textarea { font-family: inherit; }
 .auth-card p.hint { margin-bottom: 20px; }
 .auth-error { color: var(--wa-danger); font-size: 13px; min-height: 16px; margin-top: 10px; }
 .auth-switch { text-align: center; margin-top: 14px; font-size: 13.5px; color: var(--wa-accent-dark); }
+
+.persona-card { width: 480px; max-height: 90vh; overflow-y: auto; }
+.persona-options { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
+.persona-chip {
+  display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--wa-border); font-size: 13px; cursor: pointer; color: var(--wa-text);
+}
+.persona-chip input { margin: 0; }
+.persona-chip.active { border-color: var(--wa-accent); background: var(--wa-bubble-out); color: var(--wa-accent-dark); }
 
 .back-btn {
   display: none; width: 38px; height: 38px; border-radius: 50%; align-items: center; justify-content: center;

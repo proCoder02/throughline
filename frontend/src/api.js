@@ -11,7 +11,11 @@ export async function api(path, options = {}) {
   const token = getToken();
   const headers = { ...(options.headers || {}) };
   if (token) headers['Authorization'] = 'Bearer ' + token;
-  if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  // FormData needs fetch to set its own Content-Type (with the boundary) --
+  // forcing application/json on it would break multipart uploads.
+  if (options.body && !headers['Content-Type'] && !(options.body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+  }
 
   const res = await fetch(path, { ...options, headers });
   if (res.status === 401 && path !== '/me') {
@@ -30,3 +34,4 @@ export async function apiJson(path, options) {
 
 export const post = (path, body) => apiJson(path, { method: 'POST', body: JSON.stringify(body) });
 export const del = (path) => apiJson(path, { method: 'DELETE' });
+export const postForm = (path, formData) => apiJson(path, { method: 'POST', body: formData });

@@ -25,6 +25,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import livekit.api as livekit_api
 
 load_dotenv()
 
@@ -180,10 +181,83 @@ def normalize_personalization(value):
 
 
 def get_user_personalization(cur, user_id):
+    """Returns the user's current mode as stored -- a built-in one OR a
+    custom category -- NOT run through normalize_personalization(), so a
+    custom category correctly flows through to new conversations' category
+    tagging (e.g. /ws/listen) instead of being coerced back to 'personal'.
+    Callers that need LLM guidance text still get a safe fallback: both
+    build_chat_system_prompt and build_analysis_prompt call
+    normalize_personalization() themselves before indexing
+    PERSONALIZATION_GUIDANCE, so a custom category there just falls back to
+    the 'personal' guidance copy rather than erroring."""
     cur.execute("SELECT personalization FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
-    mode = row["personalization"] if row else None
-    return normalize_personalization(mode)
+    value = row["personalization"] if row else None
+    return value or DEFAULT_PERSONALIZATION
+
+
+def is_valid_category_for_user(cur, user_id, value):
+    """A category is either one of the 3 built-in personalization modes, or
+    one this specific user created (user_categories) -- lets custom
+    categories slot into the exact same personalization/category field
+    everywhere without touching how it's stored or how LLM guidance for it
+    is picked (normalize_personalization already falls back to 'personal'
+    guidance for anything outside the built-in 3, custom categories included
+    -- that fallback was already there, nothing new needed for it)."""
+    if value in PERSONALIZATION_MODES:
+        return True
+    cur.execute(
+        "SELECT 1 FROM user_categories WHERE user_id = %s AND name = %s",
+        (user_id, value),
+    )
+    return cur.fetchone() is not None
+
+
+# ---------------------------------------------------------------------------
+# Persona onboarding -- captured once right after registration, injected as
+# a compact one-line summary into the chat/analysis system prompts so the
+# LLM can tailor tone/relevance to the person, not just the personalization
+# mode. Option lists are validated app-side, same convention as
+# PERSONALIZATION_MODES/category.
+# ---------------------------------------------------------------------------
+
+GENDER_OPTIONS = ["Male", "Female", "Non-binary", "Prefer not to say"]
+LANGUAGE_OPTIONS = ["English", "Hindi", "Spanish", "French", "German", "Mandarin", "Arabic"]
+HOBBY_OPTIONS = ["Reading", "Sports & Fitness", "Music", "Gaming", "Travel", "Cooking", "Art & Design"]
+INTEREST_OPTIONS = [
+    "Technology", "Finance & Business", "Health & Wellness", "Arts & Culture",
+    "Sports", "Politics & Current Affairs", "Science",
+]
+
+
+def get_user_persona(cur, user_id):
+    cur.execute("SELECT * FROM user_personas WHERE user_id = %s", (user_id,))
+    return cur.fetchone()
+
+
+def build_persona_context(persona):
+    """One compact line, not a paragraph -- this gets appended to every
+    chat/analysis system prompt, so cost scales with how much we put here."""
+    if not persona:
+        return ""
+    bits = []
+    if persona.get("age"):
+        bits.append(f"age {persona['age']}")
+    if persona.get("gender"):
+        bits.append(persona["gender"])
+    if persona.get("occupation"):
+        bits.append(persona["occupation"])
+    if persona.get("language_preference"):
+        bits.append(f"prefers {persona['language_preference']}")
+    if persona.get("hobbies"):
+        bits.append("hobbies: " + ", ".join(persona["hobbies"]))
+    if persona.get("interests"):
+        bits.append("interests: " + ", ".join(persona["interests"]))
+    if persona.get("primary_goal"):
+        bits.append(f"goal: {persona['primary_goal']}")
+    if not bits:
+        return ""
+    return "User persona (tailor tone/relevance only, never invent facts from it): " + "; ".join(bits) + "."
 
 
 # ---------------------------------------------------------------------------
@@ -635,17 +709,148 @@ def update_settings():
     if "personalization" not in data:
         return jsonify({"error": "personalization is required"}), 400
     personalization = data.get("personalization")
-    if personalization not in PERSONALIZATION_MODES:
-        return jsonify({"error": f"personalization must be one of {sorted(PERSONALIZATION_MODES)}"}), 400
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    if not is_valid_category_for_user(cur, user_id, personalization):
+        return jsonify({"error": "personalization must be a built-in mode or one of your own categories"}), 400
+
+    cur.execute(
+        "UPDATE users SET personalization = %s WHERE id = %s",
+        (personalization, user_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "personalization": personalization})
+
+
+# ---------------------------------------------------------------------------
+# Custom categories -- personal/office/study always exist (built into app
+# code); this lets a user add their own on top, usable anywhere a category
+# is (conversations.category, users.personalization).
+# ---------------------------------------------------------------------------
+
+@app.route("/categories", methods=["GET"])
+@login_required
+def list_categories():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT name FROM user_categories WHERE user_id = %s ORDER BY name",
+        (current_user_id(),),
+    )
+    custom = [r["name"] for r in cur.fetchall()]
+    return jsonify({"builtin": sorted(PERSONALIZATION_MODES), "custom": custom})
+
+
+@app.route("/categories", methods=["POST"])
+@login_required
+def create_category():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if len(name) > 40:
+        return jsonify({"error": "name is too long (max 40 characters)"}), 400
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    if name.lower() in {m.lower() for m in PERSONALIZATION_MODES}:
+        return jsonify({"error": "That's already a built-in category"}), 409
+    cur.execute(
+        "SELECT 1 FROM user_categories WHERE user_id = %s AND lower(name) = lower(%s)",
+        (user_id, name),
+    )
+    if cur.fetchone():
+        return jsonify({"error": "You already have a category with that name"}), 409
+    cur.execute(
+        "INSERT INTO user_categories (user_id, name) VALUES (%s, %s)",
+        (user_id, name),
+    )
+    db.commit()
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/categories/<name>", methods=["DELETE"])
+@login_required
+def delete_category(name):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "DELETE FROM user_categories WHERE user_id = %s AND name = %s RETURNING id",
+        (current_user_id(), name),
+    )
+    deleted = cur.fetchone()
+    db.commit()
+    if not deleted:
+        return jsonify({"error": "Category not found"}), 404
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Persona onboarding
+# ---------------------------------------------------------------------------
+
+@app.route("/persona", methods=["GET"])
+@login_required
+def get_persona_route():
+    db = get_db()
+    cur = dict_cursor(db)
+    persona = get_user_persona(cur, current_user_id())
+    return jsonify({
+        "completed": persona is not None,
+        "persona": serialize_row(persona) if persona else None,
+        "options": {
+            "gender": GENDER_OPTIONS,
+            "language_preference": LANGUAGE_OPTIONS,
+            "hobbies": HOBBY_OPTIONS,
+            "interests": INTEREST_OPTIONS,
+        },
+    })
+
+
+@app.route("/persona", methods=["POST"])
+@login_required
+def save_persona_route():
+    data = request.get_json(silent=True) or {}
+    age = data.get("age")
+    gender = (data.get("gender") or "").strip()
+    language_preference = (data.get("language_preference") or "").strip()
+    hobbies = [h for h in (data.get("hobbies") or []) if h in HOBBY_OPTIONS]
+    interests = [i for i in (data.get("interests") or []) if i in INTEREST_OPTIONS]
+    occupation = (data.get("occupation") or "").strip()
+    primary_goal = (data.get("primary_goal") or "").strip() or None
+
+    # age, gender, language_preference, hobbies, interests, occupation are
+    # mandatory; primary_goal is the one optional field (7 total).
+    try:
+        age = int(age)
+    except (TypeError, ValueError):
+        return jsonify({"error": "age is required and must be a number"}), 400
+    if age < 13 or age > 120:
+        return jsonify({"error": "age must be between 13 and 120"}), 400
+    if gender not in GENDER_OPTIONS:
+        return jsonify({"error": f"gender must be one of {GENDER_OPTIONS}"}), 400
+    if language_preference not in LANGUAGE_OPTIONS:
+        return jsonify({"error": f"language_preference must be one of {LANGUAGE_OPTIONS}"}), 400
+    if not hobbies:
+        return jsonify({"error": "Pick at least one hobby"}), 400
+    if not interests:
+        return jsonify({"error": "Pick at least one interest"}), 400
+    if not occupation:
+        return jsonify({"error": "occupation is required"}), 400
 
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "UPDATE users SET personalization = %s WHERE id = %s",
-        (personalization, current_user_id()),
+        "INSERT INTO user_personas (user_id, age, gender, language_preference, hobbies, interests, occupation, primary_goal) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET age = EXCLUDED.age, gender = EXCLUDED.gender, "
+        "language_preference = EXCLUDED.language_preference, hobbies = EXCLUDED.hobbies, "
+        "interests = EXCLUDED.interests, occupation = EXCLUDED.occupation, primary_goal = EXCLUDED.primary_goal",
+        (current_user_id(), age, gender, language_preference, hobbies, interests, occupation, primary_goal),
     )
     db.commit()
-    return jsonify({"ok": True, "personalization": personalization})
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +925,20 @@ def record_profile_category(cur, profile_id, category):
         "VALUES (%s, %s, now(), now()) "
         "ON CONFLICT (profile_id, category) DO UPDATE SET last_seen_at = now()",
         (profile_id, category),
+    )
+
+
+def record_profile_conversation(cur, profile_id, conversation_id):
+    """Records that this profile appeared in this conversation -- the
+    reliable cross-session index /chat/global's retrieval uses, recorded
+    unconditionally (not just when the LLM happened to produce a
+    behavioral observation that pass, unlike personality_notes)."""
+    if not profile_id or not conversation_id:
+        return
+    cur.execute(
+        "INSERT INTO profile_conversations (profile_id, conversation_id) VALUES (%s, %s) "
+        "ON CONFLICT (profile_id, conversation_id) DO NOTHING",
+        (profile_id, conversation_id),
     )
 
 
@@ -798,17 +1017,18 @@ def extract_json(text):
 BACKGROUND_ANALYSIS_BATCH_SIZE = int(os.getenv("BACKGROUND_ANALYSIS_BATCH_SIZE", "12"))
 MIN_WORDS_FOR_ANALYSIS = int(os.getenv("MIN_WORDS_FOR_ANALYSIS", "8"))
 
-def build_analysis_prompt(personalization=DEFAULT_PERSONALIZATION):
+def build_analysis_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
     # Injecting the real current time lets the model resolve relative phrases
     # ("Friday", "tomorrow", "in an hour") into an actual timestamp we can
     # schedule a browser reminder against -- without this, "due_date" is just
     # a display string with nothing a scheduler could act on.
     now_local = datetime.now().astimezone()
     mode_guidance = PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
+    persona_line = f"\n{persona_context}\n" if persona_context else ""
     return f"""Today is {now_local.strftime('%A, %Y-%m-%d')}, current time {now_local.strftime('%H:%M %Z')}.
 
 {mode_guidance}
-
+{persona_line}
 Extract from this conversation transcript:
 1. "tasks": action items/commitments. Each:
    - description (<20 words, your own words)
@@ -824,11 +1044,14 @@ clinical/mental-health terms, no motive speculation.
 recording it -- "label" (a single plain word, e.g. "happy", "stressed", "calm", "frustrated", \
 "excited", "neutral", "sad", "anxious") and "score" (0.0-1.0 intensity/confidence). Base this \
 only on tone and word choice actually present, no diagnoses.
+4. "tags": 2-5 short (1-4 word) topics from THIS transcript worth asking the assistant more \
+about, matching the mode above (e.g. office: "budget approval"; study: "midterm scope"). Empty \
+list if nothing distinct came up.
 
 Reply with ONLY this JSON, no preamble/fences:
 {{"tasks": [{{"description": "", "owner": null, "due_date": null, "reminder_at": null}}], \
 "speakers": [{{"label": "", "observations": [""]}}], \
-"mood": {{"label": "neutral", "score": 0.5}}}}
+"mood": {{"label": "neutral", "score": 0.5}}, "tags": [""]}}
 Empty lists if none found. "mood" is always required."""
 
 
@@ -1008,13 +1231,15 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
 
     conn = get_raw_connection()
     try:
-        mode = get_user_personalization(dict_cursor(conn), user_id)
+        pcur = dict_cursor(conn)
+        mode = get_user_personalization(pcur, user_id)
+        persona_context = build_persona_context(get_user_persona(pcur, user_id))
     finally:
         release_raw_connection(conn)
 
     try:
         content = call_llm([
-            {"role": "system", "content": build_analysis_prompt(mode)},
+            {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
             {"role": "user", "content": delta_text},
         ])
     except Exception:
@@ -1027,6 +1252,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
     mood = parsed.get("mood") or {}
+    tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
     conn = get_raw_connection()
     created_tasks = []
@@ -1052,6 +1278,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
                 continue
             profile_id = get_or_create_profile_id(cur, user_id, label)
             record_profile_category(cur, profile_id, category)
+            record_profile_conversation(cur, profile_id, conversation_id)
             for obs in speaker.get("observations") or []:
                 obs = (obs or "").strip()
                 if not obs:
@@ -1080,7 +1307,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     for task_id, description in created_tasks:
         push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
 
-    push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers)})
+    push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers), "tags": tags})
 
 
 # ---------------------------------------------------------------------------
@@ -1434,10 +1661,11 @@ def analyze_conversation():
         return jsonify({"error": "transcript or conversation_id is required"}), 400
 
     mode = get_user_personalization(cur, user_id)
+    persona_context = build_persona_context(get_user_persona(cur, user_id))
     try:
         content = call_llm(
             [
-                {"role": "system", "content": build_analysis_prompt(mode)},
+                {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
                 {"role": "user", "content": raw_transcript},
             ]
         )
@@ -1458,6 +1686,7 @@ def analyze_conversation():
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
     mood = parsed.get("mood") or {}
+    tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
     for task in tasks:
         description = (task.get("description") or "").strip()
@@ -1480,6 +1709,7 @@ def analyze_conversation():
             continue
         profile_id = get_or_create_profile_id(cur, user_id, label)
         record_profile_category(cur, profile_id, category)
+        record_profile_conversation(cur, profile_id, conversation_id)
         for obs in speaker.get("observations") or []:
             obs = (obs or "").strip()
             if not obs:
@@ -1506,6 +1736,7 @@ def analyze_conversation():
             "tasks": tasks,
             "speakers": speakers,
             "mood": mood,
+            "tags": tags,
         }
     )
 
@@ -1564,6 +1795,41 @@ def reopen_task(task_id):
     if not cur.fetchone():
         return jsonify({"error": "Task not found"}), 404
     cur.execute("UPDATE tasks SET status = 'open' WHERE id = %s", (task_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/tasks/<int:task_id>/edit", methods=["POST"])
+@login_required
+def edit_task(task_id):
+    """Corrects a task's description/due_date after extraction -- the LLM
+    sometimes mishears/misparses. Update in place (not delete+recreate) so
+    reminder_at/email_sent/status history isn't lost."""
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id FROM tasks WHERE id = %s AND user_id = %s", (task_id, current_user_id())
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Task not found"}), 404
+
+    fields, params = [], []
+    if "description" in data:
+        description = (data.get("description") or "").strip()
+        if not description:
+            return jsonify({"error": "description cannot be empty"}), 400
+        fields.append("description = %s")
+        params.append(description)
+    if "due_date" in data:
+        fields.append("due_date = %s")
+        params.append((data.get("due_date") or "").strip() or None)
+    if not fields:
+        return jsonify({"error": "Nothing to update -- provide description and/or due_date"}), 400
+
+    fields.append("updated_at = now()")
+    params.append(task_id)
+    cur.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s", params)
     db.commit()
     return jsonify({"ok": True})
 
@@ -1676,6 +1942,38 @@ def delete_profile(profile_id):
     return jsonify({"ok": True})
 
 
+@app.route("/profiles/<int:profile_id>/rename", methods=["POST"])
+@login_required
+def rename_profile(profile_id):
+    """Fixes a misheard/misspelled name. Rejects (409) instead of silently
+    merging if the new name collides with a different existing profile --
+    a rename shouldn't surprise-merge two people's histories together."""
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "name is required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id FROM speaker_profiles WHERE id = %s AND user_id = %s", (profile_id, user_id)
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Profile not found"}), 404
+
+    cur.execute(
+        "SELECT id FROM speaker_profiles WHERE user_id = %s AND lower(name) = lower(%s) AND id != %s",
+        (user_id, new_name, profile_id),
+    )
+    if cur.fetchone():
+        return jsonify({"error": "A profile with that name already exists"}), 409
+
+    cur.execute("UPDATE speaker_profiles SET name = %s WHERE id = %s", (new_name, profile_id))
+    db.commit()
+    return jsonify({"ok": True, "name": new_name})
+
+
 @app.route("/speakers", methods=["GET"])
 @login_required
 def list_speakers():
@@ -1703,9 +2001,9 @@ def list_friends():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT users.id, users.username FROM friendships "
+        "SELECT users.id, users.username, friendships.nickname FROM friendships "
         "JOIN users ON users.id = friendships.friend_id "
-        "WHERE friendships.user_id = %s ORDER BY users.username",
+        "WHERE friendships.user_id = %s ORDER BY COALESCE(friendships.nickname, users.username)",
         (current_user_id(),),
     )
     return jsonify([dict(r) for r in cur.fetchall()])
@@ -1765,6 +2063,28 @@ def remove_friend(friend_id):
     return jsonify({"ok": True})
 
 
+@app.route("/friends/<int:friend_id>/nickname", methods=["POST"])
+@login_required
+def set_friend_nickname(friend_id):
+    """Sets *my* local name for this friend -- can't rename their actual
+    account, so this lives on my direction of the friendship row only (each
+    direction is already its own row, see add_friend)."""
+    data = request.get_json(silent=True) or {}
+    nickname = (data.get("nickname") or "").strip() or None  # empty clears it
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE friendships SET nickname = %s WHERE user_id = %s AND friend_id = %s RETURNING id",
+        (nickname, user_id, friend_id),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "Not friends with that user"}), 404
+    return jsonify({"ok": True, "nickname": nickname})
+
+
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
 @login_required
 def friend_mood(friend_id):
@@ -1793,8 +2113,278 @@ def friend_mood(friend_id):
     return jsonify({"friend_id": friend_id, "entries": entries})
 
 
-def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION):
-    return (
+# ---------------------------------------------------------------------------
+# Voice calling (1:1 + group), via LiveKit Cloud
+#
+# Calling is friends-only (same trust boundary as mood-sharing above). One
+# call_participants row shape covers both 1:1 (2 rows) and group (N rows) --
+# no special-casing. LiveKit's own SFU/room hosting means the app never
+# touches raw media -- this server only ever signs short-lived join tokens
+# and tracks call/participant state; the actual audio never passes through
+# Flask. Recording deliberately does NOT use LiveKit's server-side Egress
+# (that requires S3/GCS/Azure storage + IAM credentials on top of LiveKit
+# Cloud itself) -- instead the call initiator's browser mixes local + remote
+# audio client-side and uploads the result to /calls/<id>/recording, which
+# reuses the exact same Deepgram diarization call as /transcribe.
+# ---------------------------------------------------------------------------
+
+CALL_MAX_PARTICIPANTS = 8  # including the initiator
+
+
+def generate_livekit_token(user_id, username, room_name):
+    api_key = os.getenv("LIVEKIT_API_KEY")
+    api_secret = os.getenv("LIVEKIT_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing LIVEKIT_API_KEY/LIVEKIT_API_SECRET")
+    grants = livekit_api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True)
+    token = (
+        livekit_api.AccessToken(api_key, api_secret)
+        .with_identity(str(user_id))
+        .with_name(username)
+        .with_grants(grants)
+        .with_ttl(timedelta(hours=4))
+    )
+    return token.to_jwt()
+
+
+@app.route("/calls", methods=["POST"])
+@login_required
+def create_call():
+    if not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+        return jsonify({"error": "Calling is not configured (missing LIVEKIT_API_KEY/LIVEKIT_API_SECRET)"}), 500
+
+    data = request.get_json(silent=True) or {}
+    try:
+        friend_ids = list({int(f) for f in (data.get("friend_ids") or [])})
+    except (TypeError, ValueError):
+        return jsonify({"error": "friend_ids must be a list of user ids"}), 400
+    if not friend_ids:
+        return jsonify({"error": "friend_ids is required"}), 400
+
+    user_id = current_user_id()
+    if user_id in friend_ids:
+        return jsonify({"error": "You can't call yourself"}), 400
+    if len(friend_ids) + 1 > CALL_MAX_PARTICIPANTS:
+        return jsonify({"error": f"Group calls are capped at {CALL_MAX_PARTICIPANTS} participants"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT friend_id FROM friendships WHERE user_id = %s AND friend_id = ANY(%s)",
+        (user_id, friend_ids),
+    )
+    valid_friend_ids = {r["friend_id"] for r in cur.fetchall()}
+    if set(friend_ids) - valid_friend_ids:
+        return jsonify({"error": "You can only call your friends"}), 400
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    username = cur.fetchone()["username"]
+    category = get_user_personalization(cur, user_id)
+    room_name = f"call-{uuid.uuid4().hex[:16]}"
+
+    cur.execute(
+        "INSERT INTO calls (initiator_user_id, room_name, category) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, room_name, category),
+    )
+    call_id = cur.fetchone()["id"]
+    cur.execute(
+        "INSERT INTO call_participants (call_id, user_id, status, joined_at) VALUES (%s, %s, 'joined', now())",
+        (call_id, user_id),
+    )
+    for fid in friend_ids:
+        cur.execute(
+            "INSERT INTO call_participants (call_id, user_id, status) VALUES (%s, %s, 'invited')",
+            (call_id, fid),
+        )
+    db.commit()
+
+    token = generate_livekit_token(user_id, username, room_name)
+    for fid in friend_ids:
+        push_notification(fid, {
+            "type": "incoming_call", "call_id": call_id, "room_name": room_name,
+            "caller_id": user_id, "caller_name": username,
+        })
+
+    return jsonify({
+        "call_id": call_id, "room_name": room_name, "token": token,
+        "livekit_url": os.getenv("LIVEKIT_URL"),
+    })
+
+
+@app.route("/calls/<int:call_id>/join", methods=["POST"])
+@login_required
+def join_call(call_id):
+    if not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+        return jsonify({"error": "Calling is not configured (missing LIVEKIT_API_KEY/LIVEKIT_API_SECRET)"}), 500
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE call_participants SET status = 'joined', joined_at = now() "
+        "WHERE call_id = %s AND user_id = %s RETURNING id",
+        (call_id, user_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Call not found"}), 404
+    cur.execute("UPDATE calls SET status = 'active' WHERE id = %s AND status = 'ringing'", (call_id,))
+    cur.execute("SELECT room_name FROM calls WHERE id = %s", (call_id,))
+    room_name = cur.fetchone()["room_name"]
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    username = cur.fetchone()["username"]
+    token = generate_livekit_token(user_id, username, room_name)
+    return jsonify({
+        "call_id": call_id, "room_name": room_name, "token": token,
+        "livekit_url": os.getenv("LIVEKIT_URL"),
+    })
+
+
+@app.route("/calls/<int:call_id>/decline", methods=["POST"])
+@login_required
+def decline_call(call_id):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE call_participants SET status = 'declined' WHERE call_id = %s AND user_id = %s RETURNING id",
+        (call_id, current_user_id()),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "Call not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/calls/<int:call_id>/leave", methods=["POST"])
+@login_required
+def leave_call(call_id):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE call_participants SET status = 'left', left_at = now() "
+        "WHERE call_id = %s AND user_id = %s RETURNING id",
+        (call_id, current_user_id()),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Call not found"}), 404
+
+    cur.execute(
+        "SELECT count(*) AS n FROM call_participants WHERE call_id = %s AND status = 'joined'",
+        (call_id,),
+    )
+    call_ended = cur.fetchone()["n"] == 0
+    if call_ended:
+        cur.execute(
+            "UPDATE calls SET status = 'ended', ended_at = now() WHERE id = %s AND status != 'ended'",
+            (call_id,),
+        )
+    db.commit()
+    return jsonify({"ok": True, "call_ended": call_ended})
+
+
+@app.route("/calls/<int:call_id>/recording", methods=["POST"])
+@login_required
+def upload_call_recording(call_id):
+    """Receives the initiator's client-side mixed-audio recording once the
+    call ends. Same Deepgram diarized-transcription call as /transcribe,
+    then reuses the existing conversation-creation + analysis pipeline --
+    the resulting conversation is indistinguishable from a solo dictation
+    one, just tagged via calls.conversation_id."""
+    if "audio" not in request.files:
+        return jsonify({"error": "No audio file uploaded"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT c.category, c.conversation_id FROM calls c "
+        "JOIN call_participants cp ON cp.call_id = c.id "
+        "WHERE c.id = %s AND cp.user_id = %s",
+        (call_id, user_id),
+    )
+    call = cur.fetchone()
+    if not call:
+        return jsonify({"error": "Call not found"}), 404
+    if call["conversation_id"]:
+        return jsonify({"conversation_id": call["conversation_id"], "already_processed": True})
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    content_type = audio_file.mimetype or "audio/webm"
+
+    try:
+        resp = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
+            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
+            data=audio_bytes,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        return jsonify({"error": f"Deepgram error: {e}"}), status
+    except requests.RequestException as e:
+        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
+
+    utterances = (resp.json().get("results") or {}).get("utterances") or []
+    lines = []
+    for utt in utterances:
+        text = (utt.get("transcript") or "").strip()
+        if text:
+            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
+    raw_transcript = "\n".join(lines)
+
+    cur.execute("SELECT user_id FROM call_participants WHERE call_id = %s", (call_id,))
+    participant_ids = [r["user_id"] for r in cur.fetchall()]
+
+    # One conversation row per participant, not just the uploader --
+    # conversations.user_id is a single owner (same as every solo-dictation
+    # conversation; there's no shared-ownership concept elsewhere in the
+    # app), so without this only the uploader's own GET /conversations
+    # would ever return it. Same transcript/category copied to each; each
+    # person's title/task/profile/mood extraction still runs independently
+    # via the existing per-user pipeline, so it stays consistent with how
+    # every other conversation in the app is attributed.
+    conversation_ids = {}
+    for pid in participant_ids:
+        cur.execute(
+            "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
+            (pid, None, raw_transcript, call["category"]),
+        )
+        conversation_ids[pid] = cur.fetchone()["id"]
+
+    primary_conversation_id = conversation_ids[user_id]
+    cur.execute("UPDATE calls SET conversation_id = %s WHERE id = %s", (primary_conversation_id, call_id))
+    db.commit()
+
+    if raw_transcript.strip():
+        for pid, conv_id in conversation_ids.items():
+            threading.Thread(target=run_conversation_titling, args=(conv_id, raw_transcript), daemon=True).start()
+            # No live websocket to push background_update to here (this is a
+            # REST upload, not a /ws/listen session) -- a no-op push is a
+            # valid, unmodified use of the existing function.
+            threading.Thread(
+                target=run_background_analysis,
+                args=(pid, conv_id, raw_transcript, lambda *a, **k: None),
+                daemon=True,
+            ).start()
+
+    for pid, conv_id in conversation_ids.items():
+        push_notification(pid, {
+            "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conv_id,
+        })
+
+    return jsonify({"conversation_id": primary_conversation_id})
+
+
+def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
+    base = (
         "You are a concise assistant answering questions about a live or saved "
         "conversation transcript. Be direct: answer what was asked, no restating "
         "the question, no unnecessary preamble or filler, no padding a short "
@@ -1805,6 +2395,27 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION):
         "clarification when it's inferable from context. "
         + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
     )
+    return base + (f" {persona_context}" if persona_context else "")
+
+
+def build_global_chat_system_prompt(persona_context="", speaker_name=None):
+    """For /chat/global -- answering from EXCERPTS OF SEVERAL past
+    conversations (not one), each labeled with its own date, so the model
+    needs to reason across sessions instead of treating everything as one
+    contiguous transcript."""
+    now_local = datetime.now().astimezone()
+    base = (
+        f"Today is {now_local.strftime('%A, %Y-%m-%d')}. You are answering a question using "
+        "excerpts from several of the user's own past recorded conversations, each labeled with "
+        "its own date/title/category. Use those dates to resolve relative time references "
+        "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
+        "continuous conversation. Ground your answer only in what's in these excerpts; if the "
+        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble."
+    )
+    if speaker_name:
+        base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
+    return base + (f" {persona_context}" if persona_context else "")
+
 
 # Chat history lives permanently in the chat_messages table -- nothing here
 # ever deletes a row. CHAT_HISTORY_MAX_TURNS only bounds how many of the
@@ -1831,6 +2442,21 @@ def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
         "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
         (user_id, conversation_id, prompt, user_id, conversation_id, reply),
     )
+
+
+def load_global_chat_context(cur, user_id):
+    """Same idea as load_chat_context, but for /chat/global's thread --
+    conversation_id IS NULL there, and plain `= NULL` never matches in SQL
+    (three-valued logic), so this needs its own query rather than reusing
+    load_chat_context with conversation_id=None."""
+    cur.execute(
+        "SELECT role, content FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id IS NULL "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, CHAT_HISTORY_MAX_TURNS * 2),
+    )
+    rows = cur.fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
 @app.route("/conversations", methods=["GET"])
@@ -1953,7 +2579,8 @@ def chat():
     # instead of treating every message as a fresh, isolated call.
     history = load_chat_context(cur, user_id, conversation_id) if conversation_id else []
 
-    messages = [{"role": "system", "content": build_chat_system_prompt(mode)}]
+    persona_context = build_persona_context(get_user_persona(cur, user_id))
+    messages = [{"role": "system", "content": build_chat_system_prompt(mode, persona_context)}]
     messages.extend(history)
     messages.append({"role": "user", "content": current_turn_content})
 
@@ -1986,6 +2613,124 @@ def chat():
         push_notification(user_id, {"type": "chat_message", "conversation_id": conversation_id})
 
     return jsonify({"reply": reply})
+
+
+# How many past conversations to pull into one /chat/global answer, and how
+# much of each to send -- keeps a multi-session answer's cost in the same
+# ballpark as a single-conversation /chat call instead of scaling with the
+# user's entire history.
+GLOBAL_CHAT_MAX_CONVERSATIONS = 6
+GLOBAL_CHAT_CHARS_PER_CONVERSATION = 1200
+
+
+@app.route("/chat/global", methods=["GET"])
+@login_required
+def get_global_chat_history():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT role, content, created_at FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id IS NULL ORDER BY created_at ASC",
+        (current_user_id(),),
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
+
+
+@app.route("/chat/global", methods=["POST"])
+@login_required
+def chat_global():
+    """Cross-session Q&A -- e.g. "What was the topic of discussion with
+    Rahul last week?" Not tied to one conversation_id: if the question
+    names a known person, retrieval is scoped to every conversation they've
+    ever appeared in (via profile_conversations); otherwise it falls back
+    to the user's most recent conversations overall. Persisted permanently
+    (conversation_id NULL, same table as per-conversation chat) so this
+    thread survives closing the panel, reloading, or logging out -- same
+    durability /chat already has, just not scoped to one conversation."""
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    persona_context = build_persona_context(get_user_persona(cur, user_id))
+
+    # Cheap local keyword match against this user's known people -- no extra
+    # LLM call just to figure out who the question is about.
+    cur.execute("SELECT id, name FROM speaker_profiles WHERE user_id = %s", (user_id,))
+    matched = None
+    prompt_lower = prompt.lower()
+    for p in cur.fetchall():
+        if re.search(r"\b" + re.escape(p["name"].lower()) + r"\b", prompt_lower):
+            matched = p
+            break
+
+    if matched:
+        cur.execute(
+            "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
+            "FROM profile_conversations pc JOIN conversations c ON c.id = pc.conversation_id "
+            "WHERE pc.profile_id = %s ORDER BY c.created_at DESC LIMIT %s",
+            (matched["id"], GLOBAL_CHAT_MAX_CONVERSATIONS),
+        )
+    else:
+        cur.execute(
+            "SELECT id, title, created_at, category, raw_transcript FROM conversations "
+            "WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+            (user_id, GLOBAL_CHAT_MAX_CONVERSATIONS),
+        )
+    conversations = cur.fetchall()
+
+    if not conversations:
+        reply = "I don't have any past conversations to draw from yet."
+        append_chat_messages(cur, user_id, None, prompt, reply)
+        db.commit()
+        return jsonify({"reply": reply, "matched_speaker": None, "conversations_used": 0})
+
+    blocks = []
+    for c in conversations:
+        excerpt = (c["raw_transcript"] or "")[:GLOBAL_CHAT_CHARS_PER_CONVERSATION]
+        when = c["created_at"].strftime("%A, %Y-%m-%d %H:%M") if isinstance(c["created_at"], datetime) else str(c["created_at"])
+        blocks.append(f"[{when} - {c['title'] or 'Untitled'} ({c['category']})]\n{excerpt}")
+
+    # Prior exchanges in this thread, read back from the DB -- same
+    # follow-up-resolution role load_chat_context plays for /chat.
+    history = load_global_chat_context(cur, user_id)
+
+    user_content = "\n\n---\n\n".join(blocks) + f"\n\n---\n\nUser question:\n{prompt}"
+    messages = [{"role": "system", "content": build_global_chat_system_prompt(persona_context, matched["name"] if matched else None)}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        reply = call_llm(messages)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        if status == 429:
+            return jsonify({
+                "reply": "Ollama quota is currently exhausted or rate limited. Please try again later or use a different API key."
+            })
+        try:
+            error_json = e.response.json()
+        except Exception:
+            error_json = {"error": str(e)}
+        return jsonify({"error": error_json}), status
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+
+    if reply:
+        # Store the clean question/reply, not the retrieval blob -- that
+        # gets freshly rebuilt from profile_conversations/conversations on
+        # every turn already, so saving it too would duplicate it forever.
+        append_chat_messages(cur, user_id, None, prompt, reply)
+        db.commit()
+
+    return jsonify({
+        "reply": reply,
+        "matched_speaker": matched["name"] if matched else None,
+        "conversations_used": len(conversations),
+    })
 
 
 verify_db_connection()
