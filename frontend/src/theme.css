@@ -231,6 +231,28 @@ input, textarea { font-family: inherit; }
 .hint { font-size: 12.5px; color: var(--wa-text-soft); margin: 4px 0 12px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--wa-accent); display: inline-block; margin-right: 6px; }
 
+/* ---------- Voice calling ---------- */
+.call-overlay {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.55);
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.call-card {
+  background: var(--wa-panel); border-radius: 12px; padding: 32px 28px; width: 320px; max-width: 100%;
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+}
+.call-card .avatar.lg { margin-bottom: 14px; }
+.call-title { font-size: 18px; font-weight: 600; }
+.call-sub { font-size: 13.5px; color: var(--wa-text-soft); margin-top: 2px; }
+.call-recording-notice { font-size: 12px; color: var(--wa-danger); margin: 10px 0 4px; }
+.call-audio-blocked { background: #FFF3CD; color: #7A5B00; width: 100%; margin-top: 10px; }
+.call-audio-blocked:hover { background: #FFE8A3; }
+.call-actions { display: flex; gap: 12px; margin-top: 18px; width: 100%; }
+.call-actions .btn { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.call-actions .btn svg { width: 16px; height: 16px; }
+.call-btn { color: var(--wa-accent); }
+.call-btn:hover { background: var(--wa-hover); }
+
 .email-sent-badge { display: inline-flex; align-items: center; margin-left: 6px; color: var(--wa-accent); flex-shrink: 0; }
 .email-sent-badge svg { width: 13px; height: 13px; }
 

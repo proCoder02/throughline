@@ -281,3 +281,36 @@ CREATE TABLE IF NOT EXISTS profile_conversations (
     UNIQUE (profile_id, conversation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_profile_conversations_profile ON profile_conversations (profile_id, created_at DESC);
+
+-- ============================================================================
+-- Voice calling (1:1 + group), via LiveKit. One row shape covers both --
+-- a 1:1 call is just a call with 2 call_participants rows, group is N --
+-- no special-casing, matching how LiveKit itself treats rooms uniformly.
+-- Calling is friends-only (app-side check against the friendships table,
+-- same trust boundary mood-sharing already uses); recording/transcription
+-- always runs on call end (LiveKit Egress -> Deepgram -> conversations),
+-- same pipeline solo live-listening already uses.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS calls (
+    id SERIAL PRIMARY KEY,
+    initiator_user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    room_name TEXT NOT NULL UNIQUE,
+    category TEXT NOT NULL DEFAULT 'personal',
+    status TEXT NOT NULL DEFAULT 'ringing',
+    conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS call_participants (
+    id SERIAL PRIMARY KEY,
+    call_id INTEGER NOT NULL REFERENCES calls (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'invited',
+    joined_at TIMESTAMPTZ,
+    left_at TIMESTAMPTZ,
+    UNIQUE (call_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_call_participants_call ON call_participants (call_id);
+CREATE INDEX IF NOT EXISTS idx_call_participants_user ON call_participants (user_id);
+CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls (initiator_user_id);

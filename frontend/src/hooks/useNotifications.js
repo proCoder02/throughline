@@ -8,6 +8,7 @@ import { getToken } from '../api.js';
 export function useNotifications(enabled) {
   const [taskCount, setTaskCount] = useState(0);
   const [unreadChatIds, setUnreadChatIds] = useState(() => new Set());
+  const [incomingCall, setIncomingCall] = useState(null); // {callId, roomName, callerId, callerName}
   const socketRef = useRef(null);
 
   useEffect(() => {
@@ -21,8 +22,13 @@ export function useNotifications(enabled) {
       const msg = JSON.parse(event.data);
       if (msg.type === 'task_created') {
         setTaskCount((c) => c + 1);
-      } else if (msg.type === 'chat_message') {
+      } else if (msg.type === 'chat_message' || msg.type === 'call_conversation_ready') {
+        // A call's transcribed conversation shows up in Chats the exact
+        // same way a new chat message would -- an unread dot, discovered
+        // on next visit to the tab (ChatsSection refetches on mount).
         setUnreadChatIds((prev) => new Set(prev).add(msg.conversation_id));
+      } else if (msg.type === 'incoming_call') {
+        setIncomingCall({ callId: msg.call_id, roomName: msg.room_name, callerId: msg.caller_id, callerName: msg.caller_name });
       }
     };
     return () => socket.close();
@@ -36,5 +42,7 @@ export function useNotifications(enabled) {
     return next;
   });
 
-  return { taskCount, unreadChatIds, clearTasks, clearChat };
+  const clearIncomingCall = () => setIncomingCall(null);
+
+  return { taskCount, unreadChatIds, clearTasks, clearChat, incomingCall, clearIncomingCall };
 }

@@ -25,6 +25,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import livekit.api as livekit_api
 
 load_dotenv()
 
@@ -2110,6 +2111,276 @@ def friend_mood(friend_id):
     )
     entries = [serialize_row(r) for r in cur.fetchall()]
     return jsonify({"friend_id": friend_id, "entries": entries})
+
+
+# ---------------------------------------------------------------------------
+# Voice calling (1:1 + group), via LiveKit Cloud
+#
+# Calling is friends-only (same trust boundary as mood-sharing above). One
+# call_participants row shape covers both 1:1 (2 rows) and group (N rows) --
+# no special-casing. LiveKit's own SFU/room hosting means the app never
+# touches raw media -- this server only ever signs short-lived join tokens
+# and tracks call/participant state; the actual audio never passes through
+# Flask. Recording deliberately does NOT use LiveKit's server-side Egress
+# (that requires S3/GCS/Azure storage + IAM credentials on top of LiveKit
+# Cloud itself) -- instead the call initiator's browser mixes local + remote
+# audio client-side and uploads the result to /calls/<id>/recording, which
+# reuses the exact same Deepgram diarization call as /transcribe.
+# ---------------------------------------------------------------------------
+
+CALL_MAX_PARTICIPANTS = 8  # including the initiator
+
+
+def generate_livekit_token(user_id, username, room_name):
+    api_key = os.getenv("LIVEKIT_API_KEY")
+    api_secret = os.getenv("LIVEKIT_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing LIVEKIT_API_KEY/LIVEKIT_API_SECRET")
+    grants = livekit_api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True)
+    token = (
+        livekit_api.AccessToken(api_key, api_secret)
+        .with_identity(str(user_id))
+        .with_name(username)
+        .with_grants(grants)
+        .with_ttl(timedelta(hours=4))
+    )
+    return token.to_jwt()
+
+
+@app.route("/calls", methods=["POST"])
+@login_required
+def create_call():
+    if not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+        return jsonify({"error": "Calling is not configured (missing LIVEKIT_API_KEY/LIVEKIT_API_SECRET)"}), 500
+
+    data = request.get_json(silent=True) or {}
+    try:
+        friend_ids = list({int(f) for f in (data.get("friend_ids") or [])})
+    except (TypeError, ValueError):
+        return jsonify({"error": "friend_ids must be a list of user ids"}), 400
+    if not friend_ids:
+        return jsonify({"error": "friend_ids is required"}), 400
+
+    user_id = current_user_id()
+    if user_id in friend_ids:
+        return jsonify({"error": "You can't call yourself"}), 400
+    if len(friend_ids) + 1 > CALL_MAX_PARTICIPANTS:
+        return jsonify({"error": f"Group calls are capped at {CALL_MAX_PARTICIPANTS} participants"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT friend_id FROM friendships WHERE user_id = %s AND friend_id = ANY(%s)",
+        (user_id, friend_ids),
+    )
+    valid_friend_ids = {r["friend_id"] for r in cur.fetchall()}
+    if set(friend_ids) - valid_friend_ids:
+        return jsonify({"error": "You can only call your friends"}), 400
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    username = cur.fetchone()["username"]
+    category = get_user_personalization(cur, user_id)
+    room_name = f"call-{uuid.uuid4().hex[:16]}"
+
+    cur.execute(
+        "INSERT INTO calls (initiator_user_id, room_name, category) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, room_name, category),
+    )
+    call_id = cur.fetchone()["id"]
+    cur.execute(
+        "INSERT INTO call_participants (call_id, user_id, status, joined_at) VALUES (%s, %s, 'joined', now())",
+        (call_id, user_id),
+    )
+    for fid in friend_ids:
+        cur.execute(
+            "INSERT INTO call_participants (call_id, user_id, status) VALUES (%s, %s, 'invited')",
+            (call_id, fid),
+        )
+    db.commit()
+
+    token = generate_livekit_token(user_id, username, room_name)
+    for fid in friend_ids:
+        push_notification(fid, {
+            "type": "incoming_call", "call_id": call_id, "room_name": room_name,
+            "caller_id": user_id, "caller_name": username,
+        })
+
+    return jsonify({
+        "call_id": call_id, "room_name": room_name, "token": token,
+        "livekit_url": os.getenv("LIVEKIT_URL"),
+    })
+
+
+@app.route("/calls/<int:call_id>/join", methods=["POST"])
+@login_required
+def join_call(call_id):
+    if not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+        return jsonify({"error": "Calling is not configured (missing LIVEKIT_API_KEY/LIVEKIT_API_SECRET)"}), 500
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE call_participants SET status = 'joined', joined_at = now() "
+        "WHERE call_id = %s AND user_id = %s RETURNING id",
+        (call_id, user_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Call not found"}), 404
+    cur.execute("UPDATE calls SET status = 'active' WHERE id = %s AND status = 'ringing'", (call_id,))
+    cur.execute("SELECT room_name FROM calls WHERE id = %s", (call_id,))
+    room_name = cur.fetchone()["room_name"]
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    username = cur.fetchone()["username"]
+    token = generate_livekit_token(user_id, username, room_name)
+    return jsonify({
+        "call_id": call_id, "room_name": room_name, "token": token,
+        "livekit_url": os.getenv("LIVEKIT_URL"),
+    })
+
+
+@app.route("/calls/<int:call_id>/decline", methods=["POST"])
+@login_required
+def decline_call(call_id):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE call_participants SET status = 'declined' WHERE call_id = %s AND user_id = %s RETURNING id",
+        (call_id, current_user_id()),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "Call not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/calls/<int:call_id>/leave", methods=["POST"])
+@login_required
+def leave_call(call_id):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE call_participants SET status = 'left', left_at = now() "
+        "WHERE call_id = %s AND user_id = %s RETURNING id",
+        (call_id, current_user_id()),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Call not found"}), 404
+
+    cur.execute(
+        "SELECT count(*) AS n FROM call_participants WHERE call_id = %s AND status = 'joined'",
+        (call_id,),
+    )
+    call_ended = cur.fetchone()["n"] == 0
+    if call_ended:
+        cur.execute(
+            "UPDATE calls SET status = 'ended', ended_at = now() WHERE id = %s AND status != 'ended'",
+            (call_id,),
+        )
+    db.commit()
+    return jsonify({"ok": True, "call_ended": call_ended})
+
+
+@app.route("/calls/<int:call_id>/recording", methods=["POST"])
+@login_required
+def upload_call_recording(call_id):
+    """Receives the initiator's client-side mixed-audio recording once the
+    call ends. Same Deepgram diarized-transcription call as /transcribe,
+    then reuses the existing conversation-creation + analysis pipeline --
+    the resulting conversation is indistinguishable from a solo dictation
+    one, just tagged via calls.conversation_id."""
+    if "audio" not in request.files:
+        return jsonify({"error": "No audio file uploaded"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT c.category, c.conversation_id FROM calls c "
+        "JOIN call_participants cp ON cp.call_id = c.id "
+        "WHERE c.id = %s AND cp.user_id = %s",
+        (call_id, user_id),
+    )
+    call = cur.fetchone()
+    if not call:
+        return jsonify({"error": "Call not found"}), 404
+    if call["conversation_id"]:
+        return jsonify({"conversation_id": call["conversation_id"], "already_processed": True})
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    content_type = audio_file.mimetype or "audio/webm"
+
+    try:
+        resp = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
+            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
+            data=audio_bytes,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        return jsonify({"error": f"Deepgram error: {e}"}), status
+    except requests.RequestException as e:
+        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
+
+    utterances = (resp.json().get("results") or {}).get("utterances") or []
+    lines = []
+    for utt in utterances:
+        text = (utt.get("transcript") or "").strip()
+        if text:
+            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
+    raw_transcript = "\n".join(lines)
+
+    cur.execute("SELECT user_id FROM call_participants WHERE call_id = %s", (call_id,))
+    participant_ids = [r["user_id"] for r in cur.fetchall()]
+
+    # One conversation row per participant, not just the uploader --
+    # conversations.user_id is a single owner (same as every solo-dictation
+    # conversation; there's no shared-ownership concept elsewhere in the
+    # app), so without this only the uploader's own GET /conversations
+    # would ever return it. Same transcript/category copied to each; each
+    # person's title/task/profile/mood extraction still runs independently
+    # via the existing per-user pipeline, so it stays consistent with how
+    # every other conversation in the app is attributed.
+    conversation_ids = {}
+    for pid in participant_ids:
+        cur.execute(
+            "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
+            (pid, None, raw_transcript, call["category"]),
+        )
+        conversation_ids[pid] = cur.fetchone()["id"]
+
+    primary_conversation_id = conversation_ids[user_id]
+    cur.execute("UPDATE calls SET conversation_id = %s WHERE id = %s", (primary_conversation_id, call_id))
+    db.commit()
+
+    if raw_transcript.strip():
+        for pid, conv_id in conversation_ids.items():
+            threading.Thread(target=run_conversation_titling, args=(conv_id, raw_transcript), daemon=True).start()
+            # No live websocket to push background_update to here (this is a
+            # REST upload, not a /ws/listen session) -- a no-op push is a
+            # valid, unmodified use of the existing function.
+            threading.Thread(
+                target=run_background_analysis,
+                args=(pid, conv_id, raw_transcript, lambda *a, **k: None),
+                daemon=True,
+            ).start()
+
+    for pid, conv_id in conversation_ids.items():
+        push_notification(pid, {
+            "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conv_id,
+        })
+
+    return jsonify({"conversation_id": primary_conversation_id})
 
 
 def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):

@@ -9,6 +9,7 @@ pyopenssl
 cryptography
 requests
 python-dotenv
+livekit-api
 av
 numpy
 tensorflow

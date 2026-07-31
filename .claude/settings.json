@@ -11,7 +11,25 @@
       "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_global_chat.py\")",
       "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\backfill_profile_conversations.py\" ec2-user@rapexapi.nodexdata.click:~/throughline/backfill_pc.py)",
       "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_global_persist.py\")",
-      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/ChatsSection.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/)"
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/ChatsSection.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/)",
+      "Bash(./.venv/Scripts/python.exe -m pip install livekit-api)",
+      "Bash(npm install *)",
+      "Bash(node -e \"console.log\\(require\\('./node_modules/livekit-client/package.json'\\).version\\)\")",
+      "Bash(node -e ' *)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_calls.py\")",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_call_signaling.py\")",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/app.py c:/Users/P3INW57/Desktop/speech2text/schema.sql c:/Users/P3INW57/Desktop/speech2text/requirements.txt ec2-user@rapexapi.nodexdata.click:~/throughline/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/theme.css c:/Users/P3INW57/Desktop/speech2text/frontend/src/api.js c:/Users/P3INW57/Desktop/speech2text/frontend/src/icons.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/App.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/hooks/useCall.js c:/Users/P3INW57/Desktop/speech2text/frontend/src/hooks/useNotifications.js ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/hooks/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/CallOverlay.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/FriendsSection.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/package.json c:/Users/P3INW57/Desktop/speech2text/frontend/package-lock.json ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/hooks/useCall.js ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/hooks/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/hooks/useCall.js c:/Users/P3INW57/Desktop/speech2text/frontend/src/theme.css ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/CallOverlay.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/App.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/../)",
+      "Bash(curl -sS https://rapexapi.nodexdata.click/)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_call_conversation_sharing.py\")",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/app.py ec2-user@rapexapi.nodexdata.click:~/throughline/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/App.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/ringtone.js ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/)"
     ]
   }
 }
