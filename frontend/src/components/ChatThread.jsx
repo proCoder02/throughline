@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import MessageBubble from './MessageBubble.jsx';
 import Composer from './Composer.jsx';
-import { BackIcon, InfoIcon, TrashIcon, MicIcon } from '../icons.jsx';
+import { BackIcon, InfoIcon, TrashIcon, MicIcon, CloseIcon } from '../icons.jsx';
 
 export default function ChatThread({
   title, isLive, liveStatus, seenIndices, speakerNames,
   pendingSpeakerIndex, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
+  tags, onTagClick, onDismissTag,
   messages, onSend, sending, onToggleInfo, onDelete, onListen, onStopListen, onBack,
 }) {
   const scrollRef = useRef(null);
@@ -58,6 +59,23 @@ export default function ChatThread({
           <div className="list-empty">Ask a question about this conversation to get started.</div>
         )}
       </div>
+
+      {tags?.length > 0 && (
+        <div className="topic-tags">
+          {tags.map((tag) => (
+            <button key={tag} className="topic-tag" title={`Ask about "${tag}"`} onClick={() => onTagClick?.(tag)}>
+              <span>{tag}</span>
+              <span
+                className="topic-tag-x"
+                title="Dismiss"
+                onClick={(e) => { e.stopPropagation(); onDismissTag?.(tag); }}
+              >
+                <CloseIcon />
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
 
       <Composer
         onSend={onSend}

@@ -12,6 +12,7 @@ export function useLiveSession({ onSessionStarted, onEnded }) {
   const [seenIndices, setSeenIndices] = useState([]);
   const [pendingSpeakerIndex, setPendingSpeakerIndex] = useState(null);
   const [knownSpeakers, setKnownSpeakers] = useState([]);
+  const [tags, setTags] = useState([]); // live topic chips, extracted alongside the existing background analysis pass -- no extra LLM call
 
   const socketRef = useRef(null);
   const recorderRef = useRef(null);
@@ -53,6 +54,7 @@ export function useLiveSession({ onSessionStarted, onEnded }) {
       setLines([]);
       setSpeakerNames({});
       setSeenIndices([]);
+      setTags([]);
     };
 
     socket.onmessage = (event) => {
@@ -67,6 +69,13 @@ export function useLiveSession({ onSessionStarted, onEnded }) {
         openPrompt(0);
       } else if (msg.type === 'background_update') {
         setStatus(`Auto-extracted ${msg.tasks_found} task(s), notes on ${msg.speakers_found} speaker(s).`);
+        if (msg.tags?.length) {
+          setTags((prev) => {
+            const existing = new Set(prev.map((t) => t.toLowerCase()));
+            const fresh = msg.tags.filter((t) => !existing.has(t.toLowerCase()));
+            return [...prev, ...fresh].slice(-12); // cap so a long call doesn't grow this forever
+          });
+        }
       } else if (msg.type === 'error') {
         setStatus('Error: ' + msg.message);
       }
@@ -100,13 +109,19 @@ export function useLiveSession({ onSessionStarted, onEnded }) {
     setPendingSpeakerIndex(null);
   }, []);
 
+  // Used both for the dismiss ("x") button and after a tag is clicked/sent
+  // to chat -- either way it's done being a suggestion once acted on.
+  const removeTag = useCallback((tag) => {
+    setTags((prev) => prev.filter((t) => t !== tag));
+  }, []);
+
   const transcriptText = lines
     .map((l) => `${speakerNames[l.speakerIndex] || 'Speaker ' + l.speakerIndex}: ${l.text}`)
     .join('\n');
 
   return {
     isListening, status, lines, speakerNames, seenIndices, transcriptText,
-    pendingSpeakerIndex, knownSpeakers, openPrompt,
-    start, stop, nameSpeaker, dismissPrompt,
+    pendingSpeakerIndex, knownSpeakers, openPrompt, tags,
+    start, stop, nameSpeaker, dismissPrompt, removeTag,
   };
 }

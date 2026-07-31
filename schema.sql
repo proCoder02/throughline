@@ -205,3 +205,51 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profiles_user ON speaker_profiles (user_i
 -- LLM-context read in /chat and the full-history read in
 -- GET /conversations/<id>/chat).
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages (conversation_id, created_at);
+
+-- ============================================================================
+-- Persona onboarding -- captured once, right after registration, and fed
+-- into the LLM system prompts (chat + analysis) so responses/extraction can
+-- be tailored to the person instead of generic. One row per user; its mere
+-- existence is also the "has this user completed onboarding" flag.
+-- hobbies/interests are multi-select from a small fixed list (validated
+-- app-side, same convention as personalization/category) so a Postgres
+-- array is a natural fit -- no join table needed for a bounded pick-list.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_personas (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    age INTEGER,
+    gender TEXT,
+    language_preference TEXT,
+    hobbies TEXT[] NOT NULL DEFAULT '{}',
+    interests TEXT[] NOT NULL DEFAULT '{}',
+    occupation TEXT,
+    primary_goal TEXT,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- Custom categories -- personal/office/study are always available (built
+-- into app code, not a DB row); this table holds each user's additional
+-- ones. Referenced by name (not id) from conversations.category / tasks'
+-- derived category / users.personalization, same as the 3 built-ins, so
+-- nothing about the existing category plumbing needs to change -- this
+-- just widens what app-side validation accepts for a given user.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_categories (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_user_categories_user ON user_categories (user_id);
+
+-- Lets a task's description/due_date be corrected after extraction (the LLM
+-- sometimes mishears/misparses) without deleting and recreating the task
+-- (which would lose reminder_at/email_sent history).
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+
+-- Per-relationship nickname -- each direction of a friendship is already
+-- its own row (see friendships above), so "the name *I* call this friend"
+-- naturally lives on *my* row without colliding with what they call me.
+ALTER TABLE friendships ADD COLUMN IF NOT EXISTS nickname TEXT;

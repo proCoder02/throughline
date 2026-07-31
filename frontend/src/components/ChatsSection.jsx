@@ -91,6 +91,13 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     }
   };
 
+  // A tag click reuses the exact same send path as typing into the
+  // composer -- the tag text becomes the chat prompt, with full context.
+  const handleTagClick = (tag) => {
+    sendMessage(tag);
+    live.removeTag(tag);
+  };
+
   const deleteConversation = async (id) => {
     if (!confirm('Delete this conversation permanently? This cannot be undone.')) return;
     await conv.removeConv(id);
@@ -145,6 +152,9 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           onNameSpeaker={live.nameSpeaker}
           onSkipSpeaker={live.dismissPrompt}
           onReopenPrompt={live.openPrompt}
+          tags={live.tags}
+          onTagClick={handleTagClick}
+          onDismissTag={live.removeTag}
           messages={messages}
           onSend={sendMessage}
           sending={sending}

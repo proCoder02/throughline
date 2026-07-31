@@ -15,3 +15,4 @@ export const MicIcon = () => <svg {...base}><path d="M12 15a3 3 0 003-3V6a3 3 0 
 export const MoreIcon = () => <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>;
 export const CheckIcon = () => <svg {...base}><path d="M4 12l5 5L20 6"/></svg>;
 export const MailIcon = () => <svg {...base}><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>;
+export const CloseIcon = () => <svg {...base}><path d="M6 6l12 12M18 6L6 18"/></svg>;

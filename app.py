@@ -180,10 +180,83 @@ def normalize_personalization(value):
 
 
 def get_user_personalization(cur, user_id):
+    """Returns the user's current mode as stored -- a built-in one OR a
+    custom category -- NOT run through normalize_personalization(), so a
+    custom category correctly flows through to new conversations' category
+    tagging (e.g. /ws/listen) instead of being coerced back to 'personal'.
+    Callers that need LLM guidance text still get a safe fallback: both
+    build_chat_system_prompt and build_analysis_prompt call
+    normalize_personalization() themselves before indexing
+    PERSONALIZATION_GUIDANCE, so a custom category there just falls back to
+    the 'personal' guidance copy rather than erroring."""
     cur.execute("SELECT personalization FROM users WHERE id = %s", (user_id,))
     row = cur.fetchone()
-    mode = row["personalization"] if row else None
-    return normalize_personalization(mode)
+    value = row["personalization"] if row else None
+    return value or DEFAULT_PERSONALIZATION
+
+
+def is_valid_category_for_user(cur, user_id, value):
+    """A category is either one of the 3 built-in personalization modes, or
+    one this specific user created (user_categories) -- lets custom
+    categories slot into the exact same personalization/category field
+    everywhere without touching how it's stored or how LLM guidance for it
+    is picked (normalize_personalization already falls back to 'personal'
+    guidance for anything outside the built-in 3, custom categories included
+    -- that fallback was already there, nothing new needed for it)."""
+    if value in PERSONALIZATION_MODES:
+        return True
+    cur.execute(
+        "SELECT 1 FROM user_categories WHERE user_id = %s AND name = %s",
+        (user_id, value),
+    )
+    return cur.fetchone() is not None
+
+
+# ---------------------------------------------------------------------------
+# Persona onboarding -- captured once right after registration, injected as
+# a compact one-line summary into the chat/analysis system prompts so the
+# LLM can tailor tone/relevance to the person, not just the personalization
+# mode. Option lists are validated app-side, same convention as
+# PERSONALIZATION_MODES/category.
+# ---------------------------------------------------------------------------
+
+GENDER_OPTIONS = ["Male", "Female", "Non-binary", "Prefer not to say"]
+LANGUAGE_OPTIONS = ["English", "Hindi", "Spanish", "French", "German", "Mandarin", "Arabic"]
+HOBBY_OPTIONS = ["Reading", "Sports & Fitness", "Music", "Gaming", "Travel", "Cooking", "Art & Design"]
+INTEREST_OPTIONS = [
+    "Technology", "Finance & Business", "Health & Wellness", "Arts & Culture",
+    "Sports", "Politics & Current Affairs", "Science",
+]
+
+
+def get_user_persona(cur, user_id):
+    cur.execute("SELECT * FROM user_personas WHERE user_id = %s", (user_id,))
+    return cur.fetchone()
+
+
+def build_persona_context(persona):
+    """One compact line, not a paragraph -- this gets appended to every
+    chat/analysis system prompt, so cost scales with how much we put here."""
+    if not persona:
+        return ""
+    bits = []
+    if persona.get("age"):
+        bits.append(f"age {persona['age']}")
+    if persona.get("gender"):
+        bits.append(persona["gender"])
+    if persona.get("occupation"):
+        bits.append(persona["occupation"])
+    if persona.get("language_preference"):
+        bits.append(f"prefers {persona['language_preference']}")
+    if persona.get("hobbies"):
+        bits.append("hobbies: " + ", ".join(persona["hobbies"]))
+    if persona.get("interests"):
+        bits.append("interests: " + ", ".join(persona["interests"]))
+    if persona.get("primary_goal"):
+        bits.append(f"goal: {persona['primary_goal']}")
+    if not bits:
+        return ""
+    return "User persona (tailor tone/relevance only, never invent facts from it): " + "; ".join(bits) + "."
 
 
 # ---------------------------------------------------------------------------
@@ -635,17 +708,148 @@ def update_settings():
     if "personalization" not in data:
         return jsonify({"error": "personalization is required"}), 400
     personalization = data.get("personalization")
-    if personalization not in PERSONALIZATION_MODES:
-        return jsonify({"error": f"personalization must be one of {sorted(PERSONALIZATION_MODES)}"}), 400
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    if not is_valid_category_for_user(cur, user_id, personalization):
+        return jsonify({"error": "personalization must be a built-in mode or one of your own categories"}), 400
+
+    cur.execute(
+        "UPDATE users SET personalization = %s WHERE id = %s",
+        (personalization, user_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "personalization": personalization})
+
+
+# ---------------------------------------------------------------------------
+# Custom categories -- personal/office/study always exist (built into app
+# code); this lets a user add their own on top, usable anywhere a category
+# is (conversations.category, users.personalization).
+# ---------------------------------------------------------------------------
+
+@app.route("/categories", methods=["GET"])
+@login_required
+def list_categories():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT name FROM user_categories WHERE user_id = %s ORDER BY name",
+        (current_user_id(),),
+    )
+    custom = [r["name"] for r in cur.fetchall()]
+    return jsonify({"builtin": sorted(PERSONALIZATION_MODES), "custom": custom})
+
+
+@app.route("/categories", methods=["POST"])
+@login_required
+def create_category():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if len(name) > 40:
+        return jsonify({"error": "name is too long (max 40 characters)"}), 400
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    if name.lower() in {m.lower() for m in PERSONALIZATION_MODES}:
+        return jsonify({"error": "That's already a built-in category"}), 409
+    cur.execute(
+        "SELECT 1 FROM user_categories WHERE user_id = %s AND lower(name) = lower(%s)",
+        (user_id, name),
+    )
+    if cur.fetchone():
+        return jsonify({"error": "You already have a category with that name"}), 409
+    cur.execute(
+        "INSERT INTO user_categories (user_id, name) VALUES (%s, %s)",
+        (user_id, name),
+    )
+    db.commit()
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/categories/<name>", methods=["DELETE"])
+@login_required
+def delete_category(name):
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "DELETE FROM user_categories WHERE user_id = %s AND name = %s RETURNING id",
+        (current_user_id(), name),
+    )
+    deleted = cur.fetchone()
+    db.commit()
+    if not deleted:
+        return jsonify({"error": "Category not found"}), 404
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Persona onboarding
+# ---------------------------------------------------------------------------
+
+@app.route("/persona", methods=["GET"])
+@login_required
+def get_persona_route():
+    db = get_db()
+    cur = dict_cursor(db)
+    persona = get_user_persona(cur, current_user_id())
+    return jsonify({
+        "completed": persona is not None,
+        "persona": serialize_row(persona) if persona else None,
+        "options": {
+            "gender": GENDER_OPTIONS,
+            "language_preference": LANGUAGE_OPTIONS,
+            "hobbies": HOBBY_OPTIONS,
+            "interests": INTEREST_OPTIONS,
+        },
+    })
+
+
+@app.route("/persona", methods=["POST"])
+@login_required
+def save_persona_route():
+    data = request.get_json(silent=True) or {}
+    age = data.get("age")
+    gender = (data.get("gender") or "").strip()
+    language_preference = (data.get("language_preference") or "").strip()
+    hobbies = [h for h in (data.get("hobbies") or []) if h in HOBBY_OPTIONS]
+    interests = [i for i in (data.get("interests") or []) if i in INTEREST_OPTIONS]
+    occupation = (data.get("occupation") or "").strip()
+    primary_goal = (data.get("primary_goal") or "").strip() or None
+
+    # age, gender, language_preference, hobbies, interests, occupation are
+    # mandatory; primary_goal is the one optional field (7 total).
+    try:
+        age = int(age)
+    except (TypeError, ValueError):
+        return jsonify({"error": "age is required and must be a number"}), 400
+    if age < 13 or age > 120:
+        return jsonify({"error": "age must be between 13 and 120"}), 400
+    if gender not in GENDER_OPTIONS:
+        return jsonify({"error": f"gender must be one of {GENDER_OPTIONS}"}), 400
+    if language_preference not in LANGUAGE_OPTIONS:
+        return jsonify({"error": f"language_preference must be one of {LANGUAGE_OPTIONS}"}), 400
+    if not hobbies:
+        return jsonify({"error": "Pick at least one hobby"}), 400
+    if not interests:
+        return jsonify({"error": "Pick at least one interest"}), 400
+    if not occupation:
+        return jsonify({"error": "occupation is required"}), 400
 
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "UPDATE users SET personalization = %s WHERE id = %s",
-        (personalization, current_user_id()),
+        "INSERT INTO user_personas (user_id, age, gender, language_preference, hobbies, interests, occupation, primary_goal) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET age = EXCLUDED.age, gender = EXCLUDED.gender, "
+        "language_preference = EXCLUDED.language_preference, hobbies = EXCLUDED.hobbies, "
+        "interests = EXCLUDED.interests, occupation = EXCLUDED.occupation, primary_goal = EXCLUDED.primary_goal",
+        (current_user_id(), age, gender, language_preference, hobbies, interests, occupation, primary_goal),
     )
     db.commit()
-    return jsonify({"ok": True, "personalization": personalization})
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -798,17 +1002,18 @@ def extract_json(text):
 BACKGROUND_ANALYSIS_BATCH_SIZE = int(os.getenv("BACKGROUND_ANALYSIS_BATCH_SIZE", "12"))
 MIN_WORDS_FOR_ANALYSIS = int(os.getenv("MIN_WORDS_FOR_ANALYSIS", "8"))
 
-def build_analysis_prompt(personalization=DEFAULT_PERSONALIZATION):
+def build_analysis_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
     # Injecting the real current time lets the model resolve relative phrases
     # ("Friday", "tomorrow", "in an hour") into an actual timestamp we can
     # schedule a browser reminder against -- without this, "due_date" is just
     # a display string with nothing a scheduler could act on.
     now_local = datetime.now().astimezone()
     mode_guidance = PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
+    persona_line = f"\n{persona_context}\n" if persona_context else ""
     return f"""Today is {now_local.strftime('%A, %Y-%m-%d')}, current time {now_local.strftime('%H:%M %Z')}.
 
 {mode_guidance}
-
+{persona_line}
 Extract from this conversation transcript:
 1. "tasks": action items/commitments. Each:
    - description (<20 words, your own words)
@@ -824,11 +1029,14 @@ clinical/mental-health terms, no motive speculation.
 recording it -- "label" (a single plain word, e.g. "happy", "stressed", "calm", "frustrated", \
 "excited", "neutral", "sad", "anxious") and "score" (0.0-1.0 intensity/confidence). Base this \
 only on tone and word choice actually present, no diagnoses.
+4. "tags": 2-5 short (1-4 word) topics from THIS transcript worth asking the assistant more \
+about, matching the mode above (e.g. office: "budget approval"; study: "midterm scope"). Empty \
+list if nothing distinct came up.
 
 Reply with ONLY this JSON, no preamble/fences:
 {{"tasks": [{{"description": "", "owner": null, "due_date": null, "reminder_at": null}}], \
 "speakers": [{{"label": "", "observations": [""]}}], \
-"mood": {{"label": "neutral", "score": 0.5}}}}
+"mood": {{"label": "neutral", "score": 0.5}}, "tags": [""]}}
 Empty lists if none found. "mood" is always required."""
 
 
@@ -1008,13 +1216,15 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
 
     conn = get_raw_connection()
     try:
-        mode = get_user_personalization(dict_cursor(conn), user_id)
+        pcur = dict_cursor(conn)
+        mode = get_user_personalization(pcur, user_id)
+        persona_context = build_persona_context(get_user_persona(pcur, user_id))
     finally:
         release_raw_connection(conn)
 
     try:
         content = call_llm([
-            {"role": "system", "content": build_analysis_prompt(mode)},
+            {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
             {"role": "user", "content": delta_text},
         ])
     except Exception:
@@ -1027,6 +1237,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
     mood = parsed.get("mood") or {}
+    tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
     conn = get_raw_connection()
     created_tasks = []
@@ -1080,7 +1291,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     for task_id, description in created_tasks:
         push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
 
-    push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers)})
+    push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers), "tags": tags})
 
 
 # ---------------------------------------------------------------------------
@@ -1434,10 +1645,11 @@ def analyze_conversation():
         return jsonify({"error": "transcript or conversation_id is required"}), 400
 
     mode = get_user_personalization(cur, user_id)
+    persona_context = build_persona_context(get_user_persona(cur, user_id))
     try:
         content = call_llm(
             [
-                {"role": "system", "content": build_analysis_prompt(mode)},
+                {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
                 {"role": "user", "content": raw_transcript},
             ]
         )
@@ -1458,6 +1670,7 @@ def analyze_conversation():
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
     mood = parsed.get("mood") or {}
+    tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
     for task in tasks:
         description = (task.get("description") or "").strip()
@@ -1506,6 +1719,7 @@ def analyze_conversation():
             "tasks": tasks,
             "speakers": speakers,
             "mood": mood,
+            "tags": tags,
         }
     )
 
@@ -1564,6 +1778,41 @@ def reopen_task(task_id):
     if not cur.fetchone():
         return jsonify({"error": "Task not found"}), 404
     cur.execute("UPDATE tasks SET status = 'open' WHERE id = %s", (task_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/tasks/<int:task_id>/edit", methods=["POST"])
+@login_required
+def edit_task(task_id):
+    """Corrects a task's description/due_date after extraction -- the LLM
+    sometimes mishears/misparses. Update in place (not delete+recreate) so
+    reminder_at/email_sent/status history isn't lost."""
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id FROM tasks WHERE id = %s AND user_id = %s", (task_id, current_user_id())
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Task not found"}), 404
+
+    fields, params = [], []
+    if "description" in data:
+        description = (data.get("description") or "").strip()
+        if not description:
+            return jsonify({"error": "description cannot be empty"}), 400
+        fields.append("description = %s")
+        params.append(description)
+    if "due_date" in data:
+        fields.append("due_date = %s")
+        params.append((data.get("due_date") or "").strip() or None)
+    if not fields:
+        return jsonify({"error": "Nothing to update -- provide description and/or due_date"}), 400
+
+    fields.append("updated_at = now()")
+    params.append(task_id)
+    cur.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s", params)
     db.commit()
     return jsonify({"ok": True})
 
@@ -1676,6 +1925,38 @@ def delete_profile(profile_id):
     return jsonify({"ok": True})
 
 
+@app.route("/profiles/<int:profile_id>/rename", methods=["POST"])
+@login_required
+def rename_profile(profile_id):
+    """Fixes a misheard/misspelled name. Rejects (409) instead of silently
+    merging if the new name collides with a different existing profile --
+    a rename shouldn't surprise-merge two people's histories together."""
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "name is required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id FROM speaker_profiles WHERE id = %s AND user_id = %s", (profile_id, user_id)
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Profile not found"}), 404
+
+    cur.execute(
+        "SELECT id FROM speaker_profiles WHERE user_id = %s AND lower(name) = lower(%s) AND id != %s",
+        (user_id, new_name, profile_id),
+    )
+    if cur.fetchone():
+        return jsonify({"error": "A profile with that name already exists"}), 409
+
+    cur.execute("UPDATE speaker_profiles SET name = %s WHERE id = %s", (new_name, profile_id))
+    db.commit()
+    return jsonify({"ok": True, "name": new_name})
+
+
 @app.route("/speakers", methods=["GET"])
 @login_required
 def list_speakers():
@@ -1703,9 +1984,9 @@ def list_friends():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT users.id, users.username FROM friendships "
+        "SELECT users.id, users.username, friendships.nickname FROM friendships "
         "JOIN users ON users.id = friendships.friend_id "
-        "WHERE friendships.user_id = %s ORDER BY users.username",
+        "WHERE friendships.user_id = %s ORDER BY COALESCE(friendships.nickname, users.username)",
         (current_user_id(),),
     )
     return jsonify([dict(r) for r in cur.fetchall()])
@@ -1765,6 +2046,28 @@ def remove_friend(friend_id):
     return jsonify({"ok": True})
 
 
+@app.route("/friends/<int:friend_id>/nickname", methods=["POST"])
+@login_required
+def set_friend_nickname(friend_id):
+    """Sets *my* local name for this friend -- can't rename their actual
+    account, so this lives on my direction of the friendship row only (each
+    direction is already its own row, see add_friend)."""
+    data = request.get_json(silent=True) or {}
+    nickname = (data.get("nickname") or "").strip() or None  # empty clears it
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE friendships SET nickname = %s WHERE user_id = %s AND friend_id = %s RETURNING id",
+        (nickname, user_id, friend_id),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "Not friends with that user"}), 404
+    return jsonify({"ok": True, "nickname": nickname})
+
+
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
 @login_required
 def friend_mood(friend_id):
@@ -1793,8 +2096,8 @@ def friend_mood(friend_id):
     return jsonify({"friend_id": friend_id, "entries": entries})
 
 
-def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION):
-    return (
+def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
+    base = (
         "You are a concise assistant answering questions about a live or saved "
         "conversation transcript. Be direct: answer what was asked, no restating "
         "the question, no unnecessary preamble or filler, no padding a short "
@@ -1805,6 +2108,7 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION):
         "clarification when it's inferable from context. "
         + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
     )
+    return base + (f" {persona_context}" if persona_context else "")
 
 # Chat history lives permanently in the chat_messages table -- nothing here
 # ever deletes a row. CHAT_HISTORY_MAX_TURNS only bounds how many of the
@@ -1953,7 +2257,8 @@ def chat():
     # instead of treating every message as a fresh, isolated call.
     history = load_chat_context(cur, user_id, conversation_id) if conversation_id else []
 
-    messages = [{"role": "system", "content": build_chat_system_prompt(mode)}]
+    persona_context = build_persona_context(get_user_persona(cur, user_id))
+    messages = [{"role": "system", "content": build_chat_system_prompt(mode, persona_context)}]
     messages.extend(history)
     messages.append({"role": "user", "content": current_turn_content})
 
