@@ -29,7 +29,12 @@
       "Bash(curl -sS https://rapexapi.nodexdata.click/)",
       "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_call_conversation_sharing.py\")",
       "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/app.py ec2-user@rapexapi.nodexdata.click:~/throughline/)",
-      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/App.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/ringtone.js ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/)"
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/App.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/ringtone.js ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/App.jsx c:/Users/P3INW57/Desktop/speech2text/frontend/src/ringtone.js c:/Users/P3INW57/Desktop/speech2text/frontend/src/theme.css ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/)",
+      "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/CallOverlay.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/)",
+      "Bash(grep -n \"raw_transcript = \\\\\"\\\\\\\\\\\\\\\\n\\\\\".join\\(lines\\)\" c:/Users/P3INW57/Desktop/speech2text/app.py)",
+      "Bash(grep -n 'raw_transcript = \"\\\\\\\\\\\\\\\\n\".join\\(lines\\)\\\\|def upload_call_recording' c:/Users/P3INW57/Desktop/speech2text/app.py)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_no_transcript_skip.py\")"
     ]
   }
 }

@@ -2291,9 +2291,20 @@ def upload_call_recording(call_id):
     call ends. Same Deepgram diarized-transcription call as /transcribe,
     then reuses the existing conversation-creation + analysis pipeline --
     the resulting conversation is indistinguishable from a solo dictation
-    one, just tagged via calls.conversation_id."""
+    one, just tagged via calls.conversation_id. If Deepgram detected no
+    speech at all, nothing is created -- see the no_speech_detected check
+    below."""
     if "audio" not in request.files:
         return jsonify({"error": "No audio file uploaded"}), 400
+
+    # `scope=own` (mobile clients only): each participant uploads just their
+    # own local mic recording, independently of everyone else, instead of
+    # the web client's single mixed-stream upload from the initiator. Kept
+    # as a fully separate branch/idempotency key (call_participants row, not
+    # calls.conversation_id) so the legacy web upload path below is
+    # completely untouched.
+    if request.form.get("scope") == "own":
+        return _upload_own_call_recording(call_id)
 
     user_id = current_user_id()
     db = get_db()
@@ -2340,6 +2351,16 @@ def upload_call_recording(call_id):
             lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
     raw_transcript = "\n".join(lines)
 
+    if not raw_transcript.strip():
+        # No speech detected (silence, a call that ended before anyone said
+        # anything, etc.) -- don't create a conversation at all. One would
+        # otherwise sit in everyone's Chats list as permanent, useless
+        # clutter, and opening an empty one to ask a question would burn a
+        # real LLM call against nothing. calls.conversation_id stays NULL;
+        # a later recording upload for this same call (if it ever happened)
+        # would still be processed rather than silently no-op'd forever.
+        return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
+
     cur.execute("SELECT user_id FROM call_participants WHERE call_id = %s", (call_id,))
     participant_ids = [r["user_id"] for r in cur.fetchall()]
 
@@ -2363,17 +2384,17 @@ def upload_call_recording(call_id):
     cur.execute("UPDATE calls SET conversation_id = %s WHERE id = %s", (primary_conversation_id, call_id))
     db.commit()
 
-    if raw_transcript.strip():
-        for pid, conv_id in conversation_ids.items():
-            threading.Thread(target=run_conversation_titling, args=(conv_id, raw_transcript), daemon=True).start()
-            # No live websocket to push background_update to here (this is a
-            # REST upload, not a /ws/listen session) -- a no-op push is a
-            # valid, unmodified use of the existing function.
-            threading.Thread(
-                target=run_background_analysis,
-                args=(pid, conv_id, raw_transcript, lambda *a, **k: None),
-                daemon=True,
-            ).start()
+    # raw_transcript is guaranteed non-empty here (checked above).
+    for pid, conv_id in conversation_ids.items():
+        threading.Thread(target=run_conversation_titling, args=(conv_id, raw_transcript), daemon=True).start()
+        # No live websocket to push background_update to here (this is a
+        # REST upload, not a /ws/listen session) -- a no-op push is a
+        # valid, unmodified use of the existing function.
+        threading.Thread(
+            target=run_background_analysis,
+            args=(pid, conv_id, raw_transcript, lambda *a, **k: None),
+            daemon=True,
+        ).start()
 
     for pid, conv_id in conversation_ids.items():
         push_notification(pid, {
@@ -2381,6 +2402,91 @@ def upload_call_recording(call_id):
         })
 
     return jsonify({"conversation_id": primary_conversation_id})
+
+
+def _upload_own_call_recording(call_id):
+    """scope=own branch of upload_call_recording: transcribes and attaches
+    a conversation for just the uploading participant, independent of
+    every other participant's own upload. Idempotent per
+    (call_id, user_id) via call_participants.recording_uploaded_at, not
+    calls.conversation_id (that column is reserved for the legacy
+    mixed-upload flow above)."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT c.category, cp.recording_uploaded_at, cp.conversation_id FROM calls c "
+        "JOIN call_participants cp ON cp.call_id = c.id "
+        "WHERE c.id = %s AND cp.user_id = %s",
+        (call_id, user_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Call not found"}), 404
+    if row["recording_uploaded_at"]:
+        return jsonify({"conversation_id": row["conversation_id"], "already_processed": True})
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    content_type = audio_file.mimetype or "audio/webm"
+
+    try:
+        resp = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
+            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
+            data=audio_bytes,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        return jsonify({"error": f"Deepgram error: {e}"}), status
+    except requests.RequestException as e:
+        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
+
+    utterances = (resp.json().get("results") or {}).get("utterances") or []
+    lines = []
+    for utt in utterances:
+        text = (utt.get("transcript") or "").strip()
+        if text:
+            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
+    raw_transcript = "\n".join(lines)
+
+    if not raw_transcript.strip():
+        cur.execute(
+            "UPDATE call_participants SET recording_uploaded_at = now() WHERE call_id = %s AND user_id = %s",
+            (call_id, user_id),
+        )
+        db.commit()
+        return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
+
+    cur.execute(
+        "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
+        (user_id, None, raw_transcript, row["category"]),
+    )
+    conversation_id = cur.fetchone()["id"]
+    cur.execute(
+        "UPDATE call_participants SET recording_uploaded_at = now(), conversation_id = %s "
+        "WHERE call_id = %s AND user_id = %s",
+        (conversation_id, call_id, user_id),
+    )
+    db.commit()
+
+    threading.Thread(target=run_conversation_titling, args=(conversation_id, raw_transcript), daemon=True).start()
+    threading.Thread(
+        target=run_background_analysis,
+        args=(user_id, conversation_id, raw_transcript, lambda *a, **k: None),
+        daemon=True,
+    ).start()
+    push_notification(user_id, {
+        "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
+    })
+
+    return jsonify({"conversation_id": conversation_id})
 
 
 def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):

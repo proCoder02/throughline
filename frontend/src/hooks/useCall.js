@@ -9,7 +9,7 @@ import { post, postForm } from '../api.js';
 // MediaRecorder (same recorder setup as solo dictation in useLiveSession),
 // and uploads the result to /calls/<id>/recording when the call ends.
 export function useCall() {
-  const [activeCall, setActiveCall] = useState(null); // {callId, roomName, isInitiator, muted, participants}
+  const [activeCall, setActiveCall] = useState(null); // {callId, roomName, isInitiator, muted, participants, droppedNotices}
   const roomRef = useRef(null);
   const audioCtxRef = useRef(null);
   const mixDestRef = useRef(null);
@@ -18,6 +18,7 @@ export function useCall() {
   const localTrackRef = useRef(null);
   const isInitiatorRef = useRef(false);
   const audioElsRef = useRef(new Map()); // track sid -> <audio> element actually playing it
+  const leaveCallRef = useRef(null); // always-current leaveCall, for the disconnect-triggered auto-hangup below
 
   const addTrackToMix = (mediaStreamTrack) => {
     if (!audioCtxRef.current || !mixDestRef.current || !mediaStreamTrack) return;
@@ -64,10 +65,31 @@ export function useCall() {
       setActiveCall((c) => (c ? { ...c, audioBlocked: !room.canPlaybackAudio } : c));
     });
     room.on(RoomEvent.ParticipantConnected, (p) => {
-      setActiveCall((c) => (c ? { ...c, participants: [...c.participants, p.identity] } : c));
+      setActiveCall((c) => (c ? { ...c, participants: [...c.participants, { identity: p.identity, name: p.name || p.identity }] } : c));
     });
     room.on(RoomEvent.ParticipantDisconnected, (p) => {
-      setActiveCall((c) => (c ? { ...c, participants: c.participants.filter((id) => id !== p.identity) } : c));
+      const droppedName = p.name || p.identity;
+      const noticeId = `${p.identity}-${Date.now()}`;
+      setActiveCall((c) => {
+        if (!c) return c;
+        const participants = c.participants.filter((x) => x.identity !== p.identity);
+        // 1:1 call (or a group call that's fully drained): nobody left to
+        // talk to, so hang up automatically instead of lingering alone in
+        // an empty room -- matches how the "other side dropped" report
+        // asked for the call to just close on its own.
+        if (participants.length === 0) {
+          setTimeout(() => leaveCallRef.current?.(), 0);
+        }
+        return {
+          ...c,
+          participants,
+          droppedNotices: [...(c.droppedNotices || []), { id: noticeId, name: droppedName }],
+        };
+      });
+      // Auto-expire the "X dropped from the call" banner, Gmeet-style.
+      setTimeout(() => {
+        setActiveCall((c) => (c ? { ...c, droppedNotices: (c.droppedNotices || []).filter((n) => n.id !== noticeId) } : c));
+      }, 4000);
     });
 
     await room.connect(livekit_url, token);
@@ -87,7 +109,10 @@ export function useCall() {
     setActiveCall({
       callId: call_id, roomName: room_name, isInitiator, muted: false,
       audioBlocked: !room.canPlaybackAudio,
-      participants: room.remoteParticipants ? Array.from(room.remoteParticipants.values()).map((p) => p.identity) : [],
+      droppedNotices: [],
+      participants: room.remoteParticipants
+        ? Array.from(room.remoteParticipants.values()).map((p) => ({ identity: p.identity, name: p.name || p.identity }))
+        : [],
     });
   }, []);
 
@@ -148,6 +173,11 @@ export function useCall() {
     }
     setActiveCall(null);
   }, [activeCall]);
+
+  // Kept current every render so the ParticipantDisconnected handler above
+  // (registered once, inside connectToRoom) can trigger an up-to-date leave
+  // instead of closing over a stale one.
+  leaveCallRef.current = leaveCall;
 
   return { activeCall, startCall, joinCall, declineCall, toggleMute, leaveCall, enableAudio };
 }

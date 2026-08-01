@@ -314,3 +314,10 @@ CREATE TABLE IF NOT EXISTS call_participants (
 CREATE INDEX IF NOT EXISTS idx_call_participants_call ON call_participants (call_id);
 CREATE INDEX IF NOT EXISTS idx_call_participants_user ON call_participants (user_id);
 CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls (initiator_user_id);
+
+-- Per-participant recording upload (mobile clients upload their own local
+-- mic recording instead of the browser's mixed-stream capture -- see
+-- upload_call_recording's `scope=own` branch). Separate from
+-- calls.conversation_id, which tracks the legacy single mixed-upload flow.
+ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS recording_uploaded_at TIMESTAMPTZ;
+ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL;
