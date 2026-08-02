@@ -1,0 +1,65 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EC2InstanceStartStop",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances"
+      ],
+      "Resource": "arn:aws:ec2:eu-north-1:771713467633:instance/i-072634a707e093ae3"
+    },
+    {
+      "Sid": "EC2Describe",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeAddresses"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EC2ElasticIPLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AllocateAddress",
+        "ec2:AssociateAddress",
+        "ec2:DisassociateAddress",
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RDSDescribe",
+      "Effect": "Allow",
+      "Action": "rds:DescribeDBInstances",
+      "Resource": "*"
+    },
+    {
+      "Sid": "RDSStartStop",
+      "Effect": "Allow",
+      "Action": [
+        "rds:StartDBInstance",
+        "rds:StopDBInstance"
+      ],
+      "Resource": "arn:aws:rds:eu-north-1:771713467633:db:*"
+    },
+    {
+      "Sid": "Route53Read",
+      "Effect": "Allow",
+      "Action": [
+        "route53:ListHostedZones",
+        "route53:GetChange"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53RecordChange",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    }
+  ]
+}

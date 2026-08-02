@@ -6,7 +6,7 @@ import { apiJson } from './api.js';
 import AuthScreen from './components/AuthScreen.jsx';
 import PersonaOnboarding from './components/PersonaOnboarding.jsx';
 import CallOverlay from './components/CallOverlay.jsx';
-import { startRingtone, stopRingtone } from './ringtone.js';
+import { startRingtone, stopRingtone, unlockAudio } from './ringtone.js';
 import IconRail from './components/IconRail.jsx';
 import ChatsSection from './components/ChatsSection.jsx';
 import TasksSection from './components/TasksSection.jsx';
@@ -52,6 +52,31 @@ export default function App() {
     else stopRingtone();
     return () => stopRingtone();
   }, [notify.incomingCall, call.activeCall]);
+
+  // The initiator's own room connects immediately on startCall (before
+  // anyone accepts), so if every invitee declines, LiveKit never fires a
+  // disconnect for them -- the server-pushed call_declined event is the
+  // only signal telling this side to hang up instead of lingering.
+  useEffect(() => {
+    if (!notify.declinedCallId) return;
+    notify.clearDeclinedCall();
+    if (call.activeCall?.callId === notify.declinedCallId) call.leaveCall();
+  }, [notify.declinedCallId]);
+
+  // iOS only allows audio playback (the ringtone) if the AudioContext was
+  // primed during a real tap -- an incoming call itself has no preceding
+  // gesture to piggyback on, so this grabs the very first tap/click
+  // anywhere in the app (login, switching tabs, whatever happens first)
+  // to prime it ahead of time. Harmless no-op on browsers that don't need it.
+  useEffect(() => {
+    const unlock = () => unlockAudio();
+    document.addEventListener('click', unlock, { once: true });
+    document.addEventListener('touchstart', unlock, { once: true });
+    return () => {
+      document.removeEventListener('click', unlock);
+      document.removeEventListener('touchstart', unlock);
+    };
+  }, []);
 
   if (auth.loading) return null;
   if (!auth.user) return <AuthScreen auth={auth} />;

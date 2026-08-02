@@ -314,3 +314,24 @@ CREATE TABLE IF NOT EXISTS call_participants (
 CREATE INDEX IF NOT EXISTS idx_call_participants_call ON call_participants (call_id);
 CREATE INDEX IF NOT EXISTS idx_call_participants_user ON call_participants (user_id);
 CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls (initiator_user_id);
+
+-- Per-participant recording upload (mobile clients upload their own local
+-- mic recording instead of the browser's mixed-stream capture -- see
+-- upload_call_recording's `scope=own` branch). Separate from
+-- calls.conversation_id, which tracks the legacy single mixed-upload flow.
+ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS recording_uploaded_at TIMESTAMPTZ;
+ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL;
+
+-- FCM device tokens for mobile push (calls, tasks, reminder emails, friend
+-- mood updates) -- one row per device; UNIQUE(token) lets registration be a
+-- plain upsert (token refresh, or the same device logging into a different
+-- account both just overwrite the existing row).
+CREATE TABLE IF NOT EXISTS push_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    token TEXT NOT NULL UNIQUE,
+    platform TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens (user_id);

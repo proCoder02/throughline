@@ -9,8 +9,8 @@ pyopenssl
 cryptography
 requests
 python-dotenv
+redis
 livekit-api
+firebase-admin
 av
 numpy
-tensorflow
-tensorflow-hub

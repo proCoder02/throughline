@@ -4,6 +4,9 @@ import { getToken, apiJson } from '../api.js';
 // Ports the mic-capture + /ws/listen logic from the old vanilla-JS app.
 // Voice-activity pausing was dropped for brevity; audio streams continuously
 // while listening (functionally equivalent, just less bandwidth-efficient).
+const TAG_LIMIT = 5;
+const TAG_EXPIRY_MS = 20000;
+
 export function useLiveSession({ onSessionStarted, onEnded }) {
   const [isListening, setIsListening] = useState(false);
   const [status, setStatus] = useState('');
@@ -73,7 +76,11 @@ export function useLiveSession({ onSessionStarted, onEnded }) {
           setTags((prev) => {
             const existing = new Set(prev.map((t) => t.toLowerCase()));
             const fresh = msg.tags.filter((t) => !existing.has(t.toLowerCase()));
-            return [...prev, ...fresh].slice(-12); // cap so a long call doesn't grow this forever
+            // Each fresh tag is a live suggestion, not a permanent record --
+            // it self-dismisses after 20s if not acted on, same as tapping
+            // the "x" (removeTag is a no-op if it's already gone by then).
+            fresh.forEach((t) => setTimeout(() => removeTag(t), TAG_EXPIRY_MS));
+            return [...prev, ...fresh].slice(-TAG_LIMIT);
           });
         }
       } else if (msg.type === 'error') {

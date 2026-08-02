@@ -144,6 +144,9 @@ input, textarea { font-family: inherit; }
 .bubble.in { background: var(--wa-bubble-in); border-top-left-radius: 0; }
 .bubble.out { background: var(--wa-bubble-out); border-top-right-radius: 0; }
 .bubble-time { font-size: 11px; color: var(--wa-text-soft); float: right; margin: 4px 0 -4px 8px; }
+.msg-line:empty { min-height: 0.6em; }
+.msg-list { margin: 2px 0 2px 18px; padding: 0; }
+.msg-list li { margin: 1px 0; }
 
 .composer {
   display: flex; align-items: flex-end; gap: 8px; padding: 10px 16px;
@@ -208,21 +211,13 @@ input, textarea { font-family: inherit; }
 }
 .fab-icon svg { width: 22px; height: 22px; }
 
-.info-drawer {
-  position: absolute; top: 0; right: 0; bottom: 0; width: 400px;
-  background: var(--wa-panel); border-left: 1px solid var(--wa-border);
-  z-index: 20; display: flex; flex-direction: column; box-shadow: -2px 0 8px rgba(0,0,0,0.08);
-}
-.info-drawer-header { padding: 16px; display: flex; align-items: center; gap: 20px; background: var(--wa-bg-app); }
-.info-drawer-header button { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
-.info-drawer-header button:hover { background: var(--wa-hover); }
-.info-drawer-body { flex: 1; overflow-y: auto; padding: 16px; white-space: pre-wrap; font-size: 14px; line-height: 1.6; }
-
 /* ---------- Detail pane (Tasks/Profiles/Friends/Settings) ---------- */
 .detail-pane { flex: 1; overflow-y: auto; padding: 24px 6%; background: var(--wa-bg-app); }
 .detail-card { background: var(--wa-panel); border-radius: 8px; padding: 20px; margin-bottom: 12px; }
 .detail-title { font-size: 16px; font-weight: 600; margin: 0 0 6px; }
 .detail-meta { font-size: 13px; color: var(--wa-text-soft); margin-bottom: 4px; }
+.mood-compiled { text-align: center; padding: 24px 0 12px; }
+.mood-compiled-emoji { font-size: 64px; line-height: 1; margin-bottom: 8px; }
 .btn { padding: 8px 16px; border-radius: 6px; background: var(--wa-accent); color: #fff; font-size: 13.5px; font-weight: 500; }
 .btn:hover { background: var(--wa-accent-dark); }
 .btn.secondary { background: var(--wa-hover); color: var(--wa-text); }
@@ -245,6 +240,7 @@ input, textarea { font-family: inherit; }
 .call-title { font-size: 18px; font-weight: 600; }
 .call-sub { font-size: 13.5px; color: var(--wa-text-soft); margin-top: 2px; }
 .call-recording-notice { font-size: 12px; color: var(--wa-danger); margin: 10px 0 4px; }
+.call-drop-notice { font-size: 12.5px; color: var(--wa-text-soft); background: var(--wa-hover); border-radius: 6px; padding: 6px 10px; margin-top: 8px; width: 100%; }
 .call-audio-blocked { background: #FFF3CD; color: #7A5B00; width: 100%; margin-top: 10px; }
 .call-audio-blocked:hover { background: #FFE8A3; }
 .call-actions { display: flex; gap: 12px; margin-top: 18px; width: 100%; }
@@ -319,7 +315,6 @@ input, textarea { font-family: inherit; }
   body.has-active .list-pane { display: none; }
   body.has-active .chat-panel { display: flex; }
   body.has-active .detail-view { display: block; }
-  .info-drawer { width: 100%; }
   .back-btn { display: flex; }
 
   /* Icon rail becomes a bottom tab bar (native mobile nav convention)

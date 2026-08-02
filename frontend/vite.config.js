@@ -9,6 +9,7 @@ const PROXIED_PATHS = [
   '/login', '/register', '/logout', '/me', '/settings',
   '/conversations', '/chat', '/tasks', '/profiles',
   '/friends', '/speakers', '/analyze', '/save', '/transcribe',
+  '/persona', '/categories', '/calls', '/devices',
 ];
 
 export default defineConfig({

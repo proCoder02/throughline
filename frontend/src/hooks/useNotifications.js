@@ -9,6 +9,7 @@ export function useNotifications(enabled) {
   const [taskCount, setTaskCount] = useState(0);
   const [unreadChatIds, setUnreadChatIds] = useState(() => new Set());
   const [incomingCall, setIncomingCall] = useState(null); // {callId, roomName, callerId, callerName}
+  const [declinedCallId, setDeclinedCallId] = useState(null); // set when every invitee has declined/left a ringing call
   const socketRef = useRef(null);
 
   useEffect(() => {
@@ -29,6 +30,12 @@ export function useNotifications(enabled) {
         setUnreadChatIds((prev) => new Set(prev).add(msg.conversation_id));
       } else if (msg.type === 'incoming_call') {
         setIncomingCall({ callId: msg.call_id, roomName: msg.room_name, callerId: msg.caller_id, callerName: msg.caller_name });
+      } else if (msg.type === 'call_declined') {
+        // Nobody LiveKit-disconnects a caller who's alone in a room nobody
+        // else ever joined, so the server tells us explicitly once every
+        // invitee has declined -- lets the caller's UI hang up on its own
+        // instead of sitting on "Call in progress" forever.
+        setDeclinedCallId(msg.call_id);
       }
     };
     return () => socket.close();
@@ -43,6 +50,7 @@ export function useNotifications(enabled) {
   });
 
   const clearIncomingCall = () => setIncomingCall(null);
+  const clearDeclinedCall = () => setDeclinedCallId(null);
 
-  return { taskCount, unreadChatIds, clearTasks, clearChat, incomingCall, clearIncomingCall };
+  return { taskCount, unreadChatIds, clearTasks, clearChat, incomingCall, clearIncomingCall, declinedCallId, clearDeclinedCall };
 }

@@ -25,7 +25,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import redis
 import livekit.api as livekit_api
+import firebase_admin
+from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
 
 load_dotenv()
 
@@ -90,6 +93,66 @@ def close_db(exception=None):
         if exception is not None:
             db.rollback()
         db_pool.putconn(db)
+
+
+# ---------------------------------------------------------------------------
+# Redis (cache-aside reads + /ws/notify durability/pub-sub)
+#
+# Unlike Postgres, Redis is never load-bearing -- Postgres stays the source
+# of truth for everything, Redis only ever makes reads faster and
+# notifications more durable. Every call below swallows connection errors
+# and falls back to "as if there were no cache" (hit Postgres directly, or
+# for /ws/notify, behave like the old in-process-only delivery), so a dead
+# Redis degrades performance, not correctness.
+# ---------------------------------------------------------------------------
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# protocol=2 (RESP2) rather than the client default -- keeps this working
+# against older Redis builds (e.g. the Windows ports, based on Redis 5.x)
+# that predate RESP3's HELLO handshake, while still working fine against
+# any modern Redis server too.
+redis_client = redis.from_url(
+    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=1, socket_timeout=1
+)
+# Separate client for the pub/sub listener below -- it holds one connection
+# blocked in .listen() waiting for the next message, which can legitimately
+# take longer than 1s of idle time. Reusing redis_client's short
+# socket_timeout there made every quiet second look like a dropped
+# connection (logged as a TimeoutError, retried every 5s forever) instead
+# of actually indicating Redis was unreachable.
+redis_pubsub_client = redis.from_url(
+    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=1, socket_timeout=None
+)
+
+
+def cache_get_json(key):
+    try:
+        val = redis_client.get(key)
+    except redis.RedisError as e:
+        print(f"[redis] GET {key} failed: {e!r}")
+        return None
+    if val is None:
+        return None
+    try:
+        return json.loads(val)
+    except ValueError:
+        return None
+
+
+def cache_set_json(key, value, ttl=None):
+    try:
+        redis_client.set(key, json.dumps(value), ex=ttl)
+    except redis.RedisError as e:
+        print(f"[redis] SET {key} failed: {e!r}")
+
+
+def cache_delete(*keys):
+    if not keys:
+        return
+    try:
+        redis_client.delete(*keys)
+    except redis.RedisError as e:
+        print(f"[redis] DELETE {keys} failed: {e!r}")
 
 
 def dict_cursor(conn):
@@ -271,6 +334,68 @@ def build_persona_context(persona):
 # ---------------------------------------------------------------------------
 
 FRIEND_CODE_LENGTH = 6
+
+# A friend's mood is shown as a single compiled emoji, not a raw log list --
+# "compiled every 2 hours" means the displayed value is the dominant mood
+# across whichever 2-hour clock-aligned window (00-02, 02-04, ... 22-24) has
+# the most recent data, recomputed on read rather than via a scheduled job
+# (there's no cron/scheduler in this app, and a read-time aggregate over an
+# already-indexed range is cheap enough not to need one).
+MOOD_EMOJI = {
+    "happy": "😊", "stressed": "😰", "calm": "😌", "frustrated": "😤",
+    "excited": "🤩", "neutral": "😐", "sad": "😢", "anxious": "😟",
+}
+DEFAULT_MOOD_EMOJI = "🙂"
+MOOD_BUCKET_HOURS = 2
+
+
+def mood_bucket_bounds(at=None):
+    now_local = (at or datetime.now()).astimezone()
+    start = now_local.replace(minute=0, second=0, microsecond=0)
+    start = start.replace(hour=(start.hour // MOOD_BUCKET_HOURS) * MOOD_BUCKET_HOURS)
+    return start, start + timedelta(hours=MOOD_BUCKET_HOURS)
+
+
+def compute_compiled_mood(cur, user_id, bucket_start, bucket_end):
+    """Dominant mood_label in [bucket_start, bucket_end) for user_id, by
+    total confidence-weighted score (falls back to count on a tie/NULL
+    scores). None if nothing was logged in that window."""
+    cur.execute(
+        "SELECT mood_label, COALESCE(SUM(mood_score), 0) AS weight, COUNT(*) AS n FROM mood_logs "
+        "WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "GROUP BY mood_label ORDER BY weight DESC, n DESC LIMIT 1",
+        (user_id, bucket_start, bucket_end),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    label = row["mood_label"]
+    return {"mood_label": label, "emoji": MOOD_EMOJI.get((label or "").lower(), DEFAULT_MOOD_EMOJI)}
+
+
+def notify_friends_of_mood_update(user_id, mood_label, friend_ids):
+    """Pushed once per 2-hour compiled window per friend (see the
+    is-first-in-bucket check at each call site), not on every single
+    conversation, so friends get one check-in ping per window instead of
+    being spammed as someone's mood log fills up."""
+    if not friend_ids or not mood_label:
+        return
+    emoji = MOOD_EMOJI.get(mood_label.lower(), DEFAULT_MOOD_EMOJI)
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        name = row[0] if row else "A friend"
+    finally:
+        release_raw_connection(conn)
+    event = {
+        "type": "friend_mood_update", "friend_id": user_id, "friend_name": name,
+        "mood_label": mood_label, "emoji": emoji,
+    }
+    for fid in friend_ids:
+        push_notification(fid, event)
+        send_fcm_to_user(fid, title=f"{name} seems {mood_label} {emoji}", body="Tap to check in", data=event)
 
 
 def generate_unique_friend_code(cur):
@@ -512,7 +637,7 @@ def email_reminder_worker():
             cur = dict_cursor(conn)
             now = datetime.now(timezone.utc)
             cur.execute(
-                "SELECT tasks.id, tasks.description, tasks.owner, tasks.due_date, "
+                "SELECT tasks.id, tasks.user_id, tasks.description, tasks.owner, tasks.due_date, "
                 "tasks.reminder_at, users.email FROM tasks "
                 "JOIN users ON tasks.user_id = users.id "
                 "WHERE tasks.reminder_at IS NOT NULL AND tasks.email_sent = FALSE "
@@ -527,6 +652,13 @@ def email_reminder_worker():
                 if sent:
                     cur.execute("UPDATE tasks SET email_sent = TRUE WHERE id = %s", (row["id"],))
                     conn.commit()
+                    push_notification(row["user_id"], {
+                        "type": "reminder_email_sent", "task_id": row["id"], "description": row["description"],
+                    })
+                    send_fcm_to_user(
+                        row["user_id"], title="Reminder sent", body=row["description"],
+                        data={"type": "reminder_email_sent", "task_id": row["id"]},
+                    )
             cur.close()
         except Exception as e:
             print(f"[email_reminder_worker] error: {e!r}")
@@ -1044,8 +1176,10 @@ clinical/mental-health terms, no motive speculation.
 recording it -- "label" (a single plain word, e.g. "happy", "stressed", "calm", "frustrated", \
 "excited", "neutral", "sad", "anxious") and "score" (0.0-1.0 intensity/confidence). Base this \
 only on tone and word choice actually present, no diagnoses.
-4. "tags": 2-5 short (1-4 word) topics from THIS transcript worth asking the assistant more \
-about, matching the mode above (e.g. office: "budget approval"; study: "midterm scope"). Empty \
+4. "tags": at most 5 short, tappable suggestions worth asking the assistant next, matching the \
+mode above. Prefer a clear, directly-answerable question actually raised or clearly implied in \
+THIS transcript, phrased as that question (e.g. "What's the budget cap?"); fall back to a short \
+(1-4 word) topic (e.g. office: "budget approval") only when no such question is present. Empty \
 list if nothing distinct came up.
 
 Reply with ONLY this JSON, no preamble/fences:
@@ -1085,7 +1219,7 @@ def generate_conversation_title(raw_transcript):
     return title[:80] or None
 
 
-def run_conversation_titling(conversation_id, raw_transcript):
+def run_conversation_titling(user_id, conversation_id, raw_transcript):
     """Runs in its own thread with its own pooled connection, same pattern
     as run_background_analysis -- generating the title is an LLM call and
     shouldn't hold up the websocket teardown it's triggered from."""
@@ -1101,8 +1235,11 @@ def run_conversation_titling(conversation_id, raw_transcript):
             "UPDATE conversations SET title = %s WHERE id = %s AND title IS NULL",
             (title, conversation_id),
         )
+        updated = cur.rowcount > 0
         conn.commit()
         cur.close()
+        if updated:
+            cache_delete(f"user:{user_id}:conversation:{conversation_id}", f"user:{user_id}:conversations")
     except Exception as e:
         print(f"[run_conversation_titling] DB error: {e!r}")
         conn.rollback()
@@ -1210,13 +1347,15 @@ def save_conversation():
 
     db = get_db()
     cur = dict_cursor(db)
+    user_id = current_user_id()
     cur.execute(
         "INSERT INTO conversations (user_id, title, raw_transcript) "
         "VALUES (%s, %s, %s) RETURNING id",
-        (current_user_id(), title, raw_transcript),
+        (user_id, title, raw_transcript),
     )
     conversation_id = cur.fetchone()["id"]
     db.commit()
+    cache_delete(f"user:{user_id}:conversations")
     return jsonify({"conversation_id": conversation_id})
 
 
@@ -1254,8 +1393,11 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     mood = parsed.get("mood") or {}
     tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
+    mood_label = (mood.get("label") or "").strip()
+
     conn = get_raw_connection()
     created_tasks = []
+    notify_mood_friend_ids = []
     try:
         cur = conn.cursor()
         cur.execute("SELECT category FROM conversations WHERE id = %s", (conversation_id,))
@@ -1288,57 +1430,300 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
                     "VALUES (%s, %s, %s, %s, %s)",
                     (user_id, conversation_id, label, profile_id, obs),
                 )
-        mood_label = (mood.get("label") or "").strip()
         if mood_label:
+            bucket_start, bucket_end = mood_bucket_bounds()
+            cur.execute(
+                "SELECT 1 FROM mood_logs WHERE user_id = %s AND created_at >= %s AND created_at < %s LIMIT 1",
+                (user_id, bucket_start, bucket_end),
+            )
+            is_first_in_bucket = cur.fetchone() is None
             cur.execute(
                 "INSERT INTO mood_logs (user_id, conversation_id, mood_label, mood_score) "
                 "VALUES (%s, %s, %s, %s)",
                 (user_id, conversation_id, mood_label, mood.get("score")),
             )
+            if is_first_in_bucket:
+                cur.execute("SELECT friend_id FROM friendships WHERE user_id = %s", (user_id,))
+                notify_mood_friend_ids = [r[0] for r in cur.fetchall()]
         conn.commit()
         cur.close()
     except Exception as e:
         print(f"[run_background_analysis] DB error: {e!r}")
         conn.rollback()
         created_tasks = []
+        notify_mood_friend_ids = []
     finally:
         release_raw_connection(conn)
 
     for task_id, description in created_tasks:
         push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
+        send_fcm_to_user(user_id, title="New task", body=description, data={"type": "task_created", "task_id": task_id})
+
+    if notify_mood_friend_ids:
+        notify_friends_of_mood_update(user_id, mood_label, notify_mood_friend_ids)
 
     push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers), "tags": tags})
 
 
 # ---------------------------------------------------------------------------
-# Live notifications (WebSocket + server-side pending queue)
+# Live notifications (WebSocket + Redis-backed pending queue + pub/sub)
 #
-# Mirrors WhatsApp's shape at a scale that doesn't need a broker: a per-user
-# queue on the server, drained into any live connection immediately, or held
-# until the user's next connection if none is open right now. This is what
-# lets a second open tab/device for the same account pick up a new task or
-# chat reply live -- the same-tab case that triggered the event already has
-# it from its own request response.
+# Mirrors WhatsApp's shape: a per-user queue, drained into any live
+# connection immediately, or held until the user's next connection if none
+# is open right now. The queue itself lives in Redis (pending_events:{id})
+# so it survives a server restart instead of being lost, and every push is
+# also published on a Redis channel so a second worker process (this app
+# runs single-process today, but isn't guaranteed to forever) would still
+# deliver live to a connection it holds, rather than silently missing it.
+#
+# If Redis is unreachable, this falls back to exactly the old in-process-only
+# behavior (the _pending_events dict below), so a dead cache never breaks
+# notification delivery within this one process -- it only loses the
+# "survives a restart" and "other worker processes" guarantees.
 # ---------------------------------------------------------------------------
 
 _notify_lock = threading.Lock()
 _notify_connections = {}  # user_id -> list[ws]
-_pending_events = {}      # user_id -> list[event dict], capped, drained on connect
+_pending_events = {}      # user_id -> list[event dict]; Redis-down fallback only
+_NOTIFY_CHANNEL = "notify_events"
+_PROCESS_ID = uuid.uuid4().hex
 
 
-def push_notification(user_id, event):
+def _deliver_to_local_connections(user_id, event):
     with _notify_lock:
         conns = list(_notify_connections.get(user_id, []))
-        if not conns:
-            queue = _pending_events.setdefault(user_id, [])
-            queue.append(event)
-            del queue[:-50]  # cap so a long-offline user's queue can't grow unbounded
-            return
+    delivered = False
     for ws in conns:
         try:
             ws.send(json.dumps(event))
+            delivered = True
         except Exception:
             pass
+    return delivered
+
+
+def _queue_pending_event(user_id, event):
+    key = f"pending_events:{user_id}"
+    try:
+        redis_client.rpush(key, json.dumps(event))
+        redis_client.ltrim(key, -50, -1)  # cap so a long-offline user's queue can't grow unbounded
+        return
+    except redis.RedisError:
+        pass
+    with _notify_lock:
+        queue = _pending_events.setdefault(user_id, [])
+        queue.append(event)
+        del queue[:-50]
+
+
+def push_notification(user_id, event):
+    delivered = _deliver_to_local_connections(user_id, event)
+    try:
+        redis_client.publish(
+            _NOTIFY_CHANNEL,
+            json.dumps({"user_id": user_id, "event": event, "origin": _PROCESS_ID}),
+        )
+    except redis.RedisError:
+        pass
+    if not delivered:
+        _queue_pending_event(user_id, event)
+
+
+def _notify_pubsub_listener():
+    """Cross-process delivery: if some other worker process holds the live
+    connection for a user an event was just published for, this delivers it
+    there. In today's single-process deployment this never fires for a
+    connection this same process already handled synchronously above (the
+    `origin` check skips those) -- it only matters once/if this ever runs
+    with more than one worker."""
+    while True:
+        try:
+            pubsub = redis_pubsub_client.pubsub()
+            pubsub.subscribe(_NOTIFY_CHANNEL)
+            for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    payload = json.loads(message["data"])
+                except ValueError:
+                    continue
+                if payload.get("origin") == _PROCESS_ID:
+                    continue
+                user_id = payload.get("user_id")
+                event = payload.get("event")
+                with _notify_lock:
+                    conns = list(_notify_connections.get(user_id, []))
+                if not conns:
+                    continue
+                for ws in conns:
+                    try:
+                        ws.send(json.dumps(event))
+                    except Exception:
+                        pass
+                try:
+                    redis_client.lrem(f"pending_events:{user_id}", 1, json.dumps(event))
+                except redis.RedisError:
+                    pass
+        except redis.RedisError as e:
+            print(f"[redis] notify pubsub listener error: {e!r}; retrying in 5s")
+            time.sleep(5)
+        except Exception as e:
+            print(f"[redis] notify pubsub listener crashed: {e!r}; retrying in 5s")
+            time.sleep(5)
+
+
+threading.Thread(target=_notify_pubsub_listener, daemon=True).start()
+
+
+def _drain_pending_events(user_id):
+    key = f"pending_events:{user_id}"
+    events = []
+    try:
+        pipe = redis_client.pipeline()
+        pipe.lrange(key, 0, -1)
+        pipe.delete(key)
+        raw_events, _ = pipe.execute()
+        for raw in raw_events:
+            try:
+                events.append(json.loads(raw))
+            except ValueError:
+                pass
+    except redis.RedisError as e:
+        print(f"[redis] drain pending_events failed for user {user_id}: {e!r}")
+    with _notify_lock:
+        events.extend(_pending_events.pop(user_id, []))
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Mobile push (Firebase Cloud Messaging)
+#
+# push_notification() above only reaches a client with an open /ws/notify
+# socket -- fine for a browser tab, useless for a native app that's
+# backgrounded or killed. send_fcm_to_user() is the mobile equivalent: it
+# reaches every device the user has registered via POST /devices/register,
+# regardless of whether the app is open. Both are called side by side at
+# each notification site rather than one replacing the other.
+#
+# Silently no-ops (never raises) if FIREBASE_CREDENTIALS_PATH isn't
+# configured -- same "not set up yet" pattern as SMTP_HOST for email, so the
+# app works before/without a Firebase project existing.
+# ---------------------------------------------------------------------------
+
+_firebase_app = None
+_firebase_init_attempted = False
+
+
+def get_firebase_app():
+    global _firebase_app, _firebase_init_attempted
+    if _firebase_app is not None:
+        return _firebase_app
+    if _firebase_init_attempted:
+        return None
+    _firebase_init_attempted = True
+    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
+    if not cred_path or not os.path.exists(cred_path):
+        print("[fcm] FIREBASE_CREDENTIALS_PATH not set/found -- push notifications disabled")
+        return None
+    try:
+        _firebase_app = firebase_admin.initialize_app(firebase_credentials.Certificate(cred_path))
+    except ValueError:
+        # Already initialized in this process (e.g. a second gunicorn worker
+        # re-imported this module) -- reuse the existing default app.
+        _firebase_app = firebase_admin.get_app()
+    return _firebase_app
+
+
+def send_fcm_to_user(user_id, title, body, data=None, include_notification=True):
+    """Best-effort push to every device this user has registered. Never
+    raises -- called from background threads (mood/task extraction) and
+    after the DB work it's reporting on is already committed, so a
+    delivery failure here must never affect anything else.
+
+    include_notification=False sends a data-only message (no `notification`
+    block, so the OS/Firebase SDK doesn't auto-post anything) -- used for
+    incoming_call, where the Flutter client shows its own full-screen-intent
+    notification instead. Every other caller keeps the default (unchanged)
+    behavior."""
+    app_ = get_firebase_app()
+    if not app_:
+        return
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT token FROM push_tokens WHERE user_id = %s", (user_id,))
+        tokens = [r[0] for r in cur.fetchall()]
+    finally:
+        release_raw_connection(conn)
+    if not tokens:
+        return
+
+    data_str = {k: str(v) for k, v in (data or {}).items()}
+    stale_tokens = []
+    for token in tokens:
+        message = firebase_messaging.Message(
+            token=token,
+            notification=firebase_messaging.Notification(title=title, body=body) if include_notification else None,
+            data=data_str,
+            android=firebase_messaging.AndroidConfig(priority="high"),
+            apns=firebase_messaging.APNSConfig(headers={"apns-priority": "10"}),
+        )
+        try:
+            firebase_messaging.send(message, app=app_)
+        except firebase_messaging.UnregisteredError:
+            stale_tokens.append(token)
+        except Exception as e:
+            print(f"[fcm] send failed for user {user_id}: {e!r}")
+
+    if stale_tokens:
+        conn = get_raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM push_tokens WHERE token = ANY(%s)", (stale_tokens,))
+            conn.commit()
+        finally:
+            release_raw_connection(conn)
+
+
+@app.route("/devices/register", methods=["POST"])
+@login_required
+def register_device():
+    """Flutter calls this once it has an FCM token (on launch, and again
+    whenever the token refreshes -- the ON CONFLICT keeps this idempotent
+    either way, and reassigns a token to a new user if the same device logs
+    into a different account)."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "").strip().lower()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    if platform not in ("android", "ios"):
+        return jsonify({"error": "platform must be 'android' or 'ios'"}), 400
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "INSERT INTO push_tokens (user_id, token, platform) VALUES (%s, %s, %s) "
+        "ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, platform = EXCLUDED.platform, updated_at = now()",
+        (current_user_id(), token, platform),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/devices/unregister", methods=["POST"])
+@login_required
+def unregister_device():
+    """Called on logout so a signed-out device stops receiving pushes for
+    the account it just left."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("DELETE FROM push_tokens WHERE token = %s AND user_id = %s", (token, current_user_id()))
+    db.commit()
+    return jsonify({"ok": True})
 
 
 @sock.route("/ws/notify")
@@ -1353,8 +1738,7 @@ def ws_notify(ws):
 
     with _notify_lock:
         _notify_connections.setdefault(user_id, []).append(ws)
-        pending = _pending_events.pop(user_id, [])
-    for event in pending:
+    for event in _drain_pending_events(user_id):
         try:
             ws.send(json.dumps(event))
         except Exception:
@@ -1439,6 +1823,17 @@ def ws_listen(ws):
         "wss://api.deepgram.com/v1/listen"
         "?diarize=true&punctuate=true&interim_results=false&model=nova-2"
     )
+    # Optional, mobile-client-only: the browser always sends WebM/Opus
+    # (Deepgram auto-detects that container), but a native recorder is
+    # simplest streaming raw linear16 PCM, which Deepgram can't
+    # auto-detect -- it must be told explicitly via these params. Absent
+    # (the web client never sends them) -> identical to previous behavior.
+    encoding = request.args.get("encoding")
+    if encoding:
+        dg_url += f"&encoding={encoding}"
+        sample_rate = request.args.get("sample_rate", type=int)
+        if sample_rate:
+            dg_url += f"&sample_rate={sample_rate}"
     try:
         dg_ws = ws_client.create_connection(dg_url, header=[f"Authorization: Token {api_key}"])
     except Exception as e:
@@ -1611,6 +2006,7 @@ def ws_listen(ws):
                 )
                 conn.commit()
                 cur.close()
+                cache_delete(f"user:{user_id}:conversation:{conversation_id}")
             finally:
                 release_raw_connection(conn)
             # The conversation just ended -- generate its title now rather
@@ -1618,7 +2014,7 @@ def ws_listen(ws):
             # Conversations tab) forever.
             threading.Thread(
                 target=run_conversation_titling,
-                args=(conversation_id, full_transcript),
+                args=(user_id, conversation_id, full_transcript),
                 daemon=True,
             ).start()
             if leftover.strip():
@@ -1688,16 +2084,18 @@ def analyze_conversation():
     mood = parsed.get("mood") or {}
     tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
+    created_tasks = []
     for task in tasks:
         description = (task.get("description") or "").strip()
         if not description:
             continue
         cur.execute(
             "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, 'open')",
+            "VALUES (%s, %s, %s, %s, %s, %s, 'open') RETURNING id",
             (user_id, conversation_id, description, task.get("owner"), task.get("due_date"),
              normalize_reminder_at(task.get("reminder_at"))),
         )
+        created_tasks.append((cur.fetchone()["id"], description))
 
     cur.execute("SELECT category FROM conversations WHERE id = %s", (conversation_id,))
     category_row = cur.fetchone()
@@ -1721,14 +2119,30 @@ def analyze_conversation():
             )
 
     mood_label = (mood.get("label") or "").strip()
+    notify_mood_friend_ids = []
     if mood_label:
+        bucket_start, bucket_end = mood_bucket_bounds()
+        cur.execute(
+            "SELECT 1 FROM mood_logs WHERE user_id = %s AND created_at >= %s AND created_at < %s LIMIT 1",
+            (user_id, bucket_start, bucket_end),
+        )
+        is_first_in_bucket = cur.fetchone() is None
         cur.execute(
             "INSERT INTO mood_logs (user_id, conversation_id, mood_label, mood_score) "
             "VALUES (%s, %s, %s, %s)",
             (user_id, conversation_id, mood_label, mood.get("score")),
         )
+        if is_first_in_bucket:
+            cur.execute("SELECT friend_id FROM friendships WHERE user_id = %s", (user_id,))
+            notify_mood_friend_ids = [r["friend_id"] for r in cur.fetchall()]
 
     db.commit()
+
+    for task_id, description in created_tasks:
+        push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
+        send_fcm_to_user(user_id, title="New task", body=description, data={"type": "task_created", "task_id": task_id})
+
+    notify_friends_of_mood_update(user_id, mood_label, notify_mood_friend_ids)
 
     return jsonify(
         {
@@ -1998,15 +2412,83 @@ def list_speakers():
 @app.route("/friends", methods=["GET"])
 @login_required
 def list_friends():
+    user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT users.id, users.username, friendships.nickname FROM friendships "
         "JOIN users ON users.id = friendships.friend_id "
         "WHERE friendships.user_id = %s ORDER BY COALESCE(friendships.nickname, users.username)",
-        (current_user_id(),),
+        (user_id,),
     )
-    return jsonify([dict(r) for r in cur.fetchall()])
+    friends = [dict(r) for r in cur.fetchall()]
+    friend_ids = [f["id"] for f in friends]
+
+    # Last-call summary per friend, for the WhatsApp/Telegram-style call-log
+    # subtitle in the friends list -- a group call counts toward EVERY
+    # friend who was also a participant (the cp_friend join naturally
+    # produces one row per other participant, not just one overall).
+    last_calls = {}
+    call_counts = {}
+    if friend_ids:
+        cur.execute(
+            "SELECT DISTINCT ON (cp_friend.user_id) "
+            "cp_friend.user_id AS friend_id, calls.created_at AS last_call_at, "
+            "(calls.initiator_user_id = %(me)s) AS outgoing "
+            "FROM calls "
+            "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
+            "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id != %(me)s "
+            "WHERE cp_friend.user_id = ANY(%(friend_ids)s) "
+            "ORDER BY cp_friend.user_id, calls.created_at DESC",
+            {"me": user_id, "friend_ids": friend_ids},
+        )
+        last_calls = {r["friend_id"]: r for r in cur.fetchall()}
+
+        cur.execute(
+            "SELECT cp_friend.user_id AS friend_id, COUNT(*) AS call_count "
+            "FROM calls "
+            "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
+            "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id != %(me)s "
+            "WHERE cp_friend.user_id = ANY(%(friend_ids)s) "
+            "GROUP BY cp_friend.user_id",
+            {"me": user_id, "friend_ids": friend_ids},
+        )
+        call_counts = {r["friend_id"]: r["call_count"] for r in cur.fetchall()}
+
+    for f in friends:
+        last = last_calls.get(f["id"])
+        f["last_call_at"] = last["last_call_at"].isoformat() if last else None
+        f["last_call_outgoing"] = last["outgoing"] if last else None
+        f["call_count"] = call_counts.get(f["id"], 0)
+
+    return jsonify(friends)
+
+
+@app.route("/friends/<int:friend_id>/calls", methods=["GET"])
+@login_required
+def friend_call_history(friend_id):
+    """Full call log with one friend, newest first -- what the (i)/detail
+    view drills into from the summary shown in GET /friends."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "SELECT calls.id AS call_id, calls.created_at, calls.ended_at, calls.status, "
+        "(calls.initiator_user_id = %(me)s) AS outgoing "
+        "FROM calls "
+        "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
+        "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id = %(friend_id)s "
+        "ORDER BY calls.created_at DESC",
+        {"me": user_id, "friend_id": friend_id},
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
 
 
 @app.route("/friends/add", methods=["POST"])
@@ -2098,19 +2580,34 @@ def friend_mood(friend_id):
     if not cur.fetchone():
         return jsonify({"error": "Not friends with that user"}), 403
 
-    # "Through the day" -- everything logged since local midnight, oldest
-    # first, so the frontend can render it as a timeline rather than just
-    # the latest snapshot.
-    since_local_midnight = datetime.now().astimezone().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    cur.execute(
-        "SELECT mood_label, mood_score, created_at FROM mood_logs "
-        "WHERE user_id = %s AND created_at >= %s ORDER BY created_at ASC",
-        (friend_id, since_local_midnight),
-    )
-    entries = [serialize_row(r) for r in cur.fetchall()]
-    return jsonify({"friend_id": friend_id, "entries": entries})
+    # A single compiled emoji for the current 2-hour window, not a raw
+    # timeline -- see compute_compiled_mood/mood_bucket_bounds. Falls back
+    # to the most recent earlier window today if nothing's logged yet in
+    # the current one.
+    bucket_start, bucket_end = mood_bucket_bounds()
+    compiled = compute_compiled_mood(cur, friend_id, bucket_start, bucket_end)
+
+    if not compiled:
+        since_local_midnight = datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        cur.execute(
+            "SELECT created_at FROM mood_logs WHERE user_id = %s AND created_at >= %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (friend_id, since_local_midnight),
+        )
+        last = cur.fetchone()
+        if last:
+            bucket_start, bucket_end = mood_bucket_bounds(last["created_at"])
+            compiled = compute_compiled_mood(cur, friend_id, bucket_start, bucket_end)
+
+    return jsonify({
+        "friend_id": friend_id,
+        "window_start": bucket_start.isoformat(),
+        "window_end": bucket_end.isoformat(),
+        "mood_label": compiled["mood_label"] if compiled else None,
+        "emoji": compiled["emoji"] if compiled else None,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2200,10 +2697,15 @@ def create_call():
 
     token = generate_livekit_token(user_id, username, room_name)
     for fid in friend_ids:
-        push_notification(fid, {
+        call_event = {
             "type": "incoming_call", "call_id": call_id, "room_name": room_name,
             "caller_id": user_id, "caller_name": username,
-        })
+        }
+        push_notification(fid, call_event)
+        send_fcm_to_user(
+            fid, title="Incoming call", body=f"{username} is calling...",
+            data=call_event, include_notification=False,
+        )
 
     return jsonify({
         "call_id": call_id, "room_name": room_name, "token": token,
@@ -2220,6 +2722,12 @@ def join_call(call_id):
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
+    cur.execute("SELECT status FROM calls WHERE id = %s", (call_id,))
+    call = cur.fetchone()
+    if not call:
+        return jsonify({"error": "Call not found"}), 404
+    if call["status"] == "ended":
+        return jsonify({"error": "This call has already ended"}), 400
     cur.execute(
         "UPDATE call_participants SET status = 'joined', joined_at = now() "
         "WHERE call_id = %s AND user_id = %s RETURNING id",
@@ -2251,9 +2759,26 @@ def decline_call(call_id):
         (call_id, current_user_id()),
     )
     updated = cur.fetchone()
-    db.commit()
     if not updated:
+        db.commit()
         return jsonify({"error": "Call not found"}), 404
+
+    # If every other invitee has now declined/left and nobody has joined
+    # yet, the call can never proceed -- tell the initiator so their client
+    # can hang up instead of sitting in "Call in progress" forever (LiveKit
+    # never fires a disconnect event for someone who never connected).
+    cur.execute("SELECT initiator_user_id, status FROM calls WHERE id = %s", (call_id,))
+    call = cur.fetchone()
+    if call["status"] == "ringing":
+        cur.execute(
+            "SELECT count(*) AS n FROM call_participants "
+            "WHERE call_id = %s AND user_id != %s AND status IN ('invited', 'joined')",
+            (call_id, call["initiator_user_id"]),
+        )
+        if cur.fetchone()["n"] == 0:
+            cur.execute("UPDATE calls SET status = 'ended', ended_at = now() WHERE id = %s", (call_id,))
+            push_notification(call["initiator_user_id"], {"type": "call_declined", "call_id": call_id})
+    db.commit()
     return jsonify({"ok": True})
 
 
@@ -2291,9 +2816,20 @@ def upload_call_recording(call_id):
     call ends. Same Deepgram diarized-transcription call as /transcribe,
     then reuses the existing conversation-creation + analysis pipeline --
     the resulting conversation is indistinguishable from a solo dictation
-    one, just tagged via calls.conversation_id."""
+    one, just tagged via calls.conversation_id. If Deepgram detected no
+    speech at all, nothing is created -- see the no_speech_detected check
+    below."""
     if "audio" not in request.files:
         return jsonify({"error": "No audio file uploaded"}), 400
+
+    # `scope=own` (mobile clients only): each participant uploads just their
+    # own local mic recording, independently of everyone else, instead of
+    # the web client's single mixed-stream upload from the initiator. Kept
+    # as a fully separate branch/idempotency key (call_participants row, not
+    # calls.conversation_id) so the legacy web upload path below is
+    # completely untouched.
+    if request.form.get("scope") == "own":
+        return _upload_own_call_recording(call_id)
 
     user_id = current_user_id()
     db = get_db()
@@ -2340,6 +2876,16 @@ def upload_call_recording(call_id):
             lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
     raw_transcript = "\n".join(lines)
 
+    if not raw_transcript.strip():
+        # No speech detected (silence, a call that ended before anyone said
+        # anything, etc.) -- don't create a conversation at all. One would
+        # otherwise sit in everyone's Chats list as permanent, useless
+        # clutter, and opening an empty one to ask a question would burn a
+        # real LLM call against nothing. calls.conversation_id stays NULL;
+        # a later recording upload for this same call (if it ever happened)
+        # would still be processed rather than silently no-op'd forever.
+        return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
+
     cur.execute("SELECT user_id FROM call_participants WHERE call_id = %s", (call_id,))
     participant_ids = [r["user_id"] for r in cur.fetchall()]
 
@@ -2362,18 +2908,19 @@ def upload_call_recording(call_id):
     primary_conversation_id = conversation_ids[user_id]
     cur.execute("UPDATE calls SET conversation_id = %s WHERE id = %s", (primary_conversation_id, call_id))
     db.commit()
+    cache_delete(*(f"user:{pid}:conversations" for pid in conversation_ids))
 
-    if raw_transcript.strip():
-        for pid, conv_id in conversation_ids.items():
-            threading.Thread(target=run_conversation_titling, args=(conv_id, raw_transcript), daemon=True).start()
-            # No live websocket to push background_update to here (this is a
-            # REST upload, not a /ws/listen session) -- a no-op push is a
-            # valid, unmodified use of the existing function.
-            threading.Thread(
-                target=run_background_analysis,
-                args=(pid, conv_id, raw_transcript, lambda *a, **k: None),
-                daemon=True,
-            ).start()
+    # raw_transcript is guaranteed non-empty here (checked above).
+    for pid, conv_id in conversation_ids.items():
+        threading.Thread(target=run_conversation_titling, args=(pid, conv_id, raw_transcript), daemon=True).start()
+        # No live websocket to push background_update to here (this is a
+        # REST upload, not a /ws/listen session) -- a no-op push is a
+        # valid, unmodified use of the existing function.
+        threading.Thread(
+            target=run_background_analysis,
+            args=(pid, conv_id, raw_transcript, lambda *a, **k: None),
+            daemon=True,
+        ).start()
 
     for pid, conv_id in conversation_ids.items():
         push_notification(pid, {
@@ -2381,6 +2928,102 @@ def upload_call_recording(call_id):
         })
 
     return jsonify({"conversation_id": primary_conversation_id})
+
+
+def _upload_own_call_recording(call_id):
+    """scope=own branch of upload_call_recording: transcribes and attaches
+    a conversation for just the uploading participant, independent of
+    every other participant's own upload. Idempotent per
+    (call_id, user_id) via call_participants.recording_uploaded_at, not
+    calls.conversation_id (that column is reserved for the legacy
+    mixed-upload flow above)."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT c.category, cp.recording_uploaded_at, cp.conversation_id FROM calls c "
+        "JOIN call_participants cp ON cp.call_id = c.id "
+        "WHERE c.id = %s AND cp.user_id = %s",
+        (call_id, user_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Call not found"}), 404
+    if row["recording_uploaded_at"]:
+        return jsonify({"conversation_id": row["conversation_id"], "already_processed": True})
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    content_type = audio_file.mimetype or "audio/webm"
+
+    try:
+        resp = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
+            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
+            data=audio_bytes,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        return jsonify({"error": f"Deepgram error: {e}"}), status
+    except requests.RequestException as e:
+        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
+
+    utterances = (resp.json().get("results") or {}).get("utterances") or []
+    lines = []
+    for utt in utterances:
+        text = (utt.get("transcript") or "").strip()
+        if text:
+            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
+    raw_transcript = "\n".join(lines)
+
+    if not raw_transcript.strip():
+        cur.execute(
+            "UPDATE call_participants SET recording_uploaded_at = now() WHERE call_id = %s AND user_id = %s",
+            (call_id, user_id),
+        )
+        db.commit()
+        return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
+
+    cur.execute(
+        "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
+        (user_id, None, raw_transcript, row["category"]),
+    )
+    conversation_id = cur.fetchone()["id"]
+    cur.execute(
+        "UPDATE call_participants SET recording_uploaded_at = now(), conversation_id = %s "
+        "WHERE call_id = %s AND user_id = %s",
+        (conversation_id, call_id, user_id),
+    )
+    db.commit()
+    cache_delete(f"user:{user_id}:conversations")
+
+    threading.Thread(target=run_conversation_titling, args=(user_id, conversation_id, raw_transcript), daemon=True).start()
+    threading.Thread(
+        target=run_background_analysis,
+        args=(user_id, conversation_id, raw_transcript, lambda *a, **k: None),
+        daemon=True,
+    ).start()
+    push_notification(user_id, {
+        "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
+    })
+
+    return jsonify({"conversation_id": conversation_id})
+
+
+CHAT_FORMATTING_GUIDANCE = (
+    "If a specific line in the transcript directly answers or is clearly relevant to the "
+    "question, quote it verbatim in your reply, attributed to who said it, like: "
+    'Rahul said: "the exact line". Only quote when it genuinely supports the answer -- never '
+    "invent or paraphrase a quote. Format the reply in markdown: **bold** key terms, names, or "
+    "numbers, and use \"- \" bullet points when listing more than one item; keep a short direct "
+    "answer as plain prose instead of forcing it into a list."
+)
 
 
 def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
@@ -2394,6 +3037,7 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_co
         "references ('he', 'that', 'earlier') instead of asking for "
         "clarification when it's inferable from context. "
         + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
+        + " " + CHAT_FORMATTING_GUIDANCE
     )
     return base + (f" {persona_context}" if persona_context else "")
 
@@ -2410,7 +3054,8 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         "its own date/title/category. Use those dates to resolve relative time references "
         "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
         "continuous conversation. Ground your answer only in what's in these excerpts; if the "
-        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble."
+        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble. "
+        + CHAT_FORMATTING_GUIDANCE
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
@@ -2425,7 +3070,19 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
 CHAT_HISTORY_MAX_TURNS = int(os.getenv("CHAT_HISTORY_MAX_TURNS", "6"))
 
 
+def _messages_cache_key(user_id, conversation_id):
+    if conversation_id:
+        return f"user:{user_id}:conversation:{conversation_id}:messages"
+    return f"user:{user_id}:global_chat"
+
+
 def load_chat_context(cur, user_id, conversation_id):
+    # Same data GET /conversations/<id>/chat serves, just the tail of it --
+    # reuse that cache instead of re-querying Postgres on every /chat turn.
+    cached = cache_get_json(_messages_cache_key(user_id, conversation_id))
+    if cached is not None:
+        tail = cached[-(CHAT_HISTORY_MAX_TURNS * 2):]
+        return [{"role": m["role"], "content": m["content"]} for m in tail]
     cur.execute(
         "SELECT role, content FROM chat_messages "
         "WHERE user_id = %s AND conversation_id = %s "
@@ -2442,6 +3099,19 @@ def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
         "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
         (user_id, conversation_id, prompt, user_id, conversation_id, reply),
     )
+    # Keep the message-list cache (if any is warm) up to date in place rather
+    # than invalidating it -- this is the highest-frequency write path, and
+    # re-fetching the full history from Postgres on every single chat turn
+    # would defeat the point of caching it.
+    cache_key = _messages_cache_key(user_id, conversation_id)
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        ts = datetime.now(timezone.utc).isoformat()
+        cached = cached + [
+            {"role": "user", "content": prompt, "created_at": ts},
+            {"role": "assistant", "content": reply, "created_at": ts},
+        ]
+        cache_set_json(cache_key, cached, ttl=3600)
 
 
 def load_global_chat_context(cur, user_id):
@@ -2449,6 +3119,10 @@ def load_global_chat_context(cur, user_id):
     conversation_id IS NULL there, and plain `= NULL` never matches in SQL
     (three-valued logic), so this needs its own query rather than reusing
     load_chat_context with conversation_id=None."""
+    cached = cache_get_json(_messages_cache_key(user_id, None))
+    if cached is not None:
+        tail = cached[-(CHAT_HISTORY_MAX_TURNS * 2):]
+        return [{"role": m["role"], "content": m["content"]} for m in tail]
     cur.execute(
         "SELECT role, content FROM chat_messages "
         "WHERE user_id = %s AND conversation_id IS NULL "
@@ -2466,28 +3140,42 @@ def list_conversations():
     ChatGPT-style history list instead of losing access to a chat the moment
     a new live-listening session starts (each session is its own
     conversation row; none of them are ever deleted here)."""
+    user_id = current_user_id()
+    cache_key = f"user:{user_id}:conversations"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT id, created_at, title, category FROM conversations WHERE user_id = %s ORDER BY created_at DESC",
-        (current_user_id(),),
+        (user_id,),
     )
-    return jsonify([serialize_row(r) for r in cur.fetchall()])
+    result = [serialize_row(r) for r in cur.fetchall()]
+    cache_set_json(cache_key, result, ttl=600)
+    return jsonify(result)
 
 
 @app.route("/conversations/<int:conversation_id>", methods=["GET"])
 @login_required
 def get_conversation(conversation_id):
+    user_id = current_user_id()
+    cache_key = f"user:{user_id}:conversation:{conversation_id}"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT id, created_at, title, raw_transcript, category FROM conversations WHERE id = %s AND user_id = %s",
-        (conversation_id, current_user_id()),
+        (conversation_id, user_id),
     )
     row = cur.fetchone()
     if not row:
         return jsonify({"error": "Conversation not found"}), 404
-    return jsonify(serialize_row(row))
+    result = serialize_row(row)
+    cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
 
 
 @app.route("/conversations/<int:conversation_id>/chat", methods=["GET"])
@@ -2496,9 +3184,13 @@ def get_conversation_chat(conversation_id):
     """Full, untrimmed chat history for one conversation -- separate from
     the LLM-context slice /chat uses, so old messages remain readable here
     no matter how long the chat has run."""
+    user_id = current_user_id()
+    cache_key = _messages_cache_key(user_id, conversation_id)
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
-    user_id = current_user_id()
     cur.execute(
         "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
         (conversation_id, user_id),
@@ -2510,7 +3202,9 @@ def get_conversation_chat(conversation_id):
         "WHERE user_id = %s AND conversation_id = %s ORDER BY created_at ASC",
         (user_id, conversation_id),
     )
-    return jsonify([serialize_row(r) for r in cur.fetchall()])
+    result = [serialize_row(r) for r in cur.fetchall()]
+    cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
 
 
 @app.route("/conversations/<int:conversation_id>", methods=["DELETE"])
@@ -2524,14 +3218,20 @@ def delete_conversation(conversation_id):
     itself goes away."""
     db = get_db()
     cur = dict_cursor(db)
+    user_id = current_user_id()
     cur.execute(
         "DELETE FROM conversations WHERE id = %s AND user_id = %s RETURNING id",
-        (conversation_id, current_user_id()),
+        (conversation_id, user_id),
     )
     deleted = cur.fetchone()
     db.commit()
     if not deleted:
         return jsonify({"error": "Conversation not found"}), 404
+    cache_delete(
+        f"user:{user_id}:conversation:{conversation_id}",
+        f"user:{user_id}:conversation:{conversation_id}:messages",
+        f"user:{user_id}:conversations",
+    )
     return jsonify({"ok": True})
 
 
@@ -2626,14 +3326,21 @@ GLOBAL_CHAT_CHARS_PER_CONVERSATION = 1200
 @app.route("/chat/global", methods=["GET"])
 @login_required
 def get_global_chat_history():
+    user_id = current_user_id()
+    cache_key = _messages_cache_key(user_id, None)
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT role, content, created_at FROM chat_messages "
         "WHERE user_id = %s AND conversation_id IS NULL ORDER BY created_at ASC",
-        (current_user_id(),),
+        (user_id,),
     )
-    return jsonify([serialize_row(r) for r in cur.fetchall()])
+    result = [serialize_row(r) for r in cur.fetchall()]
+    cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
 
 
 @app.route("/chat/global", methods=["POST"])

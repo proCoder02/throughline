@@ -1,11 +1,37 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
-import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, CheckIcon } from '../icons.jsx';
+import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, CheckIcon, InfoIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
+
+// WhatsApp/Telegram-style: today's time, "Yesterday", or a short date for
+// anything older -- mirrors the Flutter client's formatCallTimestamp.
+function formatCallTimestamp(iso) {
+  const dt = new Date(iso);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const that = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+  const diffDays = Math.round((today - that) / 86400000);
+  if (diffDays === 0) return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (diffDays === 1) return 'Yesterday';
+  return dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+// e.g. "14:32 (3)  Outgoing" -- the count only shows in parens when >1.
+function formatLastCallSubtitle(f) {
+  if (!f.last_call_at) return 'No calls yet';
+  const countPart = f.call_count > 1 ? ` (${f.call_count})` : '';
+  const direction = f.last_call_outgoing ? 'Outgoing' : 'Incoming';
+  return `${formatCallTimestamp(f.last_call_at)}${countPart}  ${direction}`;
+}
 
 export default function FriendsSection({ onStartCall }) {
   const [friends, setFriends] = useState([]);
   const [selected, setSelected] = useState(null);
+  // 'calls' (default, opened by clicking a friend row) or 'mood' (opened via
+  // the (i) button) -- mirrors the Flutter client's CallHistoryScreen with
+  // its (i) action into FriendMoodScreen.
+  const [view, setView] = useState('calls');
+  const [callHistory, setCallHistory] = useState(null);
   const [mood, setMood] = useState(null);
   const [code, setCode] = useState('');
   const [status, setStatus] = useState('');
@@ -40,8 +66,15 @@ export default function FriendsSection({ onStartCall }) {
 
   const openFriend = async (f) => {
     setSelected(f);
-    const data = await apiJson(`/friends/${f.id}/mood`).catch(() => ({ entries: [] }));
-    setMood(data.entries || []);
+    setView('calls');
+    const data = await apiJson(`/friends/${f.id}/calls`).catch(() => []);
+    setCallHistory(data);
+  };
+
+  const showMood = async () => {
+    setView('mood');
+    const data = await apiJson(`/friends/${selected.id}/mood`).catch(() => null);
+    setMood(data);
   };
 
   const removeFriend = async (f) => {
@@ -113,7 +146,7 @@ export default function FriendsSection({ onStartCall }) {
             <span className="avatar">{(f.nickname || f.username)[0]}</span>
             <div className="row-main">
               <div className="row-top"><span className="row-title">{f.nickname || f.username}</span></div>
-              <div className="row-sub"><span className="status-dot" />Mood tracked today</div>
+              <div className="row-sub">{formatLastCallSubtitle(f)}</div>
             </div>
             {pickingCall ? (
               callSelection.includes(f.id) && <CheckIcon />
@@ -146,7 +179,9 @@ export default function FriendsSection({ onStartCall }) {
                     onKeyDown={(e) => e.key === 'Enter' && saveNickname()}
                   />
                 ) : (
-                  <div className="detail-title">{(selected.nickname || selected.username)}'s mood today</div>
+                  <div className="detail-title">
+                    {(selected.nickname || selected.username)}{view === 'mood' ? "'s mood" : "'s calls"}
+                  </div>
                 )}
               </div>
               {renaming ? (
@@ -156,6 +191,15 @@ export default function FriendsSection({ onStartCall }) {
                 </div>
               ) : (
                 <div style={{ display: 'flex' }}>
+                  {view === 'mood' ? (
+                    <button className="conv-link-btn" title="View calls" onClick={() => setView('calls')}>
+                      <PhoneIcon />
+                    </button>
+                  ) : (
+                    <button className="conv-link-btn" title="View mood" onClick={showMood}>
+                      <InfoIcon />
+                    </button>
+                  )}
                   <button className="conv-link-btn" title="Set nickname" onClick={startRename}>
                     <PencilIcon />
                   </button>
@@ -165,14 +209,31 @@ export default function FriendsSection({ onStartCall }) {
                 </div>
               )}
             </div>
-            {mood && mood.length ? mood.map((m, i) => (
-              <div key={i} className="detail-meta">
-                {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — {m.mood_label}
-              </div>
-            )) : <div className="hint">No mood data logged yet today.</div>}
+            {view === 'mood' ? (
+              mood?.emoji ? (
+                <div className="mood-compiled">
+                  <div className="mood-compiled-emoji">{mood.emoji}</div>
+                  <div className="detail-meta" style={{ textTransform: 'capitalize' }}>{mood.mood_label}</div>
+                  <div className="hint">
+                    As of {new Date(mood.window_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {'–'}{new Date(mood.window_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </div>
+                </div>
+              ) : <div className="hint">No mood data logged yet today.</div>
+            ) : callHistory?.length ? (
+              callHistory.map((c) => (
+                <div key={c.call_id} className="detail-meta-row">
+                  <span>{c.outgoing ? 'Outgoing' : 'Incoming'}</span>
+                  <span className="hint" style={{ margin: 0 }}>
+                    {formatCallTimestamp(c.created_at)}
+                    {c.ended_at && ` · ${Math.max(1, Math.round((new Date(c.ended_at) - new Date(c.created_at)) / 1000))}s`}
+                  </span>
+                </div>
+              ))
+            ) : <div className="hint">No calls yet.</div>}
           </div>
         ) : (
-          <div className="hint">Select a friend to see their mood through the day.</div>
+          <div className="hint">Select a friend to see their calls and mood.</div>
         )}
       </div>
     </>
