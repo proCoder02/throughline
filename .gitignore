@@ -19,6 +19,9 @@ env/
 # Logs
 *.log
 
+# Background dev-server PID tracking (scripts/backend-start.ps1)
+.backend.pid
+
 # IDE/editor files
 .vscode/
 .idea/

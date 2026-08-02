@@ -25,6 +25,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import redis
 import livekit.api as livekit_api
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
@@ -92,6 +93,66 @@ def close_db(exception=None):
         if exception is not None:
             db.rollback()
         db_pool.putconn(db)
+
+
+# ---------------------------------------------------------------------------
+# Redis (cache-aside reads + /ws/notify durability/pub-sub)
+#
+# Unlike Postgres, Redis is never load-bearing -- Postgres stays the source
+# of truth for everything, Redis only ever makes reads faster and
+# notifications more durable. Every call below swallows connection errors
+# and falls back to "as if there were no cache" (hit Postgres directly, or
+# for /ws/notify, behave like the old in-process-only delivery), so a dead
+# Redis degrades performance, not correctness.
+# ---------------------------------------------------------------------------
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# protocol=2 (RESP2) rather than the client default -- keeps this working
+# against older Redis builds (e.g. the Windows ports, based on Redis 5.x)
+# that predate RESP3's HELLO handshake, while still working fine against
+# any modern Redis server too.
+redis_client = redis.from_url(
+    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=1, socket_timeout=1
+)
+# Separate client for the pub/sub listener below -- it holds one connection
+# blocked in .listen() waiting for the next message, which can legitimately
+# take longer than 1s of idle time. Reusing redis_client's short
+# socket_timeout there made every quiet second look like a dropped
+# connection (logged as a TimeoutError, retried every 5s forever) instead
+# of actually indicating Redis was unreachable.
+redis_pubsub_client = redis.from_url(
+    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=1, socket_timeout=None
+)
+
+
+def cache_get_json(key):
+    try:
+        val = redis_client.get(key)
+    except redis.RedisError as e:
+        print(f"[redis] GET {key} failed: {e!r}")
+        return None
+    if val is None:
+        return None
+    try:
+        return json.loads(val)
+    except ValueError:
+        return None
+
+
+def cache_set_json(key, value, ttl=None):
+    try:
+        redis_client.set(key, json.dumps(value), ex=ttl)
+    except redis.RedisError as e:
+        print(f"[redis] SET {key} failed: {e!r}")
+
+
+def cache_delete(*keys):
+    if not keys:
+        return
+    try:
+        redis_client.delete(*keys)
+    except redis.RedisError as e:
+        print(f"[redis] DELETE {keys} failed: {e!r}")
 
 
 def dict_cursor(conn):
@@ -1158,7 +1219,7 @@ def generate_conversation_title(raw_transcript):
     return title[:80] or None
 
 
-def run_conversation_titling(conversation_id, raw_transcript):
+def run_conversation_titling(user_id, conversation_id, raw_transcript):
     """Runs in its own thread with its own pooled connection, same pattern
     as run_background_analysis -- generating the title is an LLM call and
     shouldn't hold up the websocket teardown it's triggered from."""
@@ -1174,8 +1235,11 @@ def run_conversation_titling(conversation_id, raw_transcript):
             "UPDATE conversations SET title = %s WHERE id = %s AND title IS NULL",
             (title, conversation_id),
         )
+        updated = cur.rowcount > 0
         conn.commit()
         cur.close()
+        if updated:
+            cache_delete(f"user:{user_id}:conversation:{conversation_id}", f"user:{user_id}:conversations")
     except Exception as e:
         print(f"[run_conversation_titling] DB error: {e!r}")
         conn.rollback()
@@ -1283,13 +1347,15 @@ def save_conversation():
 
     db = get_db()
     cur = dict_cursor(db)
+    user_id = current_user_id()
     cur.execute(
         "INSERT INTO conversations (user_id, title, raw_transcript) "
         "VALUES (%s, %s, %s) RETURNING id",
-        (current_user_id(), title, raw_transcript),
+        (user_id, title, raw_transcript),
     )
     conversation_id = cur.fetchone()["id"]
     db.commit()
+    cache_delete(f"user:{user_id}:conversations")
     return jsonify({"conversation_id": conversation_id})
 
 
@@ -1400,34 +1466,133 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
 
 
 # ---------------------------------------------------------------------------
-# Live notifications (WebSocket + server-side pending queue)
+# Live notifications (WebSocket + Redis-backed pending queue + pub/sub)
 #
-# Mirrors WhatsApp's shape at a scale that doesn't need a broker: a per-user
-# queue on the server, drained into any live connection immediately, or held
-# until the user's next connection if none is open right now. This is what
-# lets a second open tab/device for the same account pick up a new task or
-# chat reply live -- the same-tab case that triggered the event already has
-# it from its own request response.
+# Mirrors WhatsApp's shape: a per-user queue, drained into any live
+# connection immediately, or held until the user's next connection if none
+# is open right now. The queue itself lives in Redis (pending_events:{id})
+# so it survives a server restart instead of being lost, and every push is
+# also published on a Redis channel so a second worker process (this app
+# runs single-process today, but isn't guaranteed to forever) would still
+# deliver live to a connection it holds, rather than silently missing it.
+#
+# If Redis is unreachable, this falls back to exactly the old in-process-only
+# behavior (the _pending_events dict below), so a dead cache never breaks
+# notification delivery within this one process -- it only loses the
+# "survives a restart" and "other worker processes" guarantees.
 # ---------------------------------------------------------------------------
 
 _notify_lock = threading.Lock()
 _notify_connections = {}  # user_id -> list[ws]
-_pending_events = {}      # user_id -> list[event dict], capped, drained on connect
+_pending_events = {}      # user_id -> list[event dict]; Redis-down fallback only
+_NOTIFY_CHANNEL = "notify_events"
+_PROCESS_ID = uuid.uuid4().hex
 
 
-def push_notification(user_id, event):
+def _deliver_to_local_connections(user_id, event):
     with _notify_lock:
         conns = list(_notify_connections.get(user_id, []))
-        if not conns:
-            queue = _pending_events.setdefault(user_id, [])
-            queue.append(event)
-            del queue[:-50]  # cap so a long-offline user's queue can't grow unbounded
-            return
+    delivered = False
     for ws in conns:
         try:
             ws.send(json.dumps(event))
+            delivered = True
         except Exception:
             pass
+    return delivered
+
+
+def _queue_pending_event(user_id, event):
+    key = f"pending_events:{user_id}"
+    try:
+        redis_client.rpush(key, json.dumps(event))
+        redis_client.ltrim(key, -50, -1)  # cap so a long-offline user's queue can't grow unbounded
+        return
+    except redis.RedisError:
+        pass
+    with _notify_lock:
+        queue = _pending_events.setdefault(user_id, [])
+        queue.append(event)
+        del queue[:-50]
+
+
+def push_notification(user_id, event):
+    delivered = _deliver_to_local_connections(user_id, event)
+    try:
+        redis_client.publish(
+            _NOTIFY_CHANNEL,
+            json.dumps({"user_id": user_id, "event": event, "origin": _PROCESS_ID}),
+        )
+    except redis.RedisError:
+        pass
+    if not delivered:
+        _queue_pending_event(user_id, event)
+
+
+def _notify_pubsub_listener():
+    """Cross-process delivery: if some other worker process holds the live
+    connection for a user an event was just published for, this delivers it
+    there. In today's single-process deployment this never fires for a
+    connection this same process already handled synchronously above (the
+    `origin` check skips those) -- it only matters once/if this ever runs
+    with more than one worker."""
+    while True:
+        try:
+            pubsub = redis_pubsub_client.pubsub()
+            pubsub.subscribe(_NOTIFY_CHANNEL)
+            for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    payload = json.loads(message["data"])
+                except ValueError:
+                    continue
+                if payload.get("origin") == _PROCESS_ID:
+                    continue
+                user_id = payload.get("user_id")
+                event = payload.get("event")
+                with _notify_lock:
+                    conns = list(_notify_connections.get(user_id, []))
+                if not conns:
+                    continue
+                for ws in conns:
+                    try:
+                        ws.send(json.dumps(event))
+                    except Exception:
+                        pass
+                try:
+                    redis_client.lrem(f"pending_events:{user_id}", 1, json.dumps(event))
+                except redis.RedisError:
+                    pass
+        except redis.RedisError as e:
+            print(f"[redis] notify pubsub listener error: {e!r}; retrying in 5s")
+            time.sleep(5)
+        except Exception as e:
+            print(f"[redis] notify pubsub listener crashed: {e!r}; retrying in 5s")
+            time.sleep(5)
+
+
+threading.Thread(target=_notify_pubsub_listener, daemon=True).start()
+
+
+def _drain_pending_events(user_id):
+    key = f"pending_events:{user_id}"
+    events = []
+    try:
+        pipe = redis_client.pipeline()
+        pipe.lrange(key, 0, -1)
+        pipe.delete(key)
+        raw_events, _ = pipe.execute()
+        for raw in raw_events:
+            try:
+                events.append(json.loads(raw))
+            except ValueError:
+                pass
+    except redis.RedisError as e:
+        print(f"[redis] drain pending_events failed for user {user_id}: {e!r}")
+    with _notify_lock:
+        events.extend(_pending_events.pop(user_id, []))
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -1573,8 +1738,7 @@ def ws_notify(ws):
 
     with _notify_lock:
         _notify_connections.setdefault(user_id, []).append(ws)
-        pending = _pending_events.pop(user_id, [])
-    for event in pending:
+    for event in _drain_pending_events(user_id):
         try:
             ws.send(json.dumps(event))
         except Exception:
@@ -1842,6 +2006,7 @@ def ws_listen(ws):
                 )
                 conn.commit()
                 cur.close()
+                cache_delete(f"user:{user_id}:conversation:{conversation_id}")
             finally:
                 release_raw_connection(conn)
             # The conversation just ended -- generate its title now rather
@@ -1849,7 +2014,7 @@ def ws_listen(ws):
             # Conversations tab) forever.
             threading.Thread(
                 target=run_conversation_titling,
-                args=(conversation_id, full_transcript),
+                args=(user_id, conversation_id, full_transcript),
                 daemon=True,
             ).start()
             if leftover.strip():
@@ -2247,15 +2412,83 @@ def list_speakers():
 @app.route("/friends", methods=["GET"])
 @login_required
 def list_friends():
+    user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT users.id, users.username, friendships.nickname FROM friendships "
         "JOIN users ON users.id = friendships.friend_id "
         "WHERE friendships.user_id = %s ORDER BY COALESCE(friendships.nickname, users.username)",
-        (current_user_id(),),
+        (user_id,),
     )
-    return jsonify([dict(r) for r in cur.fetchall()])
+    friends = [dict(r) for r in cur.fetchall()]
+    friend_ids = [f["id"] for f in friends]
+
+    # Last-call summary per friend, for the WhatsApp/Telegram-style call-log
+    # subtitle in the friends list -- a group call counts toward EVERY
+    # friend who was also a participant (the cp_friend join naturally
+    # produces one row per other participant, not just one overall).
+    last_calls = {}
+    call_counts = {}
+    if friend_ids:
+        cur.execute(
+            "SELECT DISTINCT ON (cp_friend.user_id) "
+            "cp_friend.user_id AS friend_id, calls.created_at AS last_call_at, "
+            "(calls.initiator_user_id = %(me)s) AS outgoing "
+            "FROM calls "
+            "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
+            "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id != %(me)s "
+            "WHERE cp_friend.user_id = ANY(%(friend_ids)s) "
+            "ORDER BY cp_friend.user_id, calls.created_at DESC",
+            {"me": user_id, "friend_ids": friend_ids},
+        )
+        last_calls = {r["friend_id"]: r for r in cur.fetchall()}
+
+        cur.execute(
+            "SELECT cp_friend.user_id AS friend_id, COUNT(*) AS call_count "
+            "FROM calls "
+            "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
+            "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id != %(me)s "
+            "WHERE cp_friend.user_id = ANY(%(friend_ids)s) "
+            "GROUP BY cp_friend.user_id",
+            {"me": user_id, "friend_ids": friend_ids},
+        )
+        call_counts = {r["friend_id"]: r["call_count"] for r in cur.fetchall()}
+
+    for f in friends:
+        last = last_calls.get(f["id"])
+        f["last_call_at"] = last["last_call_at"].isoformat() if last else None
+        f["last_call_outgoing"] = last["outgoing"] if last else None
+        f["call_count"] = call_counts.get(f["id"], 0)
+
+    return jsonify(friends)
+
+
+@app.route("/friends/<int:friend_id>/calls", methods=["GET"])
+@login_required
+def friend_call_history(friend_id):
+    """Full call log with one friend, newest first -- what the (i)/detail
+    view drills into from the summary shown in GET /friends."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "SELECT calls.id AS call_id, calls.created_at, calls.ended_at, calls.status, "
+        "(calls.initiator_user_id = %(me)s) AS outgoing "
+        "FROM calls "
+        "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
+        "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id = %(friend_id)s "
+        "ORDER BY calls.created_at DESC",
+        {"me": user_id, "friend_id": friend_id},
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
 
 
 @app.route("/friends/add", methods=["POST"])
@@ -2675,10 +2908,11 @@ def upload_call_recording(call_id):
     primary_conversation_id = conversation_ids[user_id]
     cur.execute("UPDATE calls SET conversation_id = %s WHERE id = %s", (primary_conversation_id, call_id))
     db.commit()
+    cache_delete(*(f"user:{pid}:conversations" for pid in conversation_ids))
 
     # raw_transcript is guaranteed non-empty here (checked above).
     for pid, conv_id in conversation_ids.items():
-        threading.Thread(target=run_conversation_titling, args=(conv_id, raw_transcript), daemon=True).start()
+        threading.Thread(target=run_conversation_titling, args=(pid, conv_id, raw_transcript), daemon=True).start()
         # No live websocket to push background_update to here (this is a
         # REST upload, not a /ws/listen session) -- a no-op push is a
         # valid, unmodified use of the existing function.
@@ -2767,8 +3001,9 @@ def _upload_own_call_recording(call_id):
         (conversation_id, call_id, user_id),
     )
     db.commit()
+    cache_delete(f"user:{user_id}:conversations")
 
-    threading.Thread(target=run_conversation_titling, args=(conversation_id, raw_transcript), daemon=True).start()
+    threading.Thread(target=run_conversation_titling, args=(user_id, conversation_id, raw_transcript), daemon=True).start()
     threading.Thread(
         target=run_background_analysis,
         args=(user_id, conversation_id, raw_transcript, lambda *a, **k: None),
@@ -2835,7 +3070,19 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
 CHAT_HISTORY_MAX_TURNS = int(os.getenv("CHAT_HISTORY_MAX_TURNS", "6"))
 
 
+def _messages_cache_key(user_id, conversation_id):
+    if conversation_id:
+        return f"user:{user_id}:conversation:{conversation_id}:messages"
+    return f"user:{user_id}:global_chat"
+
+
 def load_chat_context(cur, user_id, conversation_id):
+    # Same data GET /conversations/<id>/chat serves, just the tail of it --
+    # reuse that cache instead of re-querying Postgres on every /chat turn.
+    cached = cache_get_json(_messages_cache_key(user_id, conversation_id))
+    if cached is not None:
+        tail = cached[-(CHAT_HISTORY_MAX_TURNS * 2):]
+        return [{"role": m["role"], "content": m["content"]} for m in tail]
     cur.execute(
         "SELECT role, content FROM chat_messages "
         "WHERE user_id = %s AND conversation_id = %s "
@@ -2852,6 +3099,19 @@ def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
         "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
         (user_id, conversation_id, prompt, user_id, conversation_id, reply),
     )
+    # Keep the message-list cache (if any is warm) up to date in place rather
+    # than invalidating it -- this is the highest-frequency write path, and
+    # re-fetching the full history from Postgres on every single chat turn
+    # would defeat the point of caching it.
+    cache_key = _messages_cache_key(user_id, conversation_id)
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        ts = datetime.now(timezone.utc).isoformat()
+        cached = cached + [
+            {"role": "user", "content": prompt, "created_at": ts},
+            {"role": "assistant", "content": reply, "created_at": ts},
+        ]
+        cache_set_json(cache_key, cached, ttl=3600)
 
 
 def load_global_chat_context(cur, user_id):
@@ -2859,6 +3119,10 @@ def load_global_chat_context(cur, user_id):
     conversation_id IS NULL there, and plain `= NULL` never matches in SQL
     (three-valued logic), so this needs its own query rather than reusing
     load_chat_context with conversation_id=None."""
+    cached = cache_get_json(_messages_cache_key(user_id, None))
+    if cached is not None:
+        tail = cached[-(CHAT_HISTORY_MAX_TURNS * 2):]
+        return [{"role": m["role"], "content": m["content"]} for m in tail]
     cur.execute(
         "SELECT role, content FROM chat_messages "
         "WHERE user_id = %s AND conversation_id IS NULL "
@@ -2876,28 +3140,42 @@ def list_conversations():
     ChatGPT-style history list instead of losing access to a chat the moment
     a new live-listening session starts (each session is its own
     conversation row; none of them are ever deleted here)."""
+    user_id = current_user_id()
+    cache_key = f"user:{user_id}:conversations"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT id, created_at, title, category FROM conversations WHERE user_id = %s ORDER BY created_at DESC",
-        (current_user_id(),),
+        (user_id,),
     )
-    return jsonify([serialize_row(r) for r in cur.fetchall()])
+    result = [serialize_row(r) for r in cur.fetchall()]
+    cache_set_json(cache_key, result, ttl=600)
+    return jsonify(result)
 
 
 @app.route("/conversations/<int:conversation_id>", methods=["GET"])
 @login_required
 def get_conversation(conversation_id):
+    user_id = current_user_id()
+    cache_key = f"user:{user_id}:conversation:{conversation_id}"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT id, created_at, title, raw_transcript, category FROM conversations WHERE id = %s AND user_id = %s",
-        (conversation_id, current_user_id()),
+        (conversation_id, user_id),
     )
     row = cur.fetchone()
     if not row:
         return jsonify({"error": "Conversation not found"}), 404
-    return jsonify(serialize_row(row))
+    result = serialize_row(row)
+    cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
 
 
 @app.route("/conversations/<int:conversation_id>/chat", methods=["GET"])
@@ -2906,9 +3184,13 @@ def get_conversation_chat(conversation_id):
     """Full, untrimmed chat history for one conversation -- separate from
     the LLM-context slice /chat uses, so old messages remain readable here
     no matter how long the chat has run."""
+    user_id = current_user_id()
+    cache_key = _messages_cache_key(user_id, conversation_id)
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
-    user_id = current_user_id()
     cur.execute(
         "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
         (conversation_id, user_id),
@@ -2920,7 +3202,9 @@ def get_conversation_chat(conversation_id):
         "WHERE user_id = %s AND conversation_id = %s ORDER BY created_at ASC",
         (user_id, conversation_id),
     )
-    return jsonify([serialize_row(r) for r in cur.fetchall()])
+    result = [serialize_row(r) for r in cur.fetchall()]
+    cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
 
 
 @app.route("/conversations/<int:conversation_id>", methods=["DELETE"])
@@ -2934,14 +3218,20 @@ def delete_conversation(conversation_id):
     itself goes away."""
     db = get_db()
     cur = dict_cursor(db)
+    user_id = current_user_id()
     cur.execute(
         "DELETE FROM conversations WHERE id = %s AND user_id = %s RETURNING id",
-        (conversation_id, current_user_id()),
+        (conversation_id, user_id),
     )
     deleted = cur.fetchone()
     db.commit()
     if not deleted:
         return jsonify({"error": "Conversation not found"}), 404
+    cache_delete(
+        f"user:{user_id}:conversation:{conversation_id}",
+        f"user:{user_id}:conversation:{conversation_id}:messages",
+        f"user:{user_id}:conversations",
+    )
     return jsonify({"ok": True})
 
 
@@ -3036,14 +3326,21 @@ GLOBAL_CHAT_CHARS_PER_CONVERSATION = 1200
 @app.route("/chat/global", methods=["GET"])
 @login_required
 def get_global_chat_history():
+    user_id = current_user_id()
+    cache_key = _messages_cache_key(user_id, None)
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "SELECT role, content, created_at FROM chat_messages "
         "WHERE user_id = %s AND conversation_id IS NULL ORDER BY created_at ASC",
-        (current_user_id(),),
+        (user_id,),
     )
-    return jsonify([serialize_row(r) for r in cur.fetchall()])
+    result = [serialize_row(r) for r in cur.fetchall()]
+    cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
 
 
 @app.route("/chat/global", methods=["POST"])

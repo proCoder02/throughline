@@ -34,7 +34,37 @@
       "Bash(scp -i \"C:/Users/P3INW57/Downloads/second_pair.pem\" c:/Users/P3INW57/Desktop/speech2text/frontend/src/components/CallOverlay.jsx ec2-user@rapexapi.nodexdata.click:~/throughline/frontend/src/components/)",
       "Bash(grep -n \"raw_transcript = \\\\\"\\\\\\\\\\\\\\\\n\\\\\".join\\(lines\\)\" c:/Users/P3INW57/Desktop/speech2text/app.py)",
       "Bash(grep -n 'raw_transcript = \"\\\\\\\\\\\\\\\\n\".join\\(lines\\)\\\\|def upload_call_recording' c:/Users/P3INW57/Desktop/speech2text/app.py)",
-      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_no_transcript_skip.py\")"
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\P3INW57\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-P3INW57-Desktop-speech2text\\\\30352e48-9ff1-47c2-9aac-dfb439ef716b\\\\scratchpad\\\\verify_no_transcript_skip.py\")",
+      "Bash(ssh rapex-ec2 *)",
+      "Bash(.venv/Scripts/python.exe -m py_compile app.py)",
+      "Bash(export PGBIN=\"/c/Program Files/PostgreSQL/17/bin\")",
+      "Bash(export PGPASSWORD=\"0326\")",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -t -c 'SELECT username FROM users LIMIT 3;')",
+      "Bash(.venv/Scripts/python.exe C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/verify_redis_notify.py)",
+      "PowerShell(Get-NetTCPConnection -LocalPort 6379 -State Listen | ForEach-Object { Get-Process -Id $_.OwningProcess | Select-Object Id, ProcessName, Path })",
+      "Bash(export REDIS=\"/c/Program Files/Redis/redis-cli.exe\")",
+      "Bash('/c/Program Files/Redis/redis-cli.exe' --scan)",
+      "Bash('/c/Program Files/Redis/redis-cli.exe' -h 127.0.0.1 -p 6379 KEYS *)",
+      "Bash('/c/Program Files/Redis/redis-cli.exe' GET user:3:conversations)",
+      "Bash(find /c/Users/P3INW57/Desktop/throughline/android/app/src/main/res -iname \"*launch*\" -o -iname \"styles.xml\" | sort)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/android/app/src/main/res/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/android/app/src/main/res/values/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/android/app/src/main/res/drawable/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/android/app/src/main/res/values-night/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/lib/**)",
+      "Bash(/c/Users/P3INW57/AppData/Local/Android/Sdk/platform-tools/adb.exe devices *)",
+      "Bash(/c/Users/P3INW57/AppData/Local/Android/Sdk/platform-tools/adb.exe -s 192.168.0.100:37651 shell am force-stop com.nodexdata.speechtotext)",
+      "Bash(/c/Users/P3INW57/AppData/Local/Android/Sdk/platform-tools/adb.exe -s 192.168.0.100:37651 shell monkey -p com.nodexdata.speechtotext -c android.intent.category.LAUNCHER 1)",
+      "Bash(/c/Users/P3INW57/AppData/Local/Android/Sdk/platform-tools/adb.exe -s 192.168.0.100:37651 shell screencap -p /sdcard/frame_test.png)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(/c/Users/P3INW57/AppData/Local/Android/Sdk/platform-tools/adb.exe -s 192.168.0.100:37651 shell ls -la /sdcard/frame_test.png)",
+      "Bash(find /c/Users/P3INW57/Desktop/throughline -iname \"*.png\" -path \"*assets*\" -o -iname \"*.svg\" -path \"*assets*\" 2>/dev/null | grep -v node_modules *)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/android/app/src/main/res/mipmap-xxxhdpi/**)",
+      "Bash(tasklist //FI \"IMAGENAME eq adb.exe\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\P3INW57\\Desktop\\throughline"
     ]
   }
 }
