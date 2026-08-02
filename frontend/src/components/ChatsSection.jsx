@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
 import ChatThread from './ChatThread.jsx';
-import InfoDrawer from './InfoDrawer.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
@@ -14,7 +13,6 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   const [selectedId, setSelectedId] = useState(null);
   const [selectedTranscript, setSelectedTranscript] = useState('');
   const [messages, setMessages] = useState([]);
-  const [showInfo, setShowInfo] = useState(false);
   const [sending, setSending] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState('all');
   // Cross-session Q&A ("What did I discuss with Rahul last week?") -- not
@@ -46,7 +44,6 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     if (live.isListening) live.stop();
     setGlobalChatOpen(false);
     setSelectedId(id);
-    setShowInfo(false);
     notify?.clearChat(id);
     const { conv: c, chat } = await conv.openConversation(id);
     setSelectedTranscript(c.raw_transcript || '');
@@ -198,7 +195,6 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           messages={messages}
           onSend={sendMessage}
           sending={sending}
-          onToggleInfo={() => setShowInfo((v) => !v)}
           onDelete={() => deleteConversation(selectedId)}
           onListen={() => resumeListening(selectedId)}
           onStopListen={live.stop}
@@ -217,14 +213,6 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
         />
       ) : (
         <div className="chat-panel empty">Select a conversation, or click Listen to start one.</div>
-      )}
-
-      {showInfo && selectedId && (
-        <InfoDrawer
-          title="Transcript"
-          text={liveTranscript}
-          onClose={() => setShowInfo(false)}
-        />
       )}
     </>
   );

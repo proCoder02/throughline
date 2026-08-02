@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import MessageBubble from './MessageBubble.jsx';
 import Composer from './Composer.jsx';
-import { BackIcon, InfoIcon, TrashIcon, MicIcon, CloseIcon } from '../icons.jsx';
+import { BackIcon, TrashIcon, MicIcon, CloseIcon } from '../icons.jsx';
 
 export default function ChatThread({
   title, isLive, liveStatus, seenIndices = [], speakerNames,
   pendingSpeakerIndex = null, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
   tags, onTagClick, onDismissTag,
-  messages, onSend, sending, onToggleInfo, onDelete, onListen, onStopListen, onBack,
+  messages, onSend, sending, onDelete, onListen, onStopListen, onBack,
   subtitle, placeholder, emptyHint,
 }) {
   const scrollRef = useRef(null);
@@ -27,7 +27,6 @@ export default function ChatThread({
           </div>
         </div>
         <div className="chat-header-actions">
-          {onToggleInfo && <button title="Transcript" onClick={onToggleInfo}><InfoIcon /></button>}
           {onDelete && <button title="Delete conversation" onClick={onDelete}><TrashIcon /></button>}
         </div>
       </div>

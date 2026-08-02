@@ -53,6 +53,16 @@ export default function App() {
     return () => stopRingtone();
   }, [notify.incomingCall, call.activeCall]);
 
+  // The initiator's own room connects immediately on startCall (before
+  // anyone accepts), so if every invitee declines, LiveKit never fires a
+  // disconnect for them -- the server-pushed call_declined event is the
+  // only signal telling this side to hang up instead of lingering.
+  useEffect(() => {
+    if (!notify.declinedCallId) return;
+    notify.clearDeclinedCall();
+    if (call.activeCall?.callId === notify.declinedCallId) call.leaveCall();
+  }, [notify.declinedCallId]);
+
   // iOS only allows audio playback (the ringtone) if the AudioContext was
   // primed during a real tap -- an incoming call itself has no preceding
   // gesture to piggyback on, so this grabs the very first tap/click

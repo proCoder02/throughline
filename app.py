@@ -26,6 +26,8 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import livekit.api as livekit_api
+import firebase_admin
+from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
 
 load_dotenv()
 
@@ -272,6 +274,68 @@ def build_persona_context(persona):
 
 FRIEND_CODE_LENGTH = 6
 
+# A friend's mood is shown as a single compiled emoji, not a raw log list --
+# "compiled every 2 hours" means the displayed value is the dominant mood
+# across whichever 2-hour clock-aligned window (00-02, 02-04, ... 22-24) has
+# the most recent data, recomputed on read rather than via a scheduled job
+# (there's no cron/scheduler in this app, and a read-time aggregate over an
+# already-indexed range is cheap enough not to need one).
+MOOD_EMOJI = {
+    "happy": "😊", "stressed": "😰", "calm": "😌", "frustrated": "😤",
+    "excited": "🤩", "neutral": "😐", "sad": "😢", "anxious": "😟",
+}
+DEFAULT_MOOD_EMOJI = "🙂"
+MOOD_BUCKET_HOURS = 2
+
+
+def mood_bucket_bounds(at=None):
+    now_local = (at or datetime.now()).astimezone()
+    start = now_local.replace(minute=0, second=0, microsecond=0)
+    start = start.replace(hour=(start.hour // MOOD_BUCKET_HOURS) * MOOD_BUCKET_HOURS)
+    return start, start + timedelta(hours=MOOD_BUCKET_HOURS)
+
+
+def compute_compiled_mood(cur, user_id, bucket_start, bucket_end):
+    """Dominant mood_label in [bucket_start, bucket_end) for user_id, by
+    total confidence-weighted score (falls back to count on a tie/NULL
+    scores). None if nothing was logged in that window."""
+    cur.execute(
+        "SELECT mood_label, COALESCE(SUM(mood_score), 0) AS weight, COUNT(*) AS n FROM mood_logs "
+        "WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "GROUP BY mood_label ORDER BY weight DESC, n DESC LIMIT 1",
+        (user_id, bucket_start, bucket_end),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    label = row["mood_label"]
+    return {"mood_label": label, "emoji": MOOD_EMOJI.get((label or "").lower(), DEFAULT_MOOD_EMOJI)}
+
+
+def notify_friends_of_mood_update(user_id, mood_label, friend_ids):
+    """Pushed once per 2-hour compiled window per friend (see the
+    is-first-in-bucket check at each call site), not on every single
+    conversation, so friends get one check-in ping per window instead of
+    being spammed as someone's mood log fills up."""
+    if not friend_ids or not mood_label:
+        return
+    emoji = MOOD_EMOJI.get(mood_label.lower(), DEFAULT_MOOD_EMOJI)
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        name = row[0] if row else "A friend"
+    finally:
+        release_raw_connection(conn)
+    event = {
+        "type": "friend_mood_update", "friend_id": user_id, "friend_name": name,
+        "mood_label": mood_label, "emoji": emoji,
+    }
+    for fid in friend_ids:
+        push_notification(fid, event)
+        send_fcm_to_user(fid, title=f"{name} seems {mood_label} {emoji}", body="Tap to check in", data=event)
+
 
 def generate_unique_friend_code(cur):
     for _ in range(20):
@@ -512,7 +576,7 @@ def email_reminder_worker():
             cur = dict_cursor(conn)
             now = datetime.now(timezone.utc)
             cur.execute(
-                "SELECT tasks.id, tasks.description, tasks.owner, tasks.due_date, "
+                "SELECT tasks.id, tasks.user_id, tasks.description, tasks.owner, tasks.due_date, "
                 "tasks.reminder_at, users.email FROM tasks "
                 "JOIN users ON tasks.user_id = users.id "
                 "WHERE tasks.reminder_at IS NOT NULL AND tasks.email_sent = FALSE "
@@ -527,6 +591,13 @@ def email_reminder_worker():
                 if sent:
                     cur.execute("UPDATE tasks SET email_sent = TRUE WHERE id = %s", (row["id"],))
                     conn.commit()
+                    push_notification(row["user_id"], {
+                        "type": "reminder_email_sent", "task_id": row["id"], "description": row["description"],
+                    })
+                    send_fcm_to_user(
+                        row["user_id"], title="Reminder sent", body=row["description"],
+                        data={"type": "reminder_email_sent", "task_id": row["id"]},
+                    )
             cur.close()
         except Exception as e:
             print(f"[email_reminder_worker] error: {e!r}")
@@ -1044,8 +1115,10 @@ clinical/mental-health terms, no motive speculation.
 recording it -- "label" (a single plain word, e.g. "happy", "stressed", "calm", "frustrated", \
 "excited", "neutral", "sad", "anxious") and "score" (0.0-1.0 intensity/confidence). Base this \
 only on tone and word choice actually present, no diagnoses.
-4. "tags": 2-5 short (1-4 word) topics from THIS transcript worth asking the assistant more \
-about, matching the mode above (e.g. office: "budget approval"; study: "midterm scope"). Empty \
+4. "tags": at most 5 short, tappable suggestions worth asking the assistant next, matching the \
+mode above. Prefer a clear, directly-answerable question actually raised or clearly implied in \
+THIS transcript, phrased as that question (e.g. "What's the budget cap?"); fall back to a short \
+(1-4 word) topic (e.g. office: "budget approval") only when no such question is present. Empty \
 list if nothing distinct came up.
 
 Reply with ONLY this JSON, no preamble/fences:
@@ -1254,8 +1327,11 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     mood = parsed.get("mood") or {}
     tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
+    mood_label = (mood.get("label") or "").strip()
+
     conn = get_raw_connection()
     created_tasks = []
+    notify_mood_friend_ids = []
     try:
         cur = conn.cursor()
         cur.execute("SELECT category FROM conversations WHERE id = %s", (conversation_id,))
@@ -1288,24 +1364,37 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
                     "VALUES (%s, %s, %s, %s, %s)",
                     (user_id, conversation_id, label, profile_id, obs),
                 )
-        mood_label = (mood.get("label") or "").strip()
         if mood_label:
+            bucket_start, bucket_end = mood_bucket_bounds()
+            cur.execute(
+                "SELECT 1 FROM mood_logs WHERE user_id = %s AND created_at >= %s AND created_at < %s LIMIT 1",
+                (user_id, bucket_start, bucket_end),
+            )
+            is_first_in_bucket = cur.fetchone() is None
             cur.execute(
                 "INSERT INTO mood_logs (user_id, conversation_id, mood_label, mood_score) "
                 "VALUES (%s, %s, %s, %s)",
                 (user_id, conversation_id, mood_label, mood.get("score")),
             )
+            if is_first_in_bucket:
+                cur.execute("SELECT friend_id FROM friendships WHERE user_id = %s", (user_id,))
+                notify_mood_friend_ids = [r[0] for r in cur.fetchall()]
         conn.commit()
         cur.close()
     except Exception as e:
         print(f"[run_background_analysis] DB error: {e!r}")
         conn.rollback()
         created_tasks = []
+        notify_mood_friend_ids = []
     finally:
         release_raw_connection(conn)
 
     for task_id, description in created_tasks:
         push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
+        send_fcm_to_user(user_id, title="New task", body=description, data={"type": "task_created", "task_id": task_id})
+
+    if notify_mood_friend_ids:
+        notify_friends_of_mood_update(user_id, mood_label, notify_mood_friend_ids)
 
     push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers), "tags": tags})
 
@@ -1339,6 +1428,137 @@ def push_notification(user_id, event):
             ws.send(json.dumps(event))
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Mobile push (Firebase Cloud Messaging)
+#
+# push_notification() above only reaches a client with an open /ws/notify
+# socket -- fine for a browser tab, useless for a native app that's
+# backgrounded or killed. send_fcm_to_user() is the mobile equivalent: it
+# reaches every device the user has registered via POST /devices/register,
+# regardless of whether the app is open. Both are called side by side at
+# each notification site rather than one replacing the other.
+#
+# Silently no-ops (never raises) if FIREBASE_CREDENTIALS_PATH isn't
+# configured -- same "not set up yet" pattern as SMTP_HOST for email, so the
+# app works before/without a Firebase project existing.
+# ---------------------------------------------------------------------------
+
+_firebase_app = None
+_firebase_init_attempted = False
+
+
+def get_firebase_app():
+    global _firebase_app, _firebase_init_attempted
+    if _firebase_app is not None:
+        return _firebase_app
+    if _firebase_init_attempted:
+        return None
+    _firebase_init_attempted = True
+    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
+    if not cred_path or not os.path.exists(cred_path):
+        print("[fcm] FIREBASE_CREDENTIALS_PATH not set/found -- push notifications disabled")
+        return None
+    try:
+        _firebase_app = firebase_admin.initialize_app(firebase_credentials.Certificate(cred_path))
+    except ValueError:
+        # Already initialized in this process (e.g. a second gunicorn worker
+        # re-imported this module) -- reuse the existing default app.
+        _firebase_app = firebase_admin.get_app()
+    return _firebase_app
+
+
+def send_fcm_to_user(user_id, title, body, data=None, include_notification=True):
+    """Best-effort push to every device this user has registered. Never
+    raises -- called from background threads (mood/task extraction) and
+    after the DB work it's reporting on is already committed, so a
+    delivery failure here must never affect anything else.
+
+    include_notification=False sends a data-only message (no `notification`
+    block, so the OS/Firebase SDK doesn't auto-post anything) -- used for
+    incoming_call, where the Flutter client shows its own full-screen-intent
+    notification instead. Every other caller keeps the default (unchanged)
+    behavior."""
+    app_ = get_firebase_app()
+    if not app_:
+        return
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT token FROM push_tokens WHERE user_id = %s", (user_id,))
+        tokens = [r[0] for r in cur.fetchall()]
+    finally:
+        release_raw_connection(conn)
+    if not tokens:
+        return
+
+    data_str = {k: str(v) for k, v in (data or {}).items()}
+    stale_tokens = []
+    for token in tokens:
+        message = firebase_messaging.Message(
+            token=token,
+            notification=firebase_messaging.Notification(title=title, body=body) if include_notification else None,
+            data=data_str,
+            android=firebase_messaging.AndroidConfig(priority="high"),
+            apns=firebase_messaging.APNSConfig(headers={"apns-priority": "10"}),
+        )
+        try:
+            firebase_messaging.send(message, app=app_)
+        except firebase_messaging.UnregisteredError:
+            stale_tokens.append(token)
+        except Exception as e:
+            print(f"[fcm] send failed for user {user_id}: {e!r}")
+
+    if stale_tokens:
+        conn = get_raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM push_tokens WHERE token = ANY(%s)", (stale_tokens,))
+            conn.commit()
+        finally:
+            release_raw_connection(conn)
+
+
+@app.route("/devices/register", methods=["POST"])
+@login_required
+def register_device():
+    """Flutter calls this once it has an FCM token (on launch, and again
+    whenever the token refreshes -- the ON CONFLICT keeps this idempotent
+    either way, and reassigns a token to a new user if the same device logs
+    into a different account)."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "").strip().lower()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    if platform not in ("android", "ios"):
+        return jsonify({"error": "platform must be 'android' or 'ios'"}), 400
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "INSERT INTO push_tokens (user_id, token, platform) VALUES (%s, %s, %s) "
+        "ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, platform = EXCLUDED.platform, updated_at = now()",
+        (current_user_id(), token, platform),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/devices/unregister", methods=["POST"])
+@login_required
+def unregister_device():
+    """Called on logout so a signed-out device stops receiving pushes for
+    the account it just left."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("DELETE FROM push_tokens WHERE token = %s AND user_id = %s", (token, current_user_id()))
+    db.commit()
+    return jsonify({"ok": True})
 
 
 @sock.route("/ws/notify")
@@ -1439,6 +1659,17 @@ def ws_listen(ws):
         "wss://api.deepgram.com/v1/listen"
         "?diarize=true&punctuate=true&interim_results=false&model=nova-2"
     )
+    # Optional, mobile-client-only: the browser always sends WebM/Opus
+    # (Deepgram auto-detects that container), but a native recorder is
+    # simplest streaming raw linear16 PCM, which Deepgram can't
+    # auto-detect -- it must be told explicitly via these params. Absent
+    # (the web client never sends them) -> identical to previous behavior.
+    encoding = request.args.get("encoding")
+    if encoding:
+        dg_url += f"&encoding={encoding}"
+        sample_rate = request.args.get("sample_rate", type=int)
+        if sample_rate:
+            dg_url += f"&sample_rate={sample_rate}"
     try:
         dg_ws = ws_client.create_connection(dg_url, header=[f"Authorization: Token {api_key}"])
     except Exception as e:
@@ -1688,16 +1919,18 @@ def analyze_conversation():
     mood = parsed.get("mood") or {}
     tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
 
+    created_tasks = []
     for task in tasks:
         description = (task.get("description") or "").strip()
         if not description:
             continue
         cur.execute(
             "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, 'open')",
+            "VALUES (%s, %s, %s, %s, %s, %s, 'open') RETURNING id",
             (user_id, conversation_id, description, task.get("owner"), task.get("due_date"),
              normalize_reminder_at(task.get("reminder_at"))),
         )
+        created_tasks.append((cur.fetchone()["id"], description))
 
     cur.execute("SELECT category FROM conversations WHERE id = %s", (conversation_id,))
     category_row = cur.fetchone()
@@ -1721,14 +1954,30 @@ def analyze_conversation():
             )
 
     mood_label = (mood.get("label") or "").strip()
+    notify_mood_friend_ids = []
     if mood_label:
+        bucket_start, bucket_end = mood_bucket_bounds()
+        cur.execute(
+            "SELECT 1 FROM mood_logs WHERE user_id = %s AND created_at >= %s AND created_at < %s LIMIT 1",
+            (user_id, bucket_start, bucket_end),
+        )
+        is_first_in_bucket = cur.fetchone() is None
         cur.execute(
             "INSERT INTO mood_logs (user_id, conversation_id, mood_label, mood_score) "
             "VALUES (%s, %s, %s, %s)",
             (user_id, conversation_id, mood_label, mood.get("score")),
         )
+        if is_first_in_bucket:
+            cur.execute("SELECT friend_id FROM friendships WHERE user_id = %s", (user_id,))
+            notify_mood_friend_ids = [r["friend_id"] for r in cur.fetchall()]
 
     db.commit()
+
+    for task_id, description in created_tasks:
+        push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
+        send_fcm_to_user(user_id, title="New task", body=description, data={"type": "task_created", "task_id": task_id})
+
+    notify_friends_of_mood_update(user_id, mood_label, notify_mood_friend_ids)
 
     return jsonify(
         {
@@ -2098,19 +2347,34 @@ def friend_mood(friend_id):
     if not cur.fetchone():
         return jsonify({"error": "Not friends with that user"}), 403
 
-    # "Through the day" -- everything logged since local midnight, oldest
-    # first, so the frontend can render it as a timeline rather than just
-    # the latest snapshot.
-    since_local_midnight = datetime.now().astimezone().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    cur.execute(
-        "SELECT mood_label, mood_score, created_at FROM mood_logs "
-        "WHERE user_id = %s AND created_at >= %s ORDER BY created_at ASC",
-        (friend_id, since_local_midnight),
-    )
-    entries = [serialize_row(r) for r in cur.fetchall()]
-    return jsonify({"friend_id": friend_id, "entries": entries})
+    # A single compiled emoji for the current 2-hour window, not a raw
+    # timeline -- see compute_compiled_mood/mood_bucket_bounds. Falls back
+    # to the most recent earlier window today if nothing's logged yet in
+    # the current one.
+    bucket_start, bucket_end = mood_bucket_bounds()
+    compiled = compute_compiled_mood(cur, friend_id, bucket_start, bucket_end)
+
+    if not compiled:
+        since_local_midnight = datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        cur.execute(
+            "SELECT created_at FROM mood_logs WHERE user_id = %s AND created_at >= %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (friend_id, since_local_midnight),
+        )
+        last = cur.fetchone()
+        if last:
+            bucket_start, bucket_end = mood_bucket_bounds(last["created_at"])
+            compiled = compute_compiled_mood(cur, friend_id, bucket_start, bucket_end)
+
+    return jsonify({
+        "friend_id": friend_id,
+        "window_start": bucket_start.isoformat(),
+        "window_end": bucket_end.isoformat(),
+        "mood_label": compiled["mood_label"] if compiled else None,
+        "emoji": compiled["emoji"] if compiled else None,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2200,10 +2464,15 @@ def create_call():
 
     token = generate_livekit_token(user_id, username, room_name)
     for fid in friend_ids:
-        push_notification(fid, {
+        call_event = {
             "type": "incoming_call", "call_id": call_id, "room_name": room_name,
             "caller_id": user_id, "caller_name": username,
-        })
+        }
+        push_notification(fid, call_event)
+        send_fcm_to_user(
+            fid, title="Incoming call", body=f"{username} is calling...",
+            data=call_event, include_notification=False,
+        )
 
     return jsonify({
         "call_id": call_id, "room_name": room_name, "token": token,
@@ -2220,6 +2489,12 @@ def join_call(call_id):
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
+    cur.execute("SELECT status FROM calls WHERE id = %s", (call_id,))
+    call = cur.fetchone()
+    if not call:
+        return jsonify({"error": "Call not found"}), 404
+    if call["status"] == "ended":
+        return jsonify({"error": "This call has already ended"}), 400
     cur.execute(
         "UPDATE call_participants SET status = 'joined', joined_at = now() "
         "WHERE call_id = %s AND user_id = %s RETURNING id",
@@ -2251,9 +2526,26 @@ def decline_call(call_id):
         (call_id, current_user_id()),
     )
     updated = cur.fetchone()
-    db.commit()
     if not updated:
+        db.commit()
         return jsonify({"error": "Call not found"}), 404
+
+    # If every other invitee has now declined/left and nobody has joined
+    # yet, the call can never proceed -- tell the initiator so their client
+    # can hang up instead of sitting in "Call in progress" forever (LiveKit
+    # never fires a disconnect event for someone who never connected).
+    cur.execute("SELECT initiator_user_id, status FROM calls WHERE id = %s", (call_id,))
+    call = cur.fetchone()
+    if call["status"] == "ringing":
+        cur.execute(
+            "SELECT count(*) AS n FROM call_participants "
+            "WHERE call_id = %s AND user_id != %s AND status IN ('invited', 'joined')",
+            (call_id, call["initiator_user_id"]),
+        )
+        if cur.fetchone()["n"] == 0:
+            cur.execute("UPDATE calls SET status = 'ended', ended_at = now() WHERE id = %s", (call_id,))
+            push_notification(call["initiator_user_id"], {"type": "call_declined", "call_id": call_id})
+    db.commit()
     return jsonify({"ok": True})
 
 
@@ -2489,6 +2781,16 @@ def _upload_own_call_recording(call_id):
     return jsonify({"conversation_id": conversation_id})
 
 
+CHAT_FORMATTING_GUIDANCE = (
+    "If a specific line in the transcript directly answers or is clearly relevant to the "
+    "question, quote it verbatim in your reply, attributed to who said it, like: "
+    'Rahul said: "the exact line". Only quote when it genuinely supports the answer -- never '
+    "invent or paraphrase a quote. Format the reply in markdown: **bold** key terms, names, or "
+    "numbers, and use \"- \" bullet points when listing more than one item; keep a short direct "
+    "answer as plain prose instead of forcing it into a list."
+)
+
+
 def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
     base = (
         "You are a concise assistant answering questions about a live or saved "
@@ -2500,6 +2802,7 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_co
         "references ('he', 'that', 'earlier') instead of asking for "
         "clarification when it's inferable from context. "
         + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
+        + " " + CHAT_FORMATTING_GUIDANCE
     )
     return base + (f" {persona_context}" if persona_context else "")
 
@@ -2516,7 +2819,8 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         "its own date/title/category. Use those dates to resolve relative time references "
         "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
         "continuous conversation. Ground your answer only in what's in these excerpts; if the "
-        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble."
+        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble. "
+        + CHAT_FORMATTING_GUIDANCE
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."

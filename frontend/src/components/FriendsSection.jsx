@@ -40,8 +40,8 @@ export default function FriendsSection({ onStartCall }) {
 
   const openFriend = async (f) => {
     setSelected(f);
-    const data = await apiJson(`/friends/${f.id}/mood`).catch(() => ({ entries: [] }));
-    setMood(data.entries || []);
+    const data = await apiJson(`/friends/${f.id}/mood`).catch(() => null);
+    setMood(data);
   };
 
   const removeFriend = async (f) => {
@@ -146,7 +146,7 @@ export default function FriendsSection({ onStartCall }) {
                     onKeyDown={(e) => e.key === 'Enter' && saveNickname()}
                   />
                 ) : (
-                  <div className="detail-title">{(selected.nickname || selected.username)}'s mood today</div>
+                  <div className="detail-title">{(selected.nickname || selected.username)}'s mood</div>
                 )}
               </div>
               {renaming ? (
@@ -165,11 +165,16 @@ export default function FriendsSection({ onStartCall }) {
                 </div>
               )}
             </div>
-            {mood && mood.length ? mood.map((m, i) => (
-              <div key={i} className="detail-meta">
-                {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — {m.mood_label}
+            {mood?.emoji ? (
+              <div className="mood-compiled">
+                <div className="mood-compiled-emoji">{mood.emoji}</div>
+                <div className="detail-meta" style={{ textTransform: 'capitalize' }}>{mood.mood_label}</div>
+                <div className="hint">
+                  As of {new Date(mood.window_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  {'–'}{new Date(mood.window_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </div>
               </div>
-            )) : <div className="hint">No mood data logged yet today.</div>}
+            ) : <div className="hint">No mood data logged yet today.</div>}
           </div>
         ) : (
           <div className="hint">Select a friend to see their mood through the day.</div>

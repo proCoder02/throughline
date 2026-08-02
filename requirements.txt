@@ -10,7 +10,6 @@ cryptography
 requests
 python-dotenv
 livekit-api
+firebase-admin
 av
 numpy
-tensorflow
-tensorflow-hub
