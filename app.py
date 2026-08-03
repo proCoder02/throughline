@@ -4,6 +4,7 @@ import re
 import json
 import hashlib
 import secrets
+import tempfile
 import threading
 import jwt as pyjwt
 import time
@@ -27,11 +28,20 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import redis
+from rq import Queue
 import livekit.api as livekit_api
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
 
 load_dotenv()
+
+# Set by worker.py (before importing this module) so the RQ worker process
+# doesn't also start the email-reminder thread or the notify pub/sub
+# listener -- both are meant to run exactly once per deployment, in the
+# actual web process, not duplicated in every process that happens to
+# import app.py. Defaults to "web" so the existing Flask-serving paths
+# (gunicorn import, or `python app.py` directly) are unaffected.
+IS_WEB_ROLE = os.getenv("SPEECH2TEXT_ROLE", "web") == "web"
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -124,6 +134,24 @@ redis_client = redis.from_url(
 redis_pubsub_client = redis.from_url(
     REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=1, socket_timeout=None
 )
+# Separate client for RQ (queue + worker) -- RQ makes many more round-trips
+# per operation than a single cache GET/SET (worker registration, job
+# bookkeeping, heartbeats), and redis_client's 1s timeout -- tuned for
+# "fail fast and fall back to Postgres" cache reads -- was too tight for
+# that over a slightly-higher-latency connection (e.g. Redis running under
+# WSL rather than natively on the same host), causing spurious
+# TimeoutErrors. RQ has no equivalent graceful-degradation path, so this
+# client gets a more forgiving timeout instead.
+rq_redis_client = redis.from_url(
+    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=5, socket_timeout=10
+)
+
+# Call-recording processing queue (Deepgram transcription + conversation
+# creation + titling/analysis) -- see process_own_call_recording_job below.
+# A separate `python worker.py` process (SimpleWorker, no fork -- Windows
+# doesn't have os.fork) consumes this; if Redis is unreachable, callers fall
+# back to running the job function inline instead of failing outright.
+call_queue = Queue("calls", connection=rq_redis_client)
 
 
 def cache_get_json(key):
@@ -669,6 +697,87 @@ def email_reminder_worker():
             if conn:
                 release_raw_connection(conn)
         time.sleep(60)
+
+
+CALL_RING_TIMEOUT_SECONDS = 45
+
+
+def call_ring_timeout_worker():
+    """Runs continuously in a background thread, same pattern as
+    email_reminder_worker -- WhatsApp-style: a call nobody answers doesn't
+    ring forever. Without this, a call whose invitee never taps
+    decline/accept (and whose caller never hangs up either) would stay
+    'ringing' in the DB permanently, its incoming-call notification would
+    never be told to dismiss, and it would never show up as a clean
+    "missed call" in history. After CALL_RING_TIMEOUT_SECONDS: ends the
+    call, tells the caller (their "Calling..." screen closes via the same
+    call_ended signal leave_call sends), and tells whoever never answered
+    both to dismiss their ringing notification (call_ended) and, separately,
+    that they missed a call (a visible push, unlike call_ended's silent
+    data-only one)."""
+    while True:
+        conn = None
+        to_notify = []  # (call_id, initiator_id, caller_name, missed_user_ids)
+        try:
+            conn = get_raw_connection()
+            cur = dict_cursor(conn)
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=CALL_RING_TIMEOUT_SECONDS)
+            cur.execute(
+                "SELECT id, initiator_user_id FROM calls WHERE status = 'ringing' AND created_at < %s",
+                (cutoff,),
+            )
+            timed_out = cur.fetchall()
+            for call in timed_out:
+                call_id = call["id"]
+                cur.execute(
+                    "UPDATE calls SET status = 'ended', ended_at = now() WHERE id = %s AND status = 'ringing'",
+                    (call_id,),
+                )
+                if cur.rowcount == 0:
+                    continue  # raced with a decline/join/leave that already ended it -- nothing to do
+                cur.execute(
+                    "SELECT user_id FROM call_participants WHERE call_id = %s AND status = 'invited'",
+                    (call_id,),
+                )
+                missed_user_ids = [r["user_id"] for r in cur.fetchall()]
+                cur.execute("SELECT username FROM users WHERE id = %s", (call["initiator_user_id"],))
+                caller_row = cur.fetchone()
+                caller_name = caller_row["username"] if caller_row else "Someone"
+                to_notify.append((call_id, call["initiator_user_id"], caller_name, missed_user_ids))
+            conn.commit()
+            cur.close()
+        except Exception as e:
+            print(f"[call_ring_timeout_worker] error: {e!r}")
+            if conn:
+                conn.rollback()
+            to_notify = []
+        finally:
+            if conn:
+                release_raw_connection(conn)
+
+        for call_id, initiator_id, caller_name, missed_user_ids in to_notify:
+            push_notification(initiator_id, {"type": "call_ended", "call_id": call_id})
+            send_fcm_to_user(
+                initiator_id, title="Call ended", body="",
+                data={"type": "call_ended", "call_id": call_id},
+                include_notification=False,
+            )
+            for uid in missed_user_ids:
+                push_notification(uid, {"type": "call_ended", "call_id": call_id})
+                send_fcm_to_user(
+                    uid, title="Call ended", body="",
+                    data={"type": "call_ended", "call_id": call_id},
+                    include_notification=False,
+                )
+                send_fcm_to_user(
+                    uid, title="Missed call", body=f"{caller_name} called you",
+                    data={
+                        "type": "missed_call", "call_id": call_id,
+                        "caller_id": initiator_id, "caller_name": caller_name,
+                    },
+                    include_notification=True,
+                )
+        time.sleep(10)
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +1357,51 @@ def run_conversation_titling(user_id, conversation_id, raw_transcript):
         release_raw_connection(conn)
 
 
+def assign_shared_call_title(call_id, user_id, conversation_id, raw_transcript):
+    """Call-flow equivalent of run_conversation_titling, but every
+    participant in a call shares one title instead of each independently
+    asking the LLM (and getting different wording for what's the same
+    conversation). Whichever participant's own scope=own recording finishes
+    processing first generates the title and claims it on calls.shared_title
+    (the `WHERE shared_title IS NULL` guard means only one caller's UPDATE
+    can ever actually claim it, even if two arrive at nearly the same time);
+    everyone after just reuses whatever's already claimed there."""
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT shared_title FROM calls WHERE id = %s", (call_id,))
+        row = cur.fetchone()
+        title = row[0] if row else None
+
+        if not title:
+            title = generate_conversation_title(raw_transcript)
+            if not title:
+                return
+            cur.execute(
+                "UPDATE calls SET shared_title = %s WHERE id = %s AND shared_title IS NULL RETURNING id",
+                (title, call_id),
+            )
+            if cur.fetchone() is None:
+                # Someone else claimed it between our SELECT and UPDATE --
+                # use theirs instead of forking into two different titles.
+                cur.execute("SELECT shared_title FROM calls WHERE id = %s", (call_id,))
+                title = cur.fetchone()[0]
+
+        cur.execute(
+            "UPDATE conversations SET title = %s WHERE id = %s AND title IS NULL",
+            (title, conversation_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        if updated:
+            cache_delete(f"user:{user_id}:conversation:{conversation_id}", f"user:{user_id}:conversations")
+    except Exception as e:
+        print(f"[assign_shared_call_title] DB error: {e!r}")
+        conn.rollback()
+    finally:
+        release_raw_connection(conn)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -1573,7 +1727,35 @@ def _notify_pubsub_listener():
             time.sleep(5)
 
 
-threading.Thread(target=_notify_pubsub_listener, daemon=True).start()
+if IS_WEB_ROLE:
+    threading.Thread(target=_notify_pubsub_listener, daemon=True).start()
+
+
+def _filter_stale_call_events(events):
+    """A queued incoming_call event replayed after a gap (client reconnects,
+    or opens the app much later) is actively misleading if that call isn't
+    actually ringing anymore -- it could have since been answered elsewhere,
+    declined, cancelled, or timed out. Without this, a phone that was
+    offline while a call came and went would show a phantom "incoming call"
+    for something that's long over the moment it reconnects. Drop any
+    incoming_call whose call has already moved past 'ringing'; every other
+    event type is left alone (a stale chat_message/task_created is still
+    valid to review, just late)."""
+    call_ids = [e["call_id"] for e in events if e.get("type") == "incoming_call" and e.get("call_id")]
+    if not call_ids:
+        return events
+    still_ringing = set()
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM calls WHERE id = ANY(%s) AND status = 'ringing'", (call_ids,))
+        still_ringing = {r[0] for r in cur.fetchall()}
+    except Exception as e:
+        print(f"[_filter_stale_call_events] DB error: {e!r}")
+        return events  # fail open -- a rare stale replay beats losing a legit queued event to a bug here
+    finally:
+        release_raw_connection(conn)
+    return [e for e in events if e.get("type") != "incoming_call" or e.get("call_id") in still_ringing]
 
 
 def _drain_pending_events(user_id):
@@ -1593,7 +1775,7 @@ def _drain_pending_events(user_id):
         print(f"[redis] drain pending_events failed for user {user_id}: {e!r}")
     with _notify_lock:
         events.extend(_pending_events.pop(user_id, []))
-    return events
+    return _filter_stale_call_events(events)
 
 
 # ---------------------------------------------------------------------------
@@ -1628,10 +1810,16 @@ def get_firebase_app():
         return None
     try:
         _firebase_app = firebase_admin.initialize_app(firebase_credentials.Certificate(cred_path))
+        print(f"[fcm] Firebase Admin initialized (project: {_firebase_app.project_id})")
     except ValueError:
         # Already initialized in this process (e.g. a second gunicorn worker
         # re-imported this module) -- reuse the existing default app.
         _firebase_app = firebase_admin.get_app()
+    except Exception as e:
+        # A bad/misconfigured credential must disable push, not take down
+        # every endpoint that happens to call send_fcm_to_user with it.
+        print(f"[fcm] Firebase Admin init failed, push notifications disabled: {e!r}")
+        _firebase_app = None
     return _firebase_app
 
 
@@ -1657,6 +1845,7 @@ def send_fcm_to_user(user_id, title, body, data=None, include_notification=True)
     finally:
         release_raw_connection(conn)
     if not tokens:
+        print(f"[fcm] user {user_id} has no registered device tokens -- skipping push")
         return
 
     data_str = {k: str(v) for k, v in (data or {}).items()}
@@ -1671,8 +1860,10 @@ def send_fcm_to_user(user_id, title, body, data=None, include_notification=True)
         )
         try:
             firebase_messaging.send(message, app=app_)
+            print(f"[fcm] sent '{data_str.get('type')}' to user {user_id} ({token[:12]}...)")
         except firebase_messaging.UnregisteredError:
             stale_tokens.append(token)
+            print(f"[fcm] token for user {user_id} is stale/unregistered, removing ({token[:12]}...)")
         except Exception as e:
             print(f"[fcm] send failed for user {user_id}: {e!r}")
 
@@ -2482,7 +2673,8 @@ def friend_call_history(friend_id):
 
     cur.execute(
         "SELECT calls.id AS call_id, calls.created_at, calls.ended_at, calls.status, "
-        "(calls.initiator_user_id = %(me)s) AS outgoing "
+        "(calls.initiator_user_id = %(me)s) AS outgoing, "
+        "cp_me.status AS my_status "
         "FROM calls "
         "JOIN call_participants cp_me ON cp_me.call_id = calls.id AND cp_me.user_id = %(me)s "
         "JOIN call_participants cp_friend ON cp_friend.call_id = calls.id AND cp_friend.user_id = %(friend_id)s "
@@ -2786,12 +2978,13 @@ def decline_call(call_id):
 @app.route("/calls/<int:call_id>/leave", methods=["POST"])
 @login_required
 def leave_call(call_id):
+    user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
         "UPDATE call_participants SET status = 'left', left_at = now() "
         "WHERE call_id = %s AND user_id = %s RETURNING id",
-        (call_id, current_user_id()),
+        (call_id, user_id),
     )
     if not cur.fetchone():
         return jsonify({"error": "Call not found"}), 404
@@ -2801,12 +2994,36 @@ def leave_call(call_id):
         (call_id,),
     )
     call_ended = cur.fetchone()["n"] == 0
+    other_ids = []
     if call_ended:
         cur.execute(
             "UPDATE calls SET status = 'ended', ended_at = now() WHERE id = %s AND status != 'ended'",
             (call_id,),
         )
+        # Anyone else still 'invited' (never joined -- i.e. still ringing)
+        # needs to hear this explicitly: their incoming-call notification is
+        # an `ongoing: true` Android notification that never auto-expires,
+        # and they have no live LiveKit connection of their own to notice
+        # the call ended any other way. (Nobody can still be 'joined' here --
+        # call_ended already means the joined count just hit zero -- so an
+        # already-connected other party always learns of this via LiveKit's
+        # own real-time disconnect event instead, same as WhatsApp/Telegram
+        # ending the call screen on both sides the instant either hangs up.)
+        cur.execute(
+            "SELECT user_id FROM call_participants WHERE call_id = %s AND user_id != %s AND status = 'invited'",
+            (call_id, user_id),
+        )
+        other_ids = [r["user_id"] for r in cur.fetchall()]
     db.commit()
+
+    for pid in other_ids:
+        push_notification(pid, {"type": "call_ended", "call_id": call_id})
+        send_fcm_to_user(
+            pid, title="Call ended", body="",
+            data={"type": "call_ended", "call_id": call_id},
+            include_notification=False,
+        )
+
     return jsonify({"ok": True, "call_ended": call_ended})
 
 
@@ -2911,9 +3128,13 @@ def upload_call_recording(call_id):
     db.commit()
     cache_delete(*(f"user:{pid}:conversations" for pid in conversation_ids))
 
-    # raw_transcript is guaranteed non-empty here (checked above).
+    # raw_transcript is guaranteed non-empty here (checked above), and
+    # identical for every participant (one mixed-stream upload) -- so unlike
+    # the per-participant scope=own path, one shared LLM call for the title
+    # is enough; no claim/race handling needed since this all happens
+    # synchronously in one request rather than N independent uploads.
+    threading.Thread(target=_title_all_call_conversations, args=(dict(conversation_ids), raw_transcript), daemon=True).start()
     for pid, conv_id in conversation_ids.items():
-        threading.Thread(target=run_conversation_titling, args=(pid, conv_id, raw_transcript), daemon=True).start()
         # No live websocket to push background_update to here (this is a
         # REST upload, not a /ws/listen session) -- a no-op push is a
         # valid, unmodified use of the existing function.
@@ -2927,17 +3148,131 @@ def upload_call_recording(call_id):
         push_notification(pid, {
             "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conv_id,
         })
+        send_fcm_to_user(
+            pid, title="Conversation ready",
+            body="Your call has been transcribed into a new conversation.",
+            data={"type": "call_conversation_ready", "call_id": call_id, "conversation_id": conv_id},
+        )
 
     return jsonify({"conversation_id": primary_conversation_id})
 
 
+def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
+    """Legacy web mixed-stream call path: every participant's conversation
+    holds the exact same raw_transcript already, so generate its title once
+    and apply it to all of them, instead of each participant's
+    run_conversation_titling asking the LLM separately and getting
+    different wording for what's the same conversation."""
+    title = generate_conversation_title(raw_transcript)
+    if not title:
+        return
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        for conv_id in conversation_ids_by_user.values():
+            cur.execute("UPDATE conversations SET title = %s WHERE id = %s AND title IS NULL", (title, conv_id))
+        conn.commit()
+    except Exception as e:
+        print(f"[_title_all_call_conversations] DB error: {e!r}")
+        conn.rollback()
+        return
+    finally:
+        release_raw_connection(conn)
+    for pid, conv_id in conversation_ids_by_user.items():
+        cache_delete(f"user:{pid}:conversation:{conv_id}", f"user:{pid}:conversations")
+
+
+def process_own_call_recording_job(call_id, user_id, audio_path, content_type, category):
+    """RQ job (queued from _upload_own_call_recording below, or called
+    inline as a fallback if Redis/RQ is unreachable): transcribes via
+    Deepgram, creates the conversation, runs titling + analysis directly
+    (no threading.Thread -- this already runs off the Flask request thread,
+    in the worker process), then pushes call_conversation_ready. Runs in a
+    separate process/thread from any Flask request, so it uses the pooled
+    get_raw_connection()/release_raw_connection() rather than Flask's
+    request-scoped get_db()."""
+    try:
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+    finally:
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return {"error": "Missing DEEPGRAM_API_KEY"}
+
+    try:
+        resp = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
+            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
+            data=audio_bytes,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return {"error": f"Deepgram request failed: {e}"}
+
+    utterances = (resp.json().get("results") or {}).get("utterances") or []
+    lines = []
+    for utt in utterances:
+        text = (utt.get("transcript") or "").strip()
+        if text:
+            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
+    raw_transcript = "\n".join(lines)
+
+    conn = get_raw_connection()
+    try:
+        cur = dict_cursor(conn)
+        if not raw_transcript.strip():
+            cur.execute(
+                "UPDATE call_participants SET recording_uploaded_at = now() WHERE call_id = %s AND user_id = %s",
+                (call_id, user_id),
+            )
+            conn.commit()
+            return {"conversation_id": None, "skipped": "no_speech_detected"}
+
+        cur.execute(
+            "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
+            (user_id, None, raw_transcript, category),
+        )
+        conversation_id = cur.fetchone()["id"]
+        cur.execute(
+            "UPDATE call_participants SET recording_uploaded_at = now(), conversation_id = %s "
+            "WHERE call_id = %s AND user_id = %s",
+            (conversation_id, call_id, user_id),
+        )
+        conn.commit()
+    finally:
+        release_raw_connection(conn)
+
+    cache_delete(f"user:{user_id}:conversations")
+    assign_shared_call_title(call_id, user_id, conversation_id, raw_transcript)
+    run_background_analysis(user_id, conversation_id, raw_transcript, lambda *a, **k: None)
+    push_notification(user_id, {
+        "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
+    })
+    send_fcm_to_user(
+        user_id, title="Conversation ready",
+        body="Your call has been transcribed into a new conversation.",
+        data={"type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id},
+    )
+
+    return {"conversation_id": conversation_id}
+
+
 def _upload_own_call_recording(call_id):
-    """scope=own branch of upload_call_recording: transcribes and attaches
-    a conversation for just the uploading participant, independent of
-    every other participant's own upload. Idempotent per
-    (call_id, user_id) via call_participants.recording_uploaded_at, not
+    """scope=own branch of upload_call_recording: queues transcription +
+    conversation-creation for just the uploading participant, independent
+    of every other participant's own upload. Idempotent per (call_id,
+    user_id) via call_participants.recording_uploaded_at, not
     calls.conversation_id (that column is reserved for the legacy
-    mixed-upload flow above)."""
+    mixed-upload flow above). The actual work happens in
+    process_own_call_recording_job, run on the `calls` RQ queue (worker.py)
+    so this request doesn't block on Deepgram."""
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
@@ -2953,68 +3288,27 @@ def _upload_own_call_recording(call_id):
     if row["recording_uploaded_at"]:
         return jsonify({"conversation_id": row["conversation_id"], "already_processed": True})
 
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not api_key:
+    if not os.getenv("DEEPGRAM_API_KEY"):
         return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
     audio_file = request.files["audio"]
-    audio_bytes = audio_file.read()
     content_type = audio_file.mimetype or "audio/webm"
+    fd, tmp_path = tempfile.mkstemp(prefix=f"call_{call_id}_{user_id}_", suffix=".audio")
+    with os.fdopen(fd, "wb") as f:
+        audio_file.save(f)
 
     try:
-        resp = requests.post(
-            "https://api.deepgram.com/v1/listen",
-            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
-            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
-            data=audio_bytes,
-            timeout=120,
+        job = call_queue.enqueue(
+            process_own_call_recording_job, call_id, user_id, tmp_path, content_type, row["category"],
+            job_timeout=240,
         )
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else 500
-        return jsonify({"error": f"Deepgram error: {e}"}), status
-    except requests.RequestException as e:
-        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
-
-    utterances = (resp.json().get("results") or {}).get("utterances") or []
-    lines = []
-    for utt in utterances:
-        text = (utt.get("transcript") or "").strip()
-        if text:
-            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
-    raw_transcript = "\n".join(lines)
-
-    if not raw_transcript.strip():
-        cur.execute(
-            "UPDATE call_participants SET recording_uploaded_at = now() WHERE call_id = %s AND user_id = %s",
-            (call_id, user_id),
-        )
-        db.commit()
-        return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
-
-    cur.execute(
-        "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
-        (user_id, None, raw_transcript, row["category"]),
-    )
-    conversation_id = cur.fetchone()["id"]
-    cur.execute(
-        "UPDATE call_participants SET recording_uploaded_at = now(), conversation_id = %s "
-        "WHERE call_id = %s AND user_id = %s",
-        (conversation_id, call_id, user_id),
-    )
-    db.commit()
-    cache_delete(f"user:{user_id}:conversations")
-
-    threading.Thread(target=run_conversation_titling, args=(user_id, conversation_id, raw_transcript), daemon=True).start()
-    threading.Thread(
-        target=run_background_analysis,
-        args=(user_id, conversation_id, raw_transcript, lambda *a, **k: None),
-        daemon=True,
-    ).start()
-    push_notification(user_id, {
-        "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
-    })
-
-    return jsonify({"conversation_id": conversation_id})
+        return jsonify({"status": "queued", "job_id": job.id})
+    except redis.RedisError:
+        # Redis/RQ unreachable -- fall back to processing inline, exactly
+        # like this endpoint always did before the queue existed, so a dead
+        # queue never means a lost recording.
+        result = process_own_call_recording_job(call_id, user_id, tmp_path, content_type, row["category"])
+        status = 500 if "error" in result else 200
+        return jsonify(result), status
 
 
 CHAT_FORMATTING_GUIDANCE = (
@@ -3524,8 +3818,9 @@ verify_db_connection()
 # the reminder-email worker needs its own start path here instead. Only
 # safe with a single worker process; running multiple gunicorn workers
 # would start one thread per worker and send duplicate reminder emails.
-if __name__ != "__main__":
+if __name__ != "__main__" and IS_WEB_ROLE:
     threading.Thread(target=email_reminder_worker, daemon=True).start()
+    threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
 
 if __name__ == "__main__":
     # Mic access (getUserMedia) only works over "secure contexts" -- https,
@@ -3541,7 +3836,8 @@ if __name__ == "__main__":
     # debug=True runs Flask's reloader, which re-executes this module in a
     # child process -- WERKZEUG_RUN_MAIN is only set in that actual running
     # child, so checking it avoids starting two copies of the email worker.
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" and IS_WEB_ROLE:
         threading.Thread(target=email_reminder_worker, daemon=True).start()
+        threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
 
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True, ssl_context=ssl_context)

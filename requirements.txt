@@ -10,6 +10,7 @@ cryptography
 requests
 python-dotenv
 redis
+rq
 livekit-api
 firebase-admin
 av

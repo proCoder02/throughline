@@ -322,6 +322,15 @@ CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls (initiator_user_id);
 ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS recording_uploaded_at TIMESTAMPTZ;
 ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL;
 
+-- One title per call, shared by every participant's own conversation row --
+-- without this, each participant's independent scope=own upload would ask
+-- the LLM separately for a title from their own transcript and get
+-- different wording for what's the same conversation. Whichever
+-- participant's recording finishes processing first claims this (guarded
+-- by the WHERE shared_title IS NULL in assign_shared_call_title), everyone
+-- after just reuses it -- see app.py.
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS shared_title TEXT;
+
 -- FCM device tokens for mobile push (calls, tasks, reminder emails, friend
 -- mood updates) -- one row per device; UNIQUE(token) lets registration be a
 -- plain upsert (token refresh, or the same device logging into a different

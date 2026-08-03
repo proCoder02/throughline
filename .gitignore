@@ -12,6 +12,10 @@ env/
 .env
 *.env
 
+# Firebase Admin SDK service-account credentials (FIREBASE_CREDENTIALS_PATH in .env)
+firebase-credentials*.json
+*-firebase-adminsdk-*.json
+
 # Database files
 *.db
 *.sqlite3
