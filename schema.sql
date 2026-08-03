@@ -322,6 +322,15 @@ CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls (initiator_user_id);
 ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS recording_uploaded_at TIMESTAMPTZ;
 ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL;
 
+-- One title per call, shared by every participant's own conversation row --
+-- without this, each participant's independent scope=own upload would ask
+-- the LLM separately for a title from their own transcript and get
+-- different wording for what's the same conversation. Whichever
+-- participant's recording finishes processing first claims this (guarded
+-- by the WHERE shared_title IS NULL in assign_shared_call_title), everyone
+-- after just reuses it -- see app.py.
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS shared_title TEXT;
+
 -- FCM device tokens for mobile push (calls, tasks, reminder emails, friend
 -- mood updates) -- one row per device; UNIQUE(token) lets registration be a
 -- plain upsert (token refresh, or the same device logging into a different
@@ -335,3 +344,18 @@ CREATE TABLE IF NOT EXISTS push_tokens (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens (user_id);
+
+-- ============================================================================
+-- Full-text search (GET /search) -- lets a user find a past conversation by
+-- what was actually said in it, not just its title. GENERATED ... STORED
+-- columns precompute the tsvector at write time (INSERT/UPDATE), so a
+-- search never re-tokenizes transcript/message text on every request; the
+-- GIN indexes are what make @@ query lookups fast instead of a seq scan.
+-- ============================================================================
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(raw_transcript, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_conversations_search_tsv ON conversations USING GIN (search_tsv);
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+CREATE INDEX IF NOT EXISTS idx_chat_messages_content_tsv ON chat_messages USING GIN (content_tsv);
