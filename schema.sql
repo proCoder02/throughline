@@ -335,3 +335,18 @@ CREATE TABLE IF NOT EXISTS push_tokens (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens (user_id);
+
+-- ============================================================================
+-- Full-text search (GET /search) -- lets a user find a past conversation by
+-- what was actually said in it, not just its title. GENERATED ... STORED
+-- columns precompute the tsvector at write time (INSERT/UPDATE), so a
+-- search never re-tokenizes transcript/message text on every request; the
+-- GIN indexes are what make @@ query lookups fast instead of a seq scan.
+-- ============================================================================
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(raw_transcript, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_conversations_search_tsv ON conversations USING GIN (search_tsv);
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+CREATE INDEX IF NOT EXISTS idx_chat_messages_content_tsv ON chat_messages USING GIN (content_tsv);

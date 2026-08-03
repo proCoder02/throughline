@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import hashlib
 import secrets
 import threading
 import jwt as pyjwt
@@ -3204,6 +3205,82 @@ def get_conversation_chat(conversation_id):
     )
     result = [serialize_row(r) for r in cur.fetchall()]
     cache_set_json(cache_key, result, ttl=3600)
+    return jsonify(result)
+
+
+SEARCH_MAX_RESULTS = 20
+
+
+@app.route("/search", methods=["GET"])
+@login_required
+def search_conversations():
+    """Full-text search across a user's own conversation titles/transcripts
+    and chat messages -- lets 'what did I say about the Q3 budget' find the
+    actual conversation instead of only matching a title substring the way
+    the Chats screen's client-side filter does. search_tsv/content_tsv are
+    precomputed (GENERATED ... STORED, see schema.sql) so this is a plain
+    GIN index lookup, not a live re-tokenize of every transcript."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+
+    user_id = current_user_id()
+    cache_key = f"user:{user_id}:search:{hashlib.md5(q.encode('utf-8')).hexdigest()}"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    db = get_db()
+    cur = dict_cursor(db)
+
+    # Two separate matches per conversation are possible (its own
+    # title/transcript, and/or one of its chat messages) -- keep whichever
+    # ranks higher rather than returning the same conversation twice.
+    matches = {}
+
+    cur.execute(
+        "SELECT c.id, c.created_at, c.title, c.category, "
+        "ts_rank(c.search_tsv, query) AS rank, "
+        "ts_headline('english', coalesce(c.raw_transcript, ''), query, "
+        "'MaxWords=20, MinWords=5, MaxFragments=1') AS snippet "
+        "FROM conversations c, websearch_to_tsquery('english', %s) query "
+        "WHERE c.user_id = %s AND c.search_tsv @@ query "
+        "ORDER BY rank DESC LIMIT %s",
+        (q, user_id, SEARCH_MAX_RESULTS),
+    )
+    for r in cur.fetchall():
+        matches[r["id"]] = r
+
+    cur.execute(
+        "SELECT DISTINCT ON (m.conversation_id) m.conversation_id AS id, "
+        "c.created_at, c.title, c.category, "
+        "ts_rank(m.content_tsv, query) AS rank, "
+        "ts_headline('english', m.content, query, "
+        "'MaxWords=20, MinWords=5, MaxFragments=1') AS snippet "
+        "FROM chat_messages m "
+        "JOIN conversations c ON c.id = m.conversation_id "
+        "CROSS JOIN websearch_to_tsquery('english', %s) query "
+        "WHERE m.user_id = %s AND m.conversation_id IS NOT NULL AND m.content_tsv @@ query "
+        "ORDER BY m.conversation_id, rank DESC LIMIT %s",
+        (q, user_id, SEARCH_MAX_RESULTS),
+    )
+    for r in cur.fetchall():
+        existing = matches.get(r["id"])
+        if existing is None or r["rank"] > existing["rank"]:
+            matches[r["id"]] = r
+
+    ranked = sorted(matches.values(), key=lambda r: r["rank"], reverse=True)[:SEARCH_MAX_RESULTS]
+    result = [
+        {
+            "id": r["id"],
+            "created_at": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else r["created_at"],
+            "title": r["title"],
+            "category": r["category"],
+            "snippet": r["snippet"],
+        }
+        for r in ranked
+    ]
+    cache_set_json(cache_key, result, ttl=90)
     return jsonify(result)
 
 
