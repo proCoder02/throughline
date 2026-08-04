@@ -3265,7 +3265,15 @@ def upload_call_recording(call_id):
         # would still be processed rather than silently no-op'd forever.
         return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
 
-    cur.execute("SELECT user_id FROM call_participants WHERE call_id = %s", (call_id,))
+    # Only participants who actually joined -- someone merely invited (never
+    # answered) or who declined was never actually part of this audio, and
+    # giving them a full conversation created from other people's transcript
+    # plus a "conversation ready" push was a real privacy leak whenever a
+    # group call included someone who didn't pick up.
+    cur.execute(
+        "SELECT user_id FROM call_participants WHERE call_id = %s AND status IN ('joined', 'left')",
+        (call_id,),
+    )
     participant_ids = [r["user_id"] for r in cur.fetchall()]
 
     # One conversation row per participant, not just the uploader --
