@@ -61,7 +61,19 @@
       "Bash(find /c/Users/P3INW57/Desktop/throughline -iname \"*.png\" -path \"*assets*\" -o -iname \"*.svg\" -path \"*assets*\" 2>/dev/null | grep -v node_modules *)",
       "Read(//c/Users/P3INW57/Desktop/throughline/**)",
       "Read(//c/Users/P3INW57/Desktop/throughline/android/app/src/main/res/mipmap-xxxhdpi/**)",
-      "Bash(tasklist //FI \"IMAGENAME eq adb.exe\")"
+      "Bash(tasklist //FI \"IMAGENAME eq adb.exe\")",
+      "WebFetch(domain:docs.x.ai)",
+      "Bash(grep -rn \"segments\" c:/Users/P3INW57/Desktop/speech2text/frontend/src C:/Users/P3INW57/Desktop/throughline/lib 2>/dev/null)",
+      "Bash(.venv/Scripts/python.exe C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/verify_stt_providers.py)",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'DELETE FROM users WHERE id = 29;')",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'DELETE FROM users WHERE id = 30;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'DELETE FROM users WHERE id = 31;')",
+      "WebSearch",
+      "WebFetch(domain:docs.sarvam.ai)",
+      "WebFetch(domain:mastra.ai)",
+      "WebFetch(domain:www.sarvam.ai)",
+      "Bash(.venv/Scripts/python.exe C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/test_diarization_hindi.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\P3INW57\\Desktop\\throughline"
