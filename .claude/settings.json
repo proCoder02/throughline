@@ -73,7 +73,12 @@
       "WebFetch(domain:docs.sarvam.ai)",
       "WebFetch(domain:mastra.ai)",
       "WebFetch(domain:www.sarvam.ai)",
-      "Bash(.venv/Scripts/python.exe C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/test_diarization_hindi.py)"
+      "Bash(.venv/Scripts/python.exe C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/test_diarization_hindi.py)",
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)",
+      "Bash(git ls-tree *)",
+      "Bash(grep -i \"pubspec\\\\|\\\\.dart$\")",
+      "Bash(git add *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\P3INW57\\Desktop\\throughline"
