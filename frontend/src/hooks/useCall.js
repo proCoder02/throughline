@@ -17,6 +17,14 @@ export function useCall() {
   const recordedChunksRef = useRef([]);
   const localTrackRef = useRef(null);
   const isInitiatorRef = useRef(false);
+  // The initiator connects to the LiveKit room (and this hook used to start
+  // recording) the instant they place the call, well before the callee ever
+  // answers. If the callee declined, that ringback/silence still got
+  // recorded and uploaded on leaveCall, producing a garbage transcribed
+  // conversation + notification for a call nobody actually had. Gate
+  // starting the recorder on an actual remote participant joining instead --
+  // a declined/missed call then records and uploads nothing.
+  const hasRemoteJoinedRef = useRef(false);
   const audioElsRef = useRef(new Map()); // track sid -> <audio> element actually playing it
   const leaveCallRef = useRef(null); // always-current leaveCall, for the disconnect-triggered auto-hangup below
 
@@ -33,11 +41,22 @@ export function useCall() {
     roomRef.current = room;
     isInitiatorRef.current = isInitiator;
 
+    hasRemoteJoinedRef.current = false;
     if (isInitiator) {
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
       mixDestRef.current = ctx.createMediaStreamDestination();
     }
+
+    const startRecordingIfNeeded = () => {
+      if (!isInitiatorRef.current || hasRemoteJoinedRef.current || !mixDestRef.current) return;
+      hasRemoteJoinedRef.current = true;
+      const recorder = new MediaRecorder(mixDestRef.current.stream, { mimeType: 'audio/webm;codecs=opus' });
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
+      recorder.start(1000);
+      recorderRef.current = recorder;
+    };
 
     // Two separate concerns that were previously (wrongly) conflated: every
     // participant needs to actually HEAR remote audio (attach + play it),
@@ -66,6 +85,7 @@ export function useCall() {
     });
     room.on(RoomEvent.ParticipantConnected, (p) => {
       setActiveCall((c) => (c ? { ...c, participants: [...c.participants, { identity: p.identity, name: p.name || p.identity }] } : c));
+      startRecordingIfNeeded();
     });
     room.on(RoomEvent.ParticipantDisconnected, (p) => {
       const droppedName = p.name || p.identity;
@@ -99,11 +119,12 @@ export function useCall() {
 
     if (isInitiator) {
       addTrackToMix(localTrack.mediaStreamTrack);
-      const recorder = new MediaRecorder(mixDestRef.current.stream, { mimeType: 'audio/webm;codecs=opus' });
-      recordedChunksRef.current = [];
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
-      recorder.start(1000);
-      recorderRef.current = recorder;
+    }
+    // Covers the callee's side connecting into a room where the caller
+    // (initiator) is already present -- ParticipantConnected above won't
+    // fire again for them.
+    if (room.remoteParticipants && room.remoteParticipants.size > 0) {
+      startRecordingIfNeeded();
     }
 
     setActiveCall({
@@ -157,7 +178,6 @@ export function useCall() {
       recorder.stop();
       await stopped;
       recorderRef.current = null;
-      try { await audioCtxRef.current?.close(); } catch (e) { /* ignore */ }
 
       if (call && recordedChunksRef.current.length) {
         const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
@@ -167,6 +187,13 @@ export function useCall() {
       }
       recordedChunksRef.current = [];
     }
+    // Created for every initiator call regardless of whether recording ever
+    // started (a declined call never reaches startRecordingIfNeeded) -- must
+    // still be closed unconditionally, or a run of declined calls leaks open
+    // AudioContexts (browsers cap how many can be open at once).
+    try { await audioCtxRef.current?.close(); } catch (e) { /* ignore */ }
+    audioCtxRef.current = null;
+    mixDestRef.current = null;
 
     if (call) {
       try { await post(`/calls/${call.callId}/leave`, {}); } catch (e) { /* already ended server-side is fine */ }

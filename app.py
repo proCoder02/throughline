@@ -1,6 +1,7 @@
 ﻿
 import os
 import re
+import io
 import json
 import hashlib
 import secrets
@@ -1107,10 +1108,21 @@ def remember_speaker_profile(cur, user_id, name):
     speaker detected" prompts (in this session or a later one) can offer it
     as an existing option instead of relying on the name being retyped
     identically. Safe to call on every rename -- ON CONFLICT DO NOTHING
-    means re-using an existing name is a no-op, not a duplicate/error."""
+    means re-using an existing name is a no-op, not a duplicate/error.
+
+    The conflict target is the case-insensitive expression index
+    (idx_speaker_profiles_user_name_ci in schema.sql), not the plain
+    exact-match UNIQUE(user_id, name) -- naming the exact-match one here
+    would only catch identical-case collisions; a name that only matches an
+    existing profile case-insensitively (e.g. typing "amit" when "Amit"
+    already exists) would still violate the other index during the actual
+    insert attempt, and since that index isn't the declared arbiter,
+    Postgres raises a hard UniqueViolation instead of silently no-op'ing --
+    exactly the bug that let picking/typing an existing speaker's name
+    sometimes fail to map back onto their one real profile."""
     cur.execute(
         "INSERT INTO speaker_profiles (user_id, name) VALUES (%s, %s) "
-        "ON CONFLICT (user_id, name) DO NOTHING",
+        "ON CONFLICT (user_id, lower(name)) DO NOTHING",
         (user_id, name),
     )
 
@@ -1129,7 +1141,12 @@ def get_or_create_profile_id(cur, user_id, name):
     """Resolve `name` to its canonical speaker_profiles.id, matching
     case-insensitively so 'Kunal' and 'kunal' collapse into one profile
     instead of forking into two. This is what links a personality_notes row
-    to a real, durable person rather than a free-text label."""
+    to a real, durable person rather than a free-text label.
+
+    See remember_speaker_profile for why the ON CONFLICT target below must
+    be the case-insensitive expression index, not the plain exact-match
+    one -- otherwise a case-varying name collision raises instead of
+    resolving to the existing profile."""
     cur.execute(
         "SELECT id FROM speaker_profiles WHERE user_id = %s AND lower(name) = lower(%s)",
         (user_id, name),
@@ -1139,7 +1156,7 @@ def get_or_create_profile_id(cur, user_id, name):
         return _first_value(row)
     cur.execute(
         "INSERT INTO speaker_profiles (user_id, name) VALUES (%s, %s) "
-        "ON CONFLICT (user_id, name) DO NOTHING RETURNING id",
+        "ON CONFLICT (user_id, lower(name)) DO NOTHING RETURNING id",
         (user_id, name),
     )
     row = cur.fetchone()
@@ -1286,16 +1303,19 @@ clinical/mental-health terms, no motive speculation.
 recording it -- "label" (a single plain word, e.g. "happy", "stressed", "calm", "frustrated", \
 "excited", "neutral", "sad", "anxious") and "score" (0.0-1.0 intensity/confidence). Base this \
 only on tone and word choice actually present, no diagnoses.
-4. "tags": at most 5 short, tappable suggestions worth asking the assistant next, matching the \
-mode above. Prefer a clear, directly-answerable question actually raised or clearly implied in \
-THIS transcript, phrased as that question (e.g. "What's the budget cap?"); fall back to a short \
-(1-4 word) topic (e.g. office: "budget approval") only when no such question is present. Empty \
-list if nothing distinct came up.
+4. "topics": at most 5 short (1-4 word) topic keywords covering what THIS transcript was actually \
+about (e.g. "budget approval", "kitchen sink", "weekend plans") -- always extracted independently \
+of "questions" below, not a fallback for when there's no question. Empty list if nothing distinct \
+came up.
+5. "questions": at most 5 short, tappable follow-up questions worth asking the assistant next, \
+matching the mode above -- a clear, directly-answerable question actually raised or clearly \
+implied in THIS transcript, phrased as that question (e.g. "What's the budget cap?"). Empty list \
+if none are clearly raised/implied -- do not invent generic questions just to fill this.
 
 Reply with ONLY this JSON, no preamble/fences:
 {{"tasks": [{{"description": "", "owner": null, "due_date": null, "reminder_at": null}}], \
 "speakers": [{{"label": "", "observations": [""]}}], \
-"mood": {{"label": "neutral", "score": 0.5}}, "tags": [""]}}
+"mood": {{"label": "neutral", "score": 0.5}}, "topics": [""], "questions": [""]}}
 Empty lists if none found. "mood" is always required."""
 
 
@@ -1427,66 +1447,115 @@ def service_worker():
     )
 
 
+def _transcribe_with_deepgram(audio_bytes, content_type):
+    """Original transcription path -- unchanged from before USE_GROQ_STT
+    existed. Diarized, so returns "Speaker N: text" lines plus per-line
+    segments with timing."""
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing DEEPGRAM_API_KEY")
+    resp = requests.post(
+        "https://api.deepgram.com/v1/listen",
+        params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
+        headers={"Authorization": f"Token {api_key}", "Content-Type": content_type or "audio/webm"},
+        data=audio_bytes,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    utterances = (resp.json().get("results") or {}).get("utterances") or []
+    lines, segments = [], []
+    for utt in utterances:
+        text = (utt.get("transcript") or "").strip()
+        if not text:
+            continue
+        speaker_label = f"Speaker {utt.get('speaker', 0)}"
+        lines.append(f"{speaker_label}: {text}")
+        segments.append({"speaker": speaker_label, "text": text, "start": utt.get("start"), "end": utt.get("end")})
+    return "\n".join(lines), segments
+
+
+_GROQ_EXT_BY_MIMETYPE = {
+    "audio/webm": "webm",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/m4a": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/ogg": "ogg",
+}
+
+
+def _transcribe_with_groq(audio_bytes, content_type):
+    """Groq's Whisper endpoint has no speaker diarization. The mobile call-
+    recording path this matters most for (process_own_call_recording_job)
+    already uploads one file per participant -- each file is single-speaker
+    to begin with, so diarization was never actually needed there. Every
+    result is attributed to a single "Speaker 0" label so downstream code
+    (which expects the "Speaker N: text" convention everywhere) keeps
+    working unchanged; the legacy multi-speaker mixed-stream web path
+    (upload_call_recording) does lose real speaker separation when this
+    flag is on, since Groq has no way to tell speakers apart in one file."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GROQ_API_KEY")
+    # Groq (like the OpenAI Whisper API it mirrors) infers the audio format
+    # from the uploaded filename's extension -- a bare filename with no
+    # extension gets rejected outright with a 400, so this can't just be a
+    # fixed placeholder like the other providers tolerate.
+    mimetype = (content_type or "audio/webm").split(";")[0].strip().lower()
+    ext = _GROQ_EXT_BY_MIMETYPE.get(mimetype, "webm")
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        files={"file": (f"audio.{ext}", io.BytesIO(audio_bytes), mimetype)},
+        data={"model": "whisper-large-v3-turbo", "response_format": "json"},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    text = (resp.json().get("text") or "").strip()
+    if not text:
+        return "", []
+    return f"Speaker 0: {text}", [{"speaker": "Speaker 0", "text": text, "start": None, "end": None}]
+
+
+def transcribe_audio_bytes(audio_bytes, content_type):
+    """Central transcription entrypoint -- every audio-to-text call site in
+    this app routes through here. USE_GROQ_STT=true in .env sends audio to
+    Groq's Whisper API (multilingual/Hinglish/code-switch friendly, no
+    diarization); false or unset reverts to the original Deepgram nova-2
+    path with no other code changes needed. Returns (raw_transcript,
+    segments); raises RuntimeError for a missing API key or lets
+    requests.RequestException/HTTPError propagate for the caller to handle."""
+    if os.getenv("USE_GROQ_STT", "false").strip().lower() == "true":
+        return _transcribe_with_groq(audio_bytes, content_type)
+    return _transcribe_with_deepgram(audio_bytes, content_type)
+
+
 @app.route("/transcribe", methods=["POST"])
 @login_required
 def transcribe_audio():
-    """Send a recorded audio clip to Deepgram for diarized transcription and
-    return a speaker-labeled transcript in the "Name: text" convention used
-    elsewhere in this app. Deepgram handles concurrent requests from many
-    users on its own infrastructure -- nothing to scale on our side."""
+    """Send a recorded audio clip for transcription (Groq or Deepgram, see
+    transcribe_audio_bytes/USE_GROQ_STT) and return a speaker-labeled
+    transcript in the "Name: text" convention used elsewhere in this app."""
     if "audio" not in request.files:
         return jsonify({"error": "No audio file uploaded"}), 400
-
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not api_key:
-        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
 
     audio_file = request.files["audio"]
     audio_bytes = audio_file.read()
     content_type = audio_file.mimetype or "audio/webm"
 
     try:
-        resp = requests.post(
-            "https://api.deepgram.com/v1/listen",
-            params={
-                "diarize": "true",
-                "punctuate": "true",
-                "utterances": "true",
-                "model": "nova-2",
-            },
-            headers={
-                "Authorization": f"Token {api_key}",
-                "Content-Type": content_type,
-            },
-            data=audio_bytes,
-            timeout=120,
-        )
-        resp.raise_for_status()
+        transcript_text, segments = transcribe_audio_bytes(audio_bytes, content_type)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 500
-        return jsonify({"error": f"Deepgram error: {e}"}), status
+        return jsonify({"error": f"Transcription error: {e}"}), status
     except requests.RequestException as e:
-        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
+        return jsonify({"error": f"Could not reach transcription service: {e}"}), 502
 
-    data = resp.json()
-    utterances = (data.get("results") or {}).get("utterances") or []
-
-    lines = []
-    segments = []
-    for utt in utterances:
-        speaker_label = f"Speaker {utt.get('speaker', 0)}"
-        text = (utt.get("transcript") or "").strip()
-        if not text:
-            continue
-        lines.append(f"{speaker_label}: {text}")
-        segments.append({
-            "speaker": speaker_label,
-            "text": text,
-            "start": utt.get("start"),
-            "end": utt.get("end"),
-        })
-
-    transcript_text = "\n".join(lines)
     return jsonify({"transcript": transcript_text, "segments": segments})
 
 
@@ -1546,7 +1615,8 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
     mood = parsed.get("mood") or {}
-    tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
+    topics = [t for t in (parsed.get("topics") or []) if isinstance(t, str) and t.strip()][:5]
+    questions = [q for q in (parsed.get("questions") or []) if isinstance(q, str) and q.strip()][:5]
 
     mood_label = (mood.get("label") or "").strip()
 
@@ -1611,13 +1681,22 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
         release_raw_connection(conn)
 
     for task_id, description in created_tasks:
-        push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
-        send_fcm_to_user(user_id, title="New task", body=description, data={"type": "task_created", "task_id": task_id})
+        push_notification(user_id, {
+            "type": "task_created", "task_id": task_id, "description": description,
+            "conversation_id": conversation_id,
+        })
+        send_fcm_to_user(
+            user_id, title="New task", body=description,
+            data={"type": "task_created", "task_id": task_id, "conversation_id": conversation_id},
+        )
 
     if notify_mood_friend_ids:
         notify_friends_of_mood_update(user_id, mood_label, notify_mood_friend_ids)
 
-    push({"type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers), "tags": tags})
+    push({
+        "type": "background_update", "tasks_found": len(tasks), "speakers_found": len(speakers),
+        "topics": topics, "questions": questions,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2198,9 +2277,29 @@ def ws_listen(ws):
                 )
                 conn.commit()
                 cur.close()
-                cache_delete(f"user:{user_id}:conversation:{conversation_id}")
+                cache_delete(f"user:{user_id}:conversation:{conversation_id}", f"user:{user_id}:conversations")
             finally:
                 release_raw_connection(conn)
+
+            if not resume_id:
+                # Only for a genuinely new conversation (not one resumed via
+                # ?conversation_id=...) -- this is the one live-listen path
+                # worth a push for: by the time this fires the user has
+                # already stopped/backgrounded the session, so unlike the
+                # synchronous /save and /analyze endpoints (where the caller
+                # gets the result directly in the response and a push would
+                # just be redundant noise), this is genuinely async from
+                # their perspective. Sent before titling below rather than
+                # waiting on it, matching call_conversation_ready's existing
+                # pattern of a generic body rather than coordinating with a
+                # second async LLM call.
+                push_notification(user_id, {"type": "conversation_created", "conversation_id": conversation_id})
+                send_fcm_to_user(
+                    user_id, title="Conversation saved",
+                    body="Your conversation has been saved and transcribed.",
+                    data={"type": "conversation_created", "conversation_id": conversation_id},
+                )
+
             # The conversation just ended -- generate its title now rather
             # than leaving it null (shown as "Untitled conversation" in the
             # Conversations tab) forever.
@@ -2274,7 +2373,8 @@ def analyze_conversation():
     tasks = parsed.get("tasks") or []
     speakers = parsed.get("speakers") or []
     mood = parsed.get("mood") or {}
-    tags = [t for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()][:5]
+    topics = [t for t in (parsed.get("topics") or []) if isinstance(t, str) and t.strip()][:5]
+    questions = [q for q in (parsed.get("questions") or []) if isinstance(q, str) and q.strip()][:5]
 
     created_tasks = []
     for task in tasks:
@@ -2331,8 +2431,14 @@ def analyze_conversation():
     db.commit()
 
     for task_id, description in created_tasks:
-        push_notification(user_id, {"type": "task_created", "task_id": task_id, "description": description})
-        send_fcm_to_user(user_id, title="New task", body=description, data={"type": "task_created", "task_id": task_id})
+        push_notification(user_id, {
+            "type": "task_created", "task_id": task_id, "description": description,
+            "conversation_id": conversation_id,
+        })
+        send_fcm_to_user(
+            user_id, title="New task", body=description,
+            data={"type": "task_created", "task_id": task_id, "conversation_id": conversation_id},
+        )
 
     notify_friends_of_mood_update(user_id, mood_label, notify_mood_friend_ids)
 
@@ -2342,7 +2448,8 @@ def analyze_conversation():
             "tasks": tasks,
             "speakers": speakers,
             "mood": mood,
-            "tags": tags,
+            "topics": topics,
+            "questions": questions,
         }
     )
 
@@ -2402,6 +2509,25 @@ def reopen_task(task_id):
         return jsonify({"error": "Task not found"}), 404
     cur.execute("UPDATE tasks SET status = 'open' WHERE id = %s", (task_id,))
     db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/tasks/<int:task_id>", methods=["DELETE"])
+@login_required
+def delete_task(task_id):
+    """Permanently removes a task -- unlike completing/reopening, this is
+    not reversible from the UI. Matches delete_conversation's shape (DELETE
+    verb, id + ownership check, RETURNING id to detect a no-op)."""
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "DELETE FROM tasks WHERE id = %s AND user_id = %s RETURNING id",
+        (task_id, current_user_id()),
+    )
+    deleted = cur.fetchone()
+    db.commit()
+    if not deleted:
+        return jsonify({"error": "Task not found"}), 404
     return jsonify({"ok": True})
 
 
@@ -2803,6 +2929,57 @@ def friend_mood(friend_id):
     })
 
 
+@app.route("/mood/history", methods=["GET"])
+@login_required
+def mood_history():
+    """Per-day dominant mood for the caller's own last `days` days (default
+    30, capped at 90) -- feeds the mood-trend calendar heatmap. Dominant
+    mood per day picked the same way compute_compiled_mood picks it per
+    2-hour bucket: highest confidence-weighted score, falling back to count
+    on a tie. Grouped by LOCAL calendar date (matching mood_bucket_bounds'
+    existing local-time convention elsewhere in this file), not UTC date."""
+    user_id = current_user_id()
+    days = max(1, min(request.args.get("days", 30, type=int) or 30, 90))
+    since = datetime.now().astimezone() - timedelta(days=days)
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT created_at, mood_label, mood_score FROM mood_logs "
+        "WHERE user_id = %s AND created_at >= %s ORDER BY created_at",
+        (user_id, since),
+    )
+    by_day = {}
+    for row in cur.fetchall():
+        day = row["created_at"].astimezone().date().isoformat()
+        bucket = by_day.setdefault(day, {})
+        label = row["mood_label"]
+        agg = bucket.get(label, {"weight": 0.0, "n": 0})
+        agg["weight"] += float(row["mood_score"] or 0)
+        agg["n"] += 1
+        bucket[label] = agg
+
+    days_out = []
+    for day, labels in sorted(by_day.items()):
+        dominant = max(labels.items(), key=lambda kv: (kv[1]["weight"], kv[1]["n"]))[0]
+        days_out.append({
+            "date": day, "mood_label": dominant,
+            "emoji": MOOD_EMOJI.get((dominant or "").lower(), DEFAULT_MOOD_EMOJI),
+        })
+
+    # Consecutive days up to and including today with at least one mood log
+    # -- a simple, honest "N-day streak" count, not stored separately since
+    # it's fully derivable from the same data every time.
+    today = datetime.now().astimezone().date()
+    logged_days = {d["date"] for d in days_out}
+    streak = 0
+    cursor_day = today
+    while cursor_day.isoformat() in logged_days:
+        streak += 1
+        cursor_day -= timedelta(days=1)
+
+    return jsonify({"days": days_out, "streak": streak})
+
+
 # ---------------------------------------------------------------------------
 # Voice calling (1:1 + group), via LiveKit Cloud
 #
@@ -3064,35 +3241,19 @@ def upload_call_recording(call_id):
     if call["conversation_id"]:
         return jsonify({"conversation_id": call["conversation_id"], "already_processed": True})
 
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not api_key:
-        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
     audio_file = request.files["audio"]
     audio_bytes = audio_file.read()
     content_type = audio_file.mimetype or "audio/webm"
 
     try:
-        resp = requests.post(
-            "https://api.deepgram.com/v1/listen",
-            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
-            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
-            data=audio_bytes,
-            timeout=120,
-        )
-        resp.raise_for_status()
+        raw_transcript, _segments = transcribe_audio_bytes(audio_bytes, content_type)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 500
-        return jsonify({"error": f"Deepgram error: {e}"}), status
+        return jsonify({"error": f"Transcription error: {e}"}), status
     except requests.RequestException as e:
-        return jsonify({"error": f"Could not reach Deepgram: {e}"}), 502
-
-    utterances = (resp.json().get("results") or {}).get("utterances") or []
-    lines = []
-    for utt in utterances:
-        text = (utt.get("transcript") or "").strip()
-        if text:
-            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
-    raw_transcript = "\n".join(lines)
+        return jsonify({"error": f"Could not reach transcription service: {e}"}), 502
 
     if not raw_transcript.strip():
         # No speech detected (silence, a call that ended before anyone said
@@ -3104,22 +3265,36 @@ def upload_call_recording(call_id):
         # would still be processed rather than silently no-op'd forever.
         return jsonify({"conversation_id": None, "skipped": "no_speech_detected"})
 
-    cur.execute("SELECT user_id FROM call_participants WHERE call_id = %s", (call_id,))
+    # Only participants who actually joined -- someone merely invited (never
+    # answered) or who declined was never actually part of this audio, and
+    # giving them a full conversation created from other people's transcript
+    # plus a "conversation ready" push was a real privacy leak whenever a
+    # group call included someone who didn't pick up.
+    cur.execute(
+        "SELECT user_id FROM call_participants WHERE call_id = %s AND status IN ('joined', 'left')",
+        (call_id,),
+    )
     participant_ids = [r["user_id"] for r in cur.fetchall()]
 
     # One conversation row per participant, not just the uploader --
     # conversations.user_id is a single owner (same as every solo-dictation
     # conversation; there's no shared-ownership concept elsewhere in the
     # app), so without this only the uploader's own GET /conversations
-    # would ever return it. Same transcript/category copied to each; each
-    # person's title/task/profile/mood extraction still runs independently
-    # via the existing per-user pipeline, so it stays consistent with how
-    # every other conversation in the app is attributed.
+    # would ever return it. Same transcript copied to each (one shared
+    # mixed-stream recording); each person's title/task/profile/mood
+    # extraction still runs independently via the existing per-user
+    # pipeline. Category is NOT copied from calls.category (that's just
+    # whoever initiated the call's mode at that moment) -- each participant
+    # gets tagged with their OWN current category, same as every other
+    # conversation-creation path in the app, so this doesn't leak one
+    # person's (possibly custom, possibly meaningless to others) category
+    # onto everyone else's Chats list.
     conversation_ids = {}
     for pid in participant_ids:
+        pid_category = get_user_personalization(cur, pid)
         cur.execute(
             "INSERT INTO conversations (user_id, title, raw_transcript, category) VALUES (%s, %s, %s, %s) RETURNING id",
-            (pid, None, raw_transcript, call["category"]),
+            (pid, None, raw_transcript, pid_category),
         )
         conversation_ids[pid] = cur.fetchone()["id"]
 
@@ -3200,29 +3375,12 @@ def process_own_call_recording_job(call_id, user_id, audio_path, content_type, c
         except OSError:
             pass
 
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not api_key:
-        return {"error": "Missing DEEPGRAM_API_KEY"}
-
     try:
-        resp = requests.post(
-            "https://api.deepgram.com/v1/listen",
-            params={"diarize": "true", "punctuate": "true", "utterances": "true", "model": "nova-2"},
-            headers={"Authorization": f"Token {api_key}", "Content-Type": content_type},
-            data=audio_bytes,
-            timeout=120,
-        )
-        resp.raise_for_status()
+        raw_transcript, _segments = transcribe_audio_bytes(audio_bytes, content_type)
+    except RuntimeError as e:
+        return {"error": str(e)}
     except requests.RequestException as e:
-        return {"error": f"Deepgram request failed: {e}"}
-
-    utterances = (resp.json().get("results") or {}).get("utterances") or []
-    lines = []
-    for utt in utterances:
-        text = (utt.get("transcript") or "").strip()
-        if text:
-            lines.append(f"Speaker {utt.get('speaker', 0)}: {text}")
-    raw_transcript = "\n".join(lines)
+        return {"error": f"Transcription request failed: {e}"}
 
     conn = get_raw_connection()
     try:
@@ -3277,7 +3435,7 @@ def _upload_own_call_recording(call_id):
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT c.category, cp.recording_uploaded_at, cp.conversation_id FROM calls c "
+        "SELECT cp.recording_uploaded_at, cp.conversation_id FROM calls c "
         "JOIN call_participants cp ON cp.call_id = c.id "
         "WHERE c.id = %s AND cp.user_id = %s",
         (call_id, user_id),
@@ -3288,8 +3446,16 @@ def _upload_own_call_recording(call_id):
     if row["recording_uploaded_at"]:
         return jsonify({"conversation_id": row["conversation_id"], "already_processed": True})
 
-    if not os.getenv("DEEPGRAM_API_KEY"):
-        return jsonify({"error": "Missing DEEPGRAM_API_KEY"}), 500
+    required_key = "GROQ_API_KEY" if os.getenv("USE_GROQ_STT", "false").strip().lower() == "true" else "DEEPGRAM_API_KEY"
+    if not os.getenv(required_key):
+        return jsonify({"error": f"Missing {required_key}"}), 500
+    # This participant's OWN active category, not the call's shared
+    # `calls.category` column (set once from whoever initiated the call) --
+    # otherwise every other participant's resulting conversation gets
+    # tagged with a category that's meaningless (or, if custom, doesn't
+    # even exist) to them. Matches how every other conversation-creation
+    # path (e.g. /ws/listen) already tags by the current user's own mode.
+    category = get_user_personalization(cur, user_id)
     audio_file = request.files["audio"]
     content_type = audio_file.mimetype or "audio/webm"
     fd, tmp_path = tempfile.mkstemp(prefix=f"call_{call_id}_{user_id}_", suffix=".audio")
@@ -3298,15 +3464,21 @@ def _upload_own_call_recording(call_id):
 
     try:
         job = call_queue.enqueue(
-            process_own_call_recording_job, call_id, user_id, tmp_path, content_type, row["category"],
+            process_own_call_recording_job, call_id, user_id, tmp_path, content_type, category,
             job_timeout=240,
         )
         return jsonify({"status": "queued", "job_id": job.id})
-    except redis.RedisError:
-        # Redis/RQ unreachable -- fall back to processing inline, exactly
-        # like this endpoint always did before the queue existed, so a dead
-        # queue never means a lost recording.
-        result = process_own_call_recording_job(call_id, user_id, tmp_path, content_type, row["category"])
+    except Exception as e:
+        # Falls back to processing inline -- covers Redis/RQ being
+        # unreachable (redis.RedisError) *and* RQ's own hard refusal to
+        # enqueue a function defined in the __main__ module (a plain
+        # ValueError, not a RedisError, raised whenever this file is run
+        # directly via `python app.py` rather than imported by a separate
+        # runner) -- either way a queueing failure must never mean a lost
+        # recording, exactly like this endpoint always worked before the
+        # queue existed.
+        print(f"[_upload_own_call_recording] enqueue failed ({e!r}), falling back to inline processing")
+        result = process_own_call_recording_job(call_id, user_id, tmp_path, content_type, category)
         status = 500 if "error" in result else 200
         return jsonify(result), status
 
