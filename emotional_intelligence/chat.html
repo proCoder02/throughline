@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cognitive Memory Chat</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #131a22; --bubble-in: #1c2530; --bubble-out: #2a5d4c;
+    --text: #e8edf2; --text-soft: #8a97a5; --border: #223040; --accent: #3ecf8e;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f4f6f8; --panel: #ffffff; --bubble-in: #eef1f4; --bubble-out: #d7f5e9;
+      --text: #16202a; --text-soft: #647385; --border: #e1e6eb; --accent: #1f9d6f; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: var(--panel);
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; color: var(--text-soft); white-space: nowrap; }
+  select {
+    background: var(--bubble-in); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 10px; font-size: 14px; min-width: 200px;
+  }
+  #stats { font-size: 12px; color: var(--text-soft); }
+  main { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; max-width: 760px; width: 100%; margin: 0 auto; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 14px; line-height: 1.45; font-size: 14.5px; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--bubble-out); border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--bubble-in); border-bottom-left-radius: 4px; }
+  .msg.system { align-self: center; color: var(--text-soft); font-size: 12.5px; background: none; }
+  .msg.typing { color: var(--text-soft); font-style: italic; }
+  footer { padding: 14px 20px; border-top: 1px solid var(--border); background: var(--panel); }
+  form { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; }
+  input[type=text] {
+    flex: 1; background: var(--bubble-in); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px; font-size: 14.5px;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); }
+  button {
+    background: var(--accent); color: #06231a; border: none; border-radius: 10px;
+    padding: 0 20px; font-weight: 600; font-size: 14.5px; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .empty { text-align: center; color: var(--text-soft); margin-top: 60px; font-size: 14px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Cognitive memory chat</h1>
+    <select id="subject"><option value="">Loading subjects...</option></select>
+    <select id="subject2"><option value="">+ Compare with... (optional)</option></select>
+    <span id="stats"></span>
+  </header>
+  <main id="log">
+    <div class="empty">Pick a subject above, then ask a question grounded in their extracted cognitive memory. Optionally pick a second subject to ask questions spanning both people.</div>
+  </main>
+  <footer>
+    <form id="form">
+      <input id="input" type="text" placeholder="Ask something about this subject..." autocomplete="off" disabled />
+      <button id="send" type="submit" disabled>Send</button>
+    </form>
+  </footer>
+
+<script>
+const log = document.getElementById('log');
+const subjectSelect = document.getElementById('subject');
+const subject2Select = document.getElementById('subject2');
+const statsEl = document.getElementById('stats');
+const form = document.getElementById('form');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+let history = [];
+let allSubjects = [];
+
+function currentSubjects() {
+  const names = [subjectSelect.value];
+  if (subject2Select.value) names.push(subject2Select.value);
+  return names;
+}
+
+function resetConversation() {
+  history = [];
+  log.innerHTML = '';
+  const names = currentSubjects();
+  addMessage('system', names.length > 1
+    ? `Now chatting about ${names.join(' and ')}. Memory resets when subjects change.`
+    : `Now chatting about ${names[0]}. Memory resets per subject.`);
+}
+
+function addMessage(role, content) {
+  const empty = log.querySelector('.empty');
+  if (empty) empty.remove();
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  el.textContent = content;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+async function loadSubjects() {
+  const res = await fetch('/api/subjects');
+  const subjects = await res.json();
+  allSubjects = subjects;
+  subjectSelect.innerHTML = '';
+  if (!subjects.length) {
+    subjectSelect.innerHTML = '<option value="">No subjects with data yet</option>';
+    return;
+  }
+  for (const s of subjects) {
+    const opt = document.createElement('option');
+    opt.value = s.canonical_name;
+    opt.textContent = `${s.canonical_name} (${s.fact_count} facts, ${s.memory_count} memories)`;
+    subjectSelect.appendChild(opt);
+  }
+  refreshSubject2Options();
+  input.disabled = false;
+  sendBtn.disabled = false;
+}
+
+function refreshSubject2Options() {
+  const current = subject2Select.value;
+  subject2Select.innerHTML = '<option value="">+ Compare with... (optional)</option>';
+  for (const s of allSubjects) {
+    if (s.canonical_name === subjectSelect.value) continue; // can't compare someone with themselves
+    const opt = document.createElement('option');
+    opt.value = s.canonical_name;
+    opt.textContent = s.canonical_name;
+    subject2Select.appendChild(opt);
+  }
+  subject2Select.value = current && current !== subjectSelect.value ? current : '';
+}
+
+subjectSelect.addEventListener('change', () => {
+  refreshSubject2Options();
+  resetConversation();
+});
+subject2Select.addEventListener('change', resetConversation);
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const message = input.value.trim();
+  const subjects = currentSubjects();
+  if (!message || !subjects[0]) return;
+
+  addMessage('user', message);
+  history.push({ role: 'user', content: message });
+  input.value = '';
+  input.disabled = true;
+  sendBtn.disabled = true;
+
+  const typingEl = addMessage('bot typing', 'thinking...');
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject: subjects, message, history: history.slice(0, -1) }),
+    });
+    const data = await res.json();
+    typingEl.remove();
+    if (data.error) {
+      addMessage('system', 'Error: ' + data.error);
+    } else {
+      addMessage('bot', data.reply);
+      history.push({ role: 'assistant', content: data.reply });
+      if (data.memory_stats) {
+        // Single-subject: flat {facts, preferences, ...}. Multi-subject: {name: {facts, ...}, ...}.
+        const s = data.memory_stats;
+        if ('facts' in s) {
+          statsEl.textContent = `memory: ${s.facts} facts, ${s.preferences} prefs, ${s.beliefs} beliefs, ${s.memories} memories`;
+        } else {
+          statsEl.textContent = Object.entries(s)
+            .map(([name, st]) => `${name}: ${st.facts}f/${st.preferences}p/${st.beliefs}b/${st.memories}m`)
+            .join('  |  ');
+        }
+      }
+    }
+  } catch (err) {
+    typingEl.remove();
+    addMessage('system', 'Request failed: ' + err.message);
+  } finally {
+    input.disabled = false;
+    sendBtn.disabled = false;
+    input.focus();
+  }
+});
+
+loadSubjects();
+</script>
+</body>
+</html>
