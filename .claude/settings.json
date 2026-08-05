@@ -78,7 +78,17 @@
       "Bash(git rev-list *)",
       "Bash(git ls-tree *)",
       "Bash(grep -i \"pubspec\\\\|\\\\.dart$\")",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(ls /e/ 2>/dev/null | head -30 *)",
+      "Read(//e//**)",
+      "Bash(diff -rq /e/speech2text /c/Users/P3INW57/Desktop/speech2text \\\\ *)",
+      "Read(//e/speech2text/**)",
+      "Bash(diff /e/speech2text/.claude/settings.json /c/Users/P3INW57/Desktop/speech2text/.claude/settings.json)",
+      "Read(//e/speech2text/.claude/**)",
+      "Bash(echo \"=== 1. Local working tree vs origin/dev \\(GitHub, merged\\) — file-level ===\" *)",
+      "Read(//tmp/**)",
+      "Read(//c/tmp/**)",
+      "Bash(git commit -m ' *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\P3INW57\\Desktop\\throughline"
