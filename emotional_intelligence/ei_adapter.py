@@ -110,8 +110,27 @@ def _resolve_subject_id(cur, user_id) -> int | None:
 
 
 def _search_table(cur, table: str, subject_id: int, question: str | None,
-                   select_cols: str, recency_col: str, limit: int) -> list:
-    """Full-text search first, against a precomputed+indexed search_tsv
+                   select_cols: str, order_by: str, limit: int, extra_where: str = "",
+                   tiebreak_col: str | None = None) -> list:
+    """Shared by ei_adapter.py (app.py's /chat, /chat/global, /analyze) and
+    cognitive_reasoning_demo.py (the CLI demo + chat_server.py's standalone
+    UI) -- there used to be two separate, hand-copied versions of this
+    query, one per file. That drift is exactly what caused a real bug: this
+    file's version got fixed to search by relevance, the other file's
+    didn't, and a "what's Joey's favorite food" question confidently
+    answered "pizza" when the actual highest-weighted preference ("best
+    sandwich", weight 1.0) had simply aged out of a recency-only cutoff the
+    fix never reached. One implementation now; fixing it here fixes both.
+
+    order_by is a full ORDER BY expression (e.g. "created_at DESC",
+    "importance DESC NULLS LAST"), not just a column name, so callers with
+    different tie-breaking needs (memories ranks by importance, not
+    recency) don't need their own copy of this function to express that.
+    extra_where is an optional additional SQL condition (e.g. "archived =
+    FALSE" for memories) -- always a caller-supplied literal from this
+    package's own fixed set of call sites, never external input.
+
+    Full-text search first, against a precomputed+indexed search_tsv
     column (see ensure_search_indexes.py) rather than computing
     to_tsvector(...) fresh per row on every call -- fine at the ~100
     facts/subject this was built and tested against, but a sequential scan
@@ -134,15 +153,27 @@ def _search_table(cur, table: str, subject_id: int, question: str | None,
     question (verified: "what should I buy for Ben" only matched because
     "buy" was required AND absent from "has_son: Ben", a false negative).
     OR'ing lets a fact matching even one meaningful term surface, while
-    ts_rank still ranks fuller matches higher."""
+    ts_rank still ranks fuller matches higher.
+
+    tiebreak_col breaks ties in ts_rank by that column (e.g. "weight" for
+    preferences, "importance" for memories) -- needed because every row of
+    a given category (e.g. every one of Joey's 28 "food" preferences)
+    matches a broad question term like "food" identically, so ts_rank alone
+    ranks them all the same and the LIMIT cutoff among the tied rows was
+    effectively arbitrary again, just arbitrary-by-tie-break instead of
+    arbitrary-by-recency (verified: "best sandwich", weight 1.0, still lost
+    to "pizza", weight 0.9, purely because of tie order, even after
+    switching to relevance search)."""
+    where_extra = f" AND {extra_where}" if extra_where else ""
+    tiebreak = f", {tiebreak_col} DESC NULLS LAST" if tiebreak_col else ""
     if question:
         or_question = " OR ".join(question.split())
         cur.execute(
             f"""
             SELECT {select_cols} FROM emotional_intelligence.{table}
-            WHERE subject_id = %s
+            WHERE subject_id = %s{where_extra}
               AND search_tsv @@ websearch_to_tsquery('english', %s)
-            ORDER BY ts_rank(search_tsv, websearch_to_tsquery('english', %s)) DESC
+            ORDER BY ts_rank(search_tsv, websearch_to_tsquery('english', %s)) DESC{tiebreak}
             LIMIT %s
             """,
             (subject_id, or_question, or_question, limit),
@@ -152,10 +183,36 @@ def _search_table(cur, table: str, subject_id: int, question: str | None,
             return rows
     cur.execute(
         f"SELECT {select_cols} FROM emotional_intelligence.{table} "
-        f"WHERE subject_id = %s ORDER BY {recency_col} DESC LIMIT %s",
+        f"WHERE subject_id = %s{where_extra} ORDER BY {order_by} LIMIT %s",
         (subject_id, limit),
     )
     return cur.fetchall()
+
+
+def _count_table(cur, table: str, subject_id: int, extra_where: str = "") -> int:
+    """The true row count for a table/subject, independent of whatever
+    sample LIMIT _search_table applies. Needed because a quantity question
+    ("who has more memories, A or B?") was being answered by comparing the
+    *lengths of two equally-capped samples* (both capped at the same LIMIT)
+    instead of the real totals -- confirmed: asked to compare Monica's and
+    Rachel's memory counts, the model said "both have 10, so neither has
+    more" when the real counts are 191 and 179. The sample is for
+    *content*; only a real COUNT(*) answers a question about *quantity*."""
+    where_extra = f" AND {extra_where}" if extra_where else ""
+    cur.execute(
+        f"SELECT count(*) AS cnt FROM emotional_intelligence.{table} WHERE subject_id = %s{where_extra}",
+        (subject_id,),
+    )
+    row = cur.fetchone()
+    # Works with both a plain cursor (ei_adapter.py's own calls -- row[0])
+    # and cognitive_reasoning_demo.py's RealDictCursor (row["cnt"], since a
+    # dict-like row has no integer key 0 and raises KeyError on row[0] --
+    # the exact bug already hit and fixed 4+ times elsewhere in this
+    # project from assuming one cursor type while actually getting another).
+    try:
+        return row[0]
+    except (KeyError, TypeError):
+        return row["cnt"]
 
 
 def get_user_cognitive_context(user_id, question: str | None = None) -> str:
@@ -179,13 +236,18 @@ def get_user_cognitive_context(user_id, question: str | None = None) -> str:
                 return ""
 
             facts = _search_table(cur, "facts", subject_id, question,
-                                   "predicate, object", "created_at", 15)
+                                   "predicate, object", "created_at DESC", 15, tiebreak_col="confidence")
             preferences = _search_table(cur, "preferences", subject_id, question,
-                                         "category, item", "updated_at", 10)
+                                         "category, item", "updated_at DESC", 10, tiebreak_col="weight")
             beliefs = _search_table(cur, "beliefs", subject_id, question,
-                                     "topic, belief", "created_at", 10)
+                                     "topic, belief", "created_at DESC", 10, tiebreak_col="confidence")
             memories = _search_table(cur, "memories", subject_id, question,
-                                      "summary, emotion", "created_at", 10)
+                                      "summary, emotion", "created_at DESC", 10, tiebreak_col="importance")
+
+            total_facts = _count_table(cur, "facts", subject_id)
+            total_preferences = _count_table(cur, "preferences", subject_id)
+            total_beliefs = _count_table(cur, "beliefs", subject_id)
+            total_memories = _count_table(cur, "memories", subject_id)
         finally:
             _release(conn)
     except Exception as exc:
@@ -197,14 +259,22 @@ def get_user_cognitive_context(user_id, question: str | None = None) -> str:
 
     lines = [
         "Additional context -- this user's own accumulated cognitive memory "
-        "(facts, preferences, beliefs, and memories extracted from their past conversations):"
+        "(facts, preferences, beliefs, and memories extracted from their past conversations). "
+        "Each section is labeled 'showing X of Y total' -- Y is the TRUE total count; X is just "
+        "how many of the most relevant ones are listed below. For any question about quantity or "
+        "frequency (\"how many times...\", \"who has more...\"), always use the TRUE TOTAL (Y), "
+        "never the number of items actually listed, which is just a relevance-filtered sample:"
     ]
+    lines.append(f"\nFacts (showing {len(facts)} of {total_facts} total):")
     for predicate, obj in facts:
         lines.append(f"- {predicate}: {obj}")
+    lines.append(f"\nPreferences (showing {len(preferences)} of {total_preferences} total):")
     for category, item in preferences:
         lines.append(f"- prefers ({category}): {item}")
+    lines.append(f"\nBeliefs (showing {len(beliefs)} of {total_beliefs} total):")
     for topic, belief in beliefs:
         lines.append(f"- believes ({topic}): {belief}")
+    lines.append(f"\nMemories (showing {len(memories)} of {total_memories} total):")
     for summary, emotion in memories:
         lines.append(f"- memory ({emotion}): {summary}")
     lines.append(

@@ -118,9 +118,9 @@ def api_chat():
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             if len(subject_names) == 1:
-                memory_block, stats = assemble_cognitive_memory(cur, subject_names[0])
+                memory_block, stats = assemble_cognitive_memory(cur, subject_names[0], message)
             else:
-                memory_block, stats = assemble_multi_subject_memory(cur, subject_names)
+                memory_block, stats = assemble_multi_subject_memory(cur, subject_names, message)
         except SystemExit as e:
             return jsonify({"error": str(e)}), 404
         finally:
