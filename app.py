@@ -2349,10 +2349,18 @@ def analyze_conversation():
 
     mode = get_user_personalization(cur, user_id)
     persona_context = build_persona_context(get_user_persona(cur, user_id))
+    analysis_system_prompt = build_analysis_prompt(mode, persona_context)
+    try:
+        from emotional_intelligence.ei_adapter import get_user_cognitive_context
+        ei_context = get_user_cognitive_context(user_id)
+        if ei_context:
+            analysis_system_prompt = f"{analysis_system_prompt}\n\n{ei_context}"
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
     try:
         content = call_llm(
             [
-                {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
+                {"role": "system", "content": analysis_system_prompt},
                 {"role": "user", "content": raw_transcript},
             ]
         )
@@ -2920,13 +2928,22 @@ def friend_mood(friend_id):
             bucket_start, bucket_end = mood_bucket_bounds(last["created_at"])
             compiled = compute_compiled_mood(cur, friend_id, bucket_start, bucket_end)
 
-    return jsonify({
+    response = {
         "friend_id": friend_id,
         "window_start": bucket_start.isoformat(),
         "window_end": bucket_end.isoformat(),
         "mood_label": compiled["mood_label"] if compiled else None,
         "emoji": compiled["emoji"] if compiled else None,
-    })
+    }
+    try:
+        from emotional_intelligence.ei_adapter import get_friend_relationship_insight
+        insight = get_friend_relationship_insight(user_id, friend_id)
+        if insight:
+            response["ei_relationship_insight"] = insight
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+
+    return jsonify(response)
 
 
 @app.route("/mood/history", methods=["GET"])
@@ -3823,7 +3840,15 @@ def chat():
     history = load_chat_context(cur, user_id, conversation_id) if conversation_id else []
 
     persona_context = build_persona_context(get_user_persona(cur, user_id))
-    messages = [{"role": "system", "content": build_chat_system_prompt(mode, persona_context)}]
+    chat_system_prompt = build_chat_system_prompt(mode, persona_context)
+    try:
+        from emotional_intelligence.ei_adapter import get_user_cognitive_context
+        ei_context = get_user_cognitive_context(user_id, question=prompt)
+        if ei_context:
+            chat_system_prompt = f"{chat_system_prompt}\n\n{ei_context}"
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+    messages = [{"role": "system", "content": chat_system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": current_turn_content})
 
@@ -3917,6 +3942,47 @@ def chat_global():
             matched = p
             break
 
+    ei_context = ""
+    try:
+        from emotional_intelligence.ei_adapter import get_friend_relationship_insight, get_user_cognitive_context
+        ei_context = get_user_cognitive_context(user_id, question=prompt)
+        if matched:
+            cur.execute(
+                "SELECT u.id FROM friendships f JOIN users u ON u.id = f.friend_id "
+                "WHERE f.user_id = %s AND lower(u.username) LIKE lower(%s)",
+                (user_id, f"%{matched['name']}%"),
+            )
+            friend_row = cur.fetchone()
+            if friend_row:
+                insight = get_friend_relationship_insight(user_id, friend_row["id"])
+                if insight:
+                    insight_text = (
+                        f"Relationship insight with {matched['name']}: trust={insight['trust_score']}, "
+                        f"conflict={insight['conflict_score']}, emotional_support={insight['emotional_support']}. "
+                        f"{insight['relationship_summary'] or ''}"
+                    )
+                    ei_context = f"{ei_context}\n\n{insight_text}" if ei_context else insight_text
+    except Exception:
+        ei_context = ""  # EI engine is optional and additive -- never affects this endpoint's own behavior
+
+    # Your own past observations about this person (from personality_notes,
+    # written by /analyze whenever they showed up as a speaker in one of
+    # YOUR conversations) -- this is your own recorded data, not anything
+    # pulled from the other person's own account, so it's safe to surface
+    # freely and doesn't depend on the emotional_intelligence flag at all.
+    personal_notes_context = ""
+    if matched:
+        cur.execute(
+            "SELECT observation FROM personality_notes WHERE profile_id = %s ORDER BY created_at DESC LIMIT 20",
+            (matched["id"],),
+        )
+        observations = [r["observation"] for r in cur.fetchall() if r["observation"]]
+        if observations:
+            personal_notes_context = (
+                f"What you've personally noted about {matched['name']} across your own past conversations:\n"
+                + "\n".join(f"- {o}" for o in observations)
+            )
+
     if matched:
         cur.execute(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
@@ -3932,7 +3998,7 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
-    if not conversations:
+    if not conversations and not ei_context and not personal_notes_context:
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -3948,8 +4014,14 @@ def chat_global():
     # follow-up-resolution role load_chat_context plays for /chat.
     history = load_global_chat_context(cur, user_id)
 
-    user_content = "\n\n---\n\n".join(blocks) + f"\n\n---\n\nUser question:\n{prompt}"
-    messages = [{"role": "system", "content": build_global_chat_system_prompt(persona_context, matched["name"] if matched else None)}]
+    transcripts_section = "\n\n---\n\n".join(blocks) if blocks else "(No saved conversation transcripts available.)"
+    if personal_notes_context:
+        transcripts_section = f"{personal_notes_context}\n\n---\n\n{transcripts_section}"
+    user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
+    global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched["name"] if matched else None)
+    if ei_context:
+        global_chat_system_prompt = f"{global_chat_system_prompt}\n\n{ei_context}"
+    messages = [{"role": "system", "content": global_chat_system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_content})
 
