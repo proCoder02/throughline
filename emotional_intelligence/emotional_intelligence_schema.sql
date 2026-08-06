@@ -214,6 +214,12 @@ CREATE TABLE IF NOT EXISTS emotional_intelligence.beliefs (
 CREATE INDEX IF NOT EXISTS idx_ei_beliefs_subject ON emotional_intelligence.beliefs (subject_id);
 CREATE INDEX IF NOT EXISTS idx_ei_beliefs_subject_topic ON emotional_intelligence.beliefs (subject_id, topic);
 CREATE INDEX IF NOT EXISTS idx_ei_beliefs_run ON emotional_intelligence.beliefs (analysis_run_id);
+-- ei_adapter.py full-text-searches this table by question relevance (see
+-- PRODUCTION_READINESS_ANALYSIS.md item 3) -- indexed rather than computing
+-- to_tsvector(...) fresh per row on every call.
+ALTER TABLE emotional_intelligence.beliefs ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(topic, '') || ' ' || coalesce(belief, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_ei_beliefs_search_tsv ON emotional_intelligence.beliefs USING GIN (search_tsv);
 
 -- ----------------------------------------------------------------------------
 -- facts -- SUBJECT-scoped.
@@ -237,6 +243,12 @@ CREATE INDEX IF NOT EXISTS idx_ei_facts_subject ON emotional_intelligence.facts 
 CREATE INDEX IF NOT EXISTS idx_ei_facts_subject_predicate ON emotional_intelligence.facts (subject_id, predicate);
 CREATE INDEX IF NOT EXISTS idx_ei_facts_subject_valid ON emotional_intelligence.facts (subject_id, valid_until);
 CREATE INDEX IF NOT EXISTS idx_ei_facts_run ON emotional_intelligence.facts (analysis_run_id);
+-- ei_adapter.py full-text-searches this table by question relevance (see
+-- PRODUCTION_READINESS_ANALYSIS.md item 3) -- indexed rather than computing
+-- to_tsvector(...) fresh per row on every call.
+ALTER TABLE emotional_intelligence.facts ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(predicate, '') || ' ' || coalesce(object, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_ei_facts_search_tsv ON emotional_intelligence.facts USING GIN (search_tsv);
 
 CREATE TABLE IF NOT EXISTS emotional_intelligence.fact_versions (
     id SERIAL PRIMARY KEY,
@@ -267,6 +279,12 @@ CREATE TABLE IF NOT EXISTS emotional_intelligence.preferences (
 );
 CREATE INDEX IF NOT EXISTS idx_ei_preferences_subject ON emotional_intelligence.preferences (subject_id, category);
 CREATE INDEX IF NOT EXISTS idx_ei_preferences_run ON emotional_intelligence.preferences (analysis_run_id);
+-- ei_adapter.py full-text-searches this table by question relevance (see
+-- PRODUCTION_READINESS_ANALYSIS.md item 3) -- indexed rather than computing
+-- to_tsvector(...) fresh per row on every call.
+ALTER TABLE emotional_intelligence.preferences ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(category, '') || ' ' || coalesce(item, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_ei_preferences_search_tsv ON emotional_intelligence.preferences USING GIN (search_tsv);
 
 -- ----------------------------------------------------------------------------
 -- personality_snapshots -- SUBJECT-scoped, batch (Big Five over time).
@@ -333,6 +351,12 @@ CREATE INDEX IF NOT EXISTS idx_ei_memories_subject ON emotional_intelligence.mem
 CREATE INDEX IF NOT EXISTS idx_ei_memories_subject_importance ON emotional_intelligence.memories (subject_id, importance DESC)
     WHERE archived = FALSE;
 CREATE INDEX IF NOT EXISTS idx_ei_memories_run ON emotional_intelligence.memories (analysis_run_id);
+-- ei_adapter.py full-text-searches this table by question relevance (see
+-- PRODUCTION_READINESS_ANALYSIS.md item 3) -- indexed rather than computing
+-- to_tsvector(...) fresh per row on every call.
+ALTER TABLE emotional_intelligence.memories ADD COLUMN IF NOT EXISTS search_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(summary, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_ei_memories_search_tsv ON emotional_intelligence.memories USING GIN (search_tsv);
 
 -- ----------------------------------------------------------------------------
 -- transcript / transcript_scenes / transcript_speakers /
