@@ -20,6 +20,8 @@ import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 
+from ei_adapter import _count_table, _search_table
+
 load_dotenv()
 
 DB_URL = os.getenv("DATABASE_URL")
@@ -42,11 +44,20 @@ def call_llm(messages: list[dict]) -> str:
     return response.json().get("message", {}).get("content", "")
 
 
-def fetch_subject_persona(cur, subject_name: str) -> dict:
+def fetch_subject_persona(cur, subject_name: str, question: str | None = None) -> dict:
     """Raw structured persona data for one subject -- the single source of
     truth both assemble_cognitive_memory() (text, for the LLM) and the
     /api/persona JSON endpoint (chat_server.py) build on, so the two never
-    drift out of sync with separate queries."""
+    drift out of sync with separate queries.
+
+    question is optional and defaults to None, which reproduces the
+    original plain-recency behavior exactly -- the /api/persona JSON
+    endpoint calls this with no question (it means "show me everything"),
+    so that path is unaffected. When a real question is passed (from
+    assemble_cognitive_memory, in turn from an actual chat message), each
+    table is searched via ei_adapter.py's shared _search_table() instead,
+    so relevant-but-not-recent rows (a preference weighted higher but
+    entered earlier, say) aren't silently dropped by a fixed cutoff."""
     cur.execute("SELECT id, canonical_name FROM emotional_intelligence.subjects WHERE lower(canonical_name) = %s",
                 (subject_name.strip().lower(),))
     row = cur.fetchone()
@@ -54,33 +65,20 @@ def fetch_subject_persona(cur, subject_name: str) -> dict:
         raise SystemExit(f"No subject found matching {subject_name!r}. Check emotional_intelligence.subjects.canonical_name.")
     subject_id, canonical_name = row["id"], row["canonical_name"]
 
-    cur.execute(
-        "SELECT predicate, object, confidence FROM emotional_intelligence.facts "
-        "WHERE subject_id = %s ORDER BY created_at DESC LIMIT 20",
-        (subject_id,),
-    )
-    facts = cur.fetchall()
+    facts = _search_table(cur, "facts", subject_id, question,
+                           "predicate, object, confidence", "created_at DESC", 20, tiebreak_col="confidence")
+    preferences = _search_table(cur, "preferences", subject_id, question,
+                                 "category, item, weight", "updated_at DESC", 15, tiebreak_col="weight")
+    beliefs = _search_table(cur, "beliefs", subject_id, question,
+                             "topic, belief, confidence", "created_at DESC", 15, tiebreak_col="confidence")
+    memories = _search_table(cur, "memories", subject_id, question,
+                              "summary, emotion, importance", "importance DESC NULLS LAST", 10,
+                              extra_where="archived = FALSE", tiebreak_col="importance")
 
-    cur.execute(
-        "SELECT category, item, weight FROM emotional_intelligence.preferences "
-        "WHERE subject_id = %s ORDER BY updated_at DESC LIMIT 15",
-        (subject_id,),
-    )
-    preferences = cur.fetchall()
-
-    cur.execute(
-        "SELECT topic, belief, confidence FROM emotional_intelligence.beliefs "
-        "WHERE subject_id = %s ORDER BY created_at DESC LIMIT 15",
-        (subject_id,),
-    )
-    beliefs = cur.fetchall()
-
-    cur.execute(
-        "SELECT summary, emotion, importance FROM emotional_intelligence.memories "
-        "WHERE subject_id = %s AND archived = FALSE ORDER BY importance DESC NULLS LAST LIMIT 10",
-        (subject_id,),
-    )
-    memories = cur.fetchall()
+    total_facts = _count_table(cur, "facts", subject_id)
+    total_preferences = _count_table(cur, "preferences", subject_id)
+    total_beliefs = _count_table(cur, "beliefs", subject_id)
+    total_memories = _count_table(cur, "memories", subject_id, extra_where="archived = FALSE")
 
     cur.execute(
         "SELECT openness, conscientiousness, extraversion, agreeableness, neuroticism, confidence "
@@ -108,28 +106,42 @@ def fetch_subject_persona(cur, subject_name: str) -> dict:
         "preferences": [dict(r) for r in preferences],
         "beliefs": [dict(r) for r in beliefs],
         "memories": [dict(r) for r in memories],
+        "total_facts": total_facts,
+        "total_preferences": total_preferences,
+        "total_beliefs": total_beliefs,
+        "total_memories": total_memories,
         "personality": dict(personality) if personality else None,
         "relationships": [dict(r) for r in relationships],
     }
 
 
-def assemble_cognitive_memory(cur, subject_name: str) -> tuple[str, dict]:
-    persona = fetch_subject_persona(cur, subject_name)
+def assemble_cognitive_memory(cur, subject_name: str, question: str | None = None) -> tuple[str, dict]:
+    persona = fetch_subject_persona(cur, subject_name, question)
     canonical_name = persona["canonical_name"]
 
-    lines = [f"=== Cognitive memory: {canonical_name} ==="]
-    lines.append(f"\nFacts ({len(persona['facts'])}):")
+    lines = [
+        f"=== Cognitive memory: {canonical_name} ===",
+        "(Each section below is labeled 'showing X of Y total' -- Y is the TRUE total count; X is "
+        "just how many of the most relevant ones are listed. For any question about quantity or "
+        "frequency, always use the TRUE TOTAL, never the number of items actually listed below, "
+        "which is only a relevance-filtered sample.)",
+    ]
+    lines.append(f"\nFacts (showing {len(persona['facts'])} of {persona['total_facts']} total):")
     for f in persona["facts"]:
         lines.append(f"- {canonical_name} {f['predicate']} {f['object']} (confidence={f['confidence']})")
-    lines.append(f"\nRecurring preferences/tastes -- general likes, NOT tied to one moment ({len(persona['preferences'])}):")
+    lines.append(
+        f"\nRecurring preferences/tastes -- general likes, NOT tied to one moment "
+        f"(showing {len(persona['preferences'])} of {persona['total_preferences']} total):"
+    )
     for p in persona["preferences"]:
         lines.append(f"- {p['category']}: {p['item']} (weight={p['weight']})")
-    lines.append(f"\nBeliefs ({len(persona['beliefs'])}):")
+    lines.append(f"\nBeliefs (showing {len(persona['beliefs'])} of {persona['total_beliefs']} total):")
     for b in persona["beliefs"]:
         lines.append(f"- On {b['topic']}: {b['belief']} (confidence={b['confidence']})")
     lines.append(
         f"\nNotable one-time memories -- specific past moments, each with its OWN emotion tag "
-        f"(importance = how significant, independent of whether the emotion is positive) ({len(persona['memories'])}):"
+        f"(importance = how significant, independent of whether the emotion is positive) "
+        f"(showing {len(persona['memories'])} of {persona['total_memories']} total):"
     )
     for m in persona["memories"]:
         lines.append(f"- {m['summary']} (emotion={m['emotion']}, importance={m['importance']})")
@@ -151,14 +163,16 @@ def assemble_cognitive_memory(cur, subject_name: str) -> tuple[str, dict]:
         )
 
     stats = {
-        "facts": len(persona["facts"]), "preferences": len(persona["preferences"]),
-        "beliefs": len(persona["beliefs"]), "memories": len(persona["memories"]),
+        "facts": len(persona["facts"]), "facts_total": persona["total_facts"],
+        "preferences": len(persona["preferences"]), "preferences_total": persona["total_preferences"],
+        "beliefs": len(persona["beliefs"]), "beliefs_total": persona["total_beliefs"],
+        "memories": len(persona["memories"]), "memories_total": persona["total_memories"],
         "has_personality": bool(personality), "relationships": len(persona["relationships"]),
     }
     return "\n".join(lines), stats
 
 
-def assemble_multi_subject_memory(cur, subject_names: list[str]) -> tuple[str, dict]:
+def assemble_multi_subject_memory(cur, subject_names: list[str], question: str | None = None) -> tuple[str, dict]:
     """Multi-subject variant -- concatenates each subject's own memory block
     so a question spanning two people (e.g. comparing them, asking about
     their relationship) has both sides available. Each subject's memory
@@ -170,7 +184,7 @@ def assemble_multi_subject_memory(cur, subject_names: list[str]) -> tuple[str, d
     blocks = []
     combined_stats = {}
     for name in subject_names:
-        block, stats = assemble_cognitive_memory(cur, name)
+        block, stats = assemble_cognitive_memory(cur, name, question)
         blocks.append(block)
         combined_stats[name] = stats
     return "\n\n".join(blocks), combined_stats
@@ -207,9 +221,9 @@ def main() -> int:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         if len(args.subject) == 1:
-            memory_block, stats = assemble_cognitive_memory(cur, args.subject[0])
+            memory_block, stats = assemble_cognitive_memory(cur, args.subject[0], args.question)
         else:
-            memory_block, stats = assemble_multi_subject_memory(cur, args.subject)
+            memory_block, stats = assemble_multi_subject_memory(cur, args.subject, args.question)
     finally:
         cur.close()
         conn.close()
