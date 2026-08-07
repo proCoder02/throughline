@@ -20,7 +20,7 @@ import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 
-from ei_adapter import _count_table, _search_table
+from ei_adapter import NOT_EXPIRED, _count_table, _search_table
 
 load_dotenv()
 
@@ -66,7 +66,8 @@ def fetch_subject_persona(cur, subject_name: str, question: str | None = None) -
     subject_id, canonical_name = row["id"], row["canonical_name"]
 
     facts = _search_table(cur, "facts", subject_id, question,
-                           "predicate, object, confidence", "created_at DESC", 20, tiebreak_col="confidence")
+                           "predicate, object, confidence", "created_at DESC", 20, tiebreak_col="confidence",
+                           extra_where=NOT_EXPIRED)
     preferences = _search_table(cur, "preferences", subject_id, question,
                                  "category, item, weight", "updated_at DESC", 15, tiebreak_col="weight")
     beliefs = _search_table(cur, "beliefs", subject_id, question,
@@ -75,7 +76,7 @@ def fetch_subject_persona(cur, subject_name: str, question: str | None = None) -
                               "summary, emotion, importance", "importance DESC NULLS LAST", 10,
                               extra_where="archived = FALSE", tiebreak_col="importance")
 
-    total_facts = _count_table(cur, "facts", subject_id)
+    total_facts = _count_table(cur, "facts", subject_id, extra_where=NOT_EXPIRED)
     total_preferences = _count_table(cur, "preferences", subject_id)
     total_beliefs = _count_table(cur, "beliefs", subject_id)
     total_memories = _count_table(cur, "memories", subject_id, extra_where="archived = FALSE")

@@ -19,11 +19,23 @@ apply (REASONING_SYSTEM_PROMPT's caveats about not inventing shared history
 don't apply here since this prompt is separate, but the same discipline of
 "ground it in what's actually there" is carried over).
 
-Idempotent: skips pairs already in relationship_profiles.
+Re-assesses over time, not just once: a pair already in relationship_profiles
+re-qualifies once >= MIN_NEW_DATA new facts/beliefs/memories have
+accumulated for either subject since that pair's last assessment. Unlike
+personality_snapshots, relationship_profiles has a UNIQUE(subject_a,
+subject_b) constraint -- it holds one current-state row per pair, not a
+timeline -- so a re-assessment UPDATEs that row (refreshing trust/conflict/
+emotional_support/communication_frequency/shared_topics/updated_at) rather
+than inserting a new one. A genuine per-pair history would need a schema
+change (e.g. a relationship_profile_versions table, mirroring
+fact_versions); out of scope here since other code (ei_adapter.py's
+get_friend_relationship_insight) reads this table expecting exactly one
+row per pair.
 
 Usage:
     python relationship_batch.py
     python relationship_batch.py --min-shared-episodes 15   # narrower scope
+    python relationship_batch.py --min-new-data 10          # require more new data before refreshing
 """
 from __future__ import annotations
 
@@ -89,9 +101,33 @@ def fetch_qualifying_subjects(cur, min_data: int) -> list[dict]:
     return [dict(row) for row in cur.fetchall() if row["total"] >= min_data]
 
 
-def fetch_existing_pairs(cur) -> set[tuple[int, int]]:
-    cur.execute("SELECT subject_a, subject_b FROM emotional_intelligence.relationship_profiles")
-    return {(row["subject_a"], row["subject_b"]) for row in cur.fetchall()}
+def fetch_existing_pairs(cur) -> dict[tuple[int, int], object]:
+    """(subject_a, subject_b) -> when that pair was last assessed (via the
+    linked analysis_run's created_at), so main() can tell a genuinely new
+    pair apart from one that's just due for a refresh."""
+    cur.execute(
+        """
+        SELECT rp.subject_a, rp.subject_b, r.created_at
+        FROM emotional_intelligence.relationship_profiles rp
+        LEFT JOIN emotional_intelligence.analysis_runs r ON r.id = rp.analysis_run_id
+        """
+    )
+    return {(row["subject_a"], row["subject_b"]): row["created_at"] for row in cur.fetchall()}
+
+
+def count_new_data_since(cur, subject_id: int, since) -> int:
+    if since is None:
+        return 0
+    cur.execute(
+        """
+        SELECT
+            (SELECT count(*) FROM emotional_intelligence.facts f WHERE f.subject_id=%(id)s AND f.created_at > %(since)s) +
+            (SELECT count(*) FROM emotional_intelligence.beliefs b WHERE b.subject_id=%(id)s AND b.created_at > %(since)s) +
+            (SELECT count(*) FROM emotional_intelligence.memories m WHERE m.subject_id=%(id)s AND m.created_at > %(since)s) AS n
+        """,
+        {"id": subject_id, "since": since},
+    )
+    return cur.fetchone()["n"]
 
 
 def compute_shared_topics(cur, episode_ids_text: set[str], limit: int = 5) -> list[str]:
@@ -150,6 +186,15 @@ def process_pair(cur, subject_a: dict, subject_b: dict, shared_episode_ids: set[
             (subject_a, subject_b, analysis_run_id, trust_score, communication_frequency,
              conflict_score, emotional_support, shared_topics, relationship_summary)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (subject_a, subject_b) DO UPDATE SET
+            analysis_run_id = EXCLUDED.analysis_run_id,
+            trust_score = EXCLUDED.trust_score,
+            communication_frequency = EXCLUDED.communication_frequency,
+            conflict_score = EXCLUDED.conflict_score,
+            emotional_support = EXCLUDED.emotional_support,
+            shared_topics = EXCLUDED.shared_topics,
+            relationship_summary = EXCLUDED.relationship_summary,
+            updated_at = now()
         """,
         (
             a, b, run_id,
@@ -164,6 +209,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate relationship_profiles for qualifying subject pairs.")
     parser.add_argument("--min-data", type=int, default=5, help="Minimum combined facts+beliefs+memories per subject to qualify.")
     parser.add_argument("--min-shared-episodes", type=int, default=10, help="Minimum co-occurring episodes for a pair to qualify.")
+    parser.add_argument("--min-new-data", type=int, default=5, help="Minimum NEW facts+beliefs+memories (either subject) since last assessment to qualify a refresh of an existing pair.")
     parser.add_argument("--limit", type=int, default=0, help="Max pairs to process (0 = all qualifying).")
     args = parser.parse_args()
 
@@ -177,18 +223,23 @@ def main() -> int:
 
         subjects = fetch_qualifying_subjects(cur, args.min_data)
         subj_episodes = fetch_subject_episode_sets(cur)
-        existing = fetch_existing_pairs(cur)
+        existing = fetch_existing_pairs(cur)  # (a, b) -> last assessed at (or None)
 
         candidates = []
         for i in range(len(subjects)):
             for j in range(i + 1, len(subjects)):
                 sa, sb = subjects[i], subjects[j]
                 a, b = sorted([sa["id"], sb["id"]])
-                if (a, b) in existing:
-                    continue
                 shared = subj_episodes.get(sa["id"], set()) & subj_episodes.get(sb["id"], set())
-                if len(shared) >= args.min_shared_episodes:
-                    candidates.append((sa, sb, shared))
+                if len(shared) < args.min_shared_episodes:
+                    continue
+                last_at = existing.get((a, b), "not_existing")
+                if last_at == "not_existing":
+                    candidates.append((sa, sb, shared, "new"))
+                    continue
+                new_data = count_new_data_since(cur, a, last_at) + count_new_data_since(cur, b, last_at)
+                if new_data >= args.min_new_data:
+                    candidates.append((sa, sb, shared, f"refresh, {new_data} new since last"))
         candidates.sort(key=lambda c: len(c[2]), reverse=True)
         if args.limit:
             candidates = candidates[: args.limit]
@@ -196,8 +247,8 @@ def main() -> int:
         print(f"pairs_to_process={len(candidates)}")
 
         succeeded, failed = 0, 0
-        for sa, sb, shared in candidates:
-            print(f"--- {sa['canonical_name']} <-> {sb['canonical_name']} (shared_episodes={len(shared)}) ---")
+        for sa, sb, shared, kind in candidates:
+            print(f"--- {sa['canonical_name']} <-> {sb['canonical_name']} (shared_episodes={len(shared)}, {kind}) ---")
             try:
                 result = process_pair(cur, sa, sb, shared, total_episodes)
                 if result["status"] == "success":

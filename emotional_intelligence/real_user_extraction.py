@@ -48,7 +48,7 @@ EXTRACTION_PROMPT = """You are extracting structured cognitive memory about ONE 
 Transcript owner: {owner_label}
 
 From what the owner says, does, or reveals about themselves, extract:
-- facts: durable factual statements about the owner (predicate/object pairs) -- job, plans, relationships, possessions.
+- facts: durable factual statements about the owner (predicate/object pairs) -- job, plans, relationships, possessions. NEVER use a bare relative time word ("today"/"tomorrow"/"tonight"/"yesterday") as the object -- a fact is read back as still true indefinitely, so "needs to pick up X tomorrow" said once becomes a stale, misleading claim on every future day it's read. If the detail is genuinely time-bound like that, put it in "memories" instead (a memory is inherently a past moment, not an ongoing claim), or state the durable part only and drop the relative-time word.
 - preferences: recurring tastes/likes attributed to the owner (category/item), NOT one-off mentions.
 - beliefs: opinions or beliefs the owner expresses (topic/belief).
 - memories: notable one-time events involving the owner, each with an emotion and importance (0.0-1.0).
