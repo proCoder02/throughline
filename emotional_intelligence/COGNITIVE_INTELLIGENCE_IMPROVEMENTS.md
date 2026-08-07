@@ -40,7 +40,7 @@ snapshots").
 
 ---
 
-## 2. No semantic (embedding-based) retrieval yet
+## 2. No semantic (embedding-based) retrieval yet  (pg_vector embedding required on production)
 
 Full-text search (fixed this session — see `ei_adapter.py`'s `_search_table`)
 works on shared keywords via Postgres `websearch_to_tsquery`. It correctly
