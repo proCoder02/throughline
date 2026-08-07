@@ -4,16 +4,33 @@ schedule (Windows Task Scheduler, cron, etc.) twice a day so new
 conversations get folded into emotional_intelligence as they accumulate,
 matching the original "runs twice/thrice a day" production design.
 
-Runs three stages in sequence, each a subprocess call to the existing,
+Runs five stages in sequence, each a subprocess call to the existing,
 already-tested script -- this file doesn't duplicate any extraction logic,
 so a fix to any one stage's script doesn't need a matching fix here:
 
-  1. real_user_extraction.py  -- facts/preferences/beliefs/memories from
-     each user's own new conversations. Works for real users today.
-  2. personality_batch.py     -- Big Five snapshot per qualifying subject.
+  1. real_user_extraction.py     -- facts/preferences/beliefs/memories from
+     each user's own new DICTATED conversations. Works for real users today.
+  2. chat_feedback_extraction.py -- facts/corrections from each user's own
+     new CHAT messages (the feedback loop: a correction typed into chat,
+     e.g. "actually Emma is my niece, not my daughter", was previously
+     never captured anywhere -- only dictated conversations were ever read).
+     Resolves corrections itself, directly: it full-text-searches the
+     subject's own existing facts for ones the new message might contradict
+     and asks the LLM to mark supersedes_fact_id explicitly. (The first
+     version of this deferred that to fact_dedup.py's bulk clustering --
+     tested against a real correction and it missed it twice, even after
+     fixing the extracted wording, because bulk-clustering ~100 facts at
+     once isn't reliable for spotting one specific contradiction. Targeted,
+     small-context supersession is what actually works.)
+  3. fact_dedup.py               -- still runs after, for the thing it's
+     actually good at: consolidating near-duplicate wordings of the same
+     fact across many independent observations (proven on the Friends
+     corpus -- e.g. ten separately-extracted "engaged_to: Monica" mentions
+     merged into one canonical fact). Not relied on for corrections anymore.
+  4. personality_batch.py        -- Big Five snapshot per qualifying subject.
      Its qualifying query is generic (facts+beliefs+memories count, no
      Friends-specific dependency), so it genuinely works for real users too.
-  3. relationship_batch.py    -- trust/conflict/support per qualifying pair.
+  5. relationship_batch.py       -- trust/conflict/support per qualifying pair.
      NOTE: its co-occurrence logic (fetch_subject_episode_sets) is built
      entirely on Friends-transcript tables (speaker_aliases +
      episode_speaker_transcript), which real users have zero rows in. This
@@ -87,7 +104,15 @@ def main() -> int:
     with open(log_path, "a", encoding="utf-8") as log_file:
         log_file.write(f"\n{'=' * 70}\nrun begins {datetime.now().isoformat()}\n")
 
+        chat_feedback_cmd = [sys.executable, str(HERE / "chat_feedback_extraction.py")]
+        if args.user_id is not None:
+            chat_feedback_cmd += ["--user-id", str(args.user_id)]
+
         exit_codes["extraction"] = run_stage("real_user_extraction", extraction_cmd, log_file)
+        exit_codes["chat_feedback"] = run_stage("chat_feedback_extraction", chat_feedback_cmd, log_file)
+        exit_codes["fact_dedup"] = run_stage(
+            "fact_dedup", [sys.executable, str(HERE / "fact_dedup.py")], log_file
+        )
         exit_codes["personality"] = run_stage(
             "personality_batch", [sys.executable, str(HERE / "personality_batch.py")], log_file
         )
