@@ -94,7 +94,26 @@
       "Bash(xxd)",
       "Bash(.venv/Scripts/pip.exe show *)",
       "Bash(.venv/Scripts/python.exe C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/verify_post_merge.py)",
-      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'DELETE FROM users WHERE id = 32;')"
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'DELETE FROM users WHERE id = 32;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT id, subject, predicate, object, supersedes_fact_id, created_at FROM facts WHERE user_id = 33 AND \\(subject ILIKE '\\\\''%emma%'\\\\'' OR object ILIKE '\\\\''%emma%'\\\\''\\) ORDER BY created_at DESC;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c '\\\\d facts')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT id, subject, predicate, object, valid_from, valid_until, source, created_at FROM facts WHERE user_id = 33 AND \\(subject ILIKE '\\\\''%emma%'\\\\'' OR object ILIKE '\\\\''%emma%'\\\\''\\) ORDER BY created_at DESC;')",
+      "Bash(.venv/Scripts/python.exe run_daily_ei_pipeline.py --user-id 33)",
+      "Bash(awk '/stage: chat_feedback_extraction/,/stage: fact_dedup/' c:/Users/P3INW57/Desktop/speech2text/emotional_intelligence/logs/ei_pipeline_2026-08-08.log)",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT id, subject, predicate, object, created_at FROM facts WHERE user_id = 33 AND \\(subject ILIKE '\\\\''%emma%'\\\\'' OR object ILIKE '\\\\''%emma%'\\\\''\\);')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c '\\\\d beliefs')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT * FROM beliefs WHERE user_id = 33 AND \\(subject ILIKE '\\\\''%emma%'\\\\'' OR belief_text ILIKE '\\\\''%emma%'\\\\''\\);')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT topic, belief, created_at FROM beliefs WHERE user_id = 33 AND \\(topic ILIKE '\\\\''%emma%'\\\\'' OR belief ILIKE '\\\\''%emma%'\\\\''\\);')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c '\\\\dt')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c '\\\\d preferences')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT * FROM preferences WHERE user_id = 33 ORDER BY updated_at DESC LIMIT 5;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c '\\\\dt emotional_intelligence.*')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT * FROM emotional_intelligence.subjects WHERE user_id = 33;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT * FROM emotional_intelligence.app_user_subject_links WHERE user_id = 33;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT id, predicate, object, confidence, source, created_at FROM emotional_intelligence.facts WHERE subject_id = 582 AND \\(predicate ILIKE '\\\\''%emma%'\\\\'' OR object ILIKE '\\\\''%emma%'\\\\''\\) ORDER BY created_at DESC;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT fv.id, fv.predicate, fv.object, fv.superseded_at FROM emotional_intelligence.fact_versions fv WHERE fv.predicate ILIKE '\\\\''%emma%'\\\\'' OR fv.object ILIKE '\\\\''%emma%'\\\\'' ORDER BY fv.superseded_at DESC LIMIT 5;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT category, item, weight, confidence, updated_at FROM emotional_intelligence.preferences WHERE subject_id = 582 ORDER BY updated_at DESC LIMIT 5;')",
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c ' *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\P3INW57\\Desktop\\throughline"
