@@ -185,6 +185,42 @@ def cache_delete(*keys):
         print(f"[redis] DELETE {keys} failed: {e!r}")
 
 
+EI_RECENT_STATEMENTS_TTL = 86400  # 24 hours -- covers the gap until the
+# twice-daily/once-daily scheduled batch has definitely had a chance to run
+# and write the permanent fact, not just the much-faster real-time trigger.
+
+
+def remember_ei_recent_statement(user_id, text):
+    """A cheap, LLM-free bridge for the EI feedback loop: the background
+    fact-extraction thread (ei_adapter.trigger_chat_feedback_extraction)
+    can take several seconds and only ever updates the ONE conversation
+    thread it ran for; a correction typed in /chat wouldn't be visible to
+    a follow-up asked in /chat/global (a different message history) until
+    that background write lands. This caches the user's own raw statement,
+    keyed by user_id (not conversation_id), so ANY chat surface for that
+    user can see it immediately -- no extraction LLM call needed for that,
+    since ei_adapter.py just hands the raw text to the reasoning call and
+    lets it read the statement directly, same as it already does with the
+    current turn's own message. Purely additive: Redis being unreachable
+    just means this cache is empty, never an error."""
+    if not (text or "").strip():
+        return
+    try:
+        from emotional_intelligence.ei_adapter import is_closing_acknowledgment
+        if is_closing_acknowledgment(text):
+            return  # "ok"/"cool"/"thanks" etc. -- nothing worth remembering
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+    key = f"ei_recent_statements:{user_id}"
+    existing = cache_get_json(key) or []
+    existing.append(text.strip())
+    cache_set_json(key, existing[-5:], ttl=EI_RECENT_STATEMENTS_TTL)
+
+
+def get_ei_recent_statements(user_id):
+    return cache_get_json(f"ei_recent_statements:{user_id}") or []
+
+
 def dict_cursor(conn):
     """RealDictCursor gives dict-style row access (row['email']), the
     equivalent of sqlite3.Row from the old version."""
@@ -3509,6 +3545,14 @@ CHAT_FORMATTING_GUIDANCE = (
     "answer as plain prose instead of forcing it into a list."
 )
 
+CHAT_CLOSING_GUIDANCE = (
+    "If the user's message is just a brief closing acknowledgment (\"ok\", \"cool\", \"thanks\", "
+    "\"got it\", \"sounds good\", and similar) rather than a question or new statement, don't treat "
+    "it as an opening to keep going -- no follow-up questions, no extra elaboration, no summarizing "
+    "what was just discussed. Give a short, warm acknowledgment (a few words) and let the "
+    "conversation rest there."
+)
+
 
 def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
     base = (
@@ -3522,6 +3566,7 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_co
         "clarification when it's inferable from context. "
         + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
         + " " + CHAT_FORMATTING_GUIDANCE
+        + " " + CHAT_CLOSING_GUIDANCE
     )
     return base + (f" {persona_context}" if persona_context else "")
 
@@ -3539,7 +3584,7 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
         "continuous conversation. Ground your answer only in what's in these excerpts; if the "
         "answer isn't there, say so briefly rather than guessing. Be concise, no preamble. "
-        + CHAT_FORMATTING_GUIDANCE
+        + CHAT_FORMATTING_GUIDANCE + " " + CHAT_CLOSING_GUIDANCE
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
@@ -3843,7 +3888,9 @@ def chat():
     chat_system_prompt = build_chat_system_prompt(mode, persona_context)
     try:
         from emotional_intelligence.ei_adapter import get_user_cognitive_context
-        ei_context = get_user_cognitive_context(user_id, question=prompt)
+        ei_context = get_user_cognitive_context(
+            user_id, question=prompt, recent_statements=get_ei_recent_statements(user_id)
+        )
         if ei_context:
             chat_system_prompt = f"{chat_system_prompt}\n\n{ei_context}"
     except Exception:
@@ -3851,6 +3898,8 @@ def chat():
     messages = [{"role": "system", "content": chat_system_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": current_turn_content})
+
+    remember_ei_recent_statement(user_id, prompt)
 
     try:
         reply = call_llm(messages)
@@ -3879,6 +3928,13 @@ def chat():
         append_chat_messages(cur, user_id, conversation_id, prompt, reply)
         db.commit()
         push_notification(user_id, {"type": "chat_message", "conversation_id": conversation_id})
+
+    try:
+        from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior, and this
+              # runs in the background after the reply below is already on its way -- never blocks the user.
 
     return jsonify({"reply": reply})
 
@@ -3942,10 +3998,14 @@ def chat_global():
             matched = p
             break
 
+    remember_ei_recent_statement(user_id, prompt)
+
     ei_context = ""
     try:
         from emotional_intelligence.ei_adapter import get_friend_relationship_insight, get_user_cognitive_context
-        ei_context = get_user_cognitive_context(user_id, question=prompt)
+        ei_context = get_user_cognitive_context(
+            user_id, question=prompt, recent_statements=get_ei_recent_statements(user_id)
+        )
         if matched:
             cur.execute(
                 "SELECT u.id FROM friendships f JOIN users u ON u.id = f.friend_id "
@@ -4002,6 +4062,11 @@ def chat_global():
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
+        try:
+            from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
+        except Exception:
+            pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
         return jsonify({"reply": reply, "matched_speaker": None, "conversations_used": 0})
 
     blocks = []
@@ -4047,6 +4112,12 @@ def chat_global():
         # every turn already, so saving it too would duplicate it forever.
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
+
+    try:
+        from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
 
     return jsonify({
         "reply": reply,

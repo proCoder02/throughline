@@ -35,6 +35,24 @@ def is_enabled() -> bool:
     return os.getenv("EMOTIONAL_INTELLIGENCE_ENABLED", "false").strip().lower() == "true"
 
 
+# Bare closing acknowledgments ("ok", "cool", "thanks") carry no extractable
+# information -- every one of them was still triggering a full extraction
+# LLM call and getting cached as a "recent statement", pure waste. Matched
+# as an EXACT match on the whole (normalized) message, not a substring --
+# "ok but I also wanted to ask..." must NOT match, only a message that IS
+# just the acknowledgment, nothing else.
+_CLOSING_ACKNOWLEDGMENTS = {
+    "ok", "okay", "k", "kk", "cool", "nice", "great", "awesome", "perfect",
+    "thanks", "thank you", "thx", "ty", "got it", "gotcha", "noted",
+    "sounds good", "alright", "understood", "fine", "good", "yep", "yup",
+    "sure", "bet", "np", "no problem", "welcome", "cheers",
+}
+
+
+def is_closing_acknowledgment(text: str) -> bool:
+    return (text or "").strip().lower().rstrip(".!?,;: ") in _CLOSING_ACKNOWLEDGMENTS
+
+
 # facts.valid_until exists in the schema specifically for this, but nothing
 # ever read it before -- a fact like "birthday: today" or "quitting_job:
 # tomorrow", extracted from one line of dialogue, was read back literally
@@ -225,7 +243,8 @@ def _count_table(cur, table: str, subject_id: int, extra_where: str = "") -> int
         return row["cnt"]
 
 
-def get_user_cognitive_context(user_id, question: str | None = None) -> str:
+def get_user_cognitive_context(user_id, question: str | None = None,
+                                recent_statements: list[str] | None = None) -> str:
     """Extra system-prompt text for app.py's /analyze, /chat, and
     /chat/global calls, built from this user's EI cognitive memory if a
     matching subject exists. Passing the user's actual question lets each
@@ -233,17 +252,38 @@ def get_user_cognitive_context(user_id, question: str | None = None) -> str:
     "has_child: Emma" even if that fact is one of a hundred, buried outside
     any fixed recency cutoff); omit it (as /analyze does -- there's no
     natural question there) to fall back to plain recency. Returns "" if
-    disabled, no subject yet, or on any failure -- callers append this
-    directly to their existing prompt string; no other change required."""
+    disabled, no subject yet AND no recent_statements, or on any failure --
+    callers append this directly to their existing prompt string; no other
+    change required.
+
+    recent_statements is app.py's cheap, LLM-free bridge (see
+    remember_ei_recent_statement there): the background fact-extraction
+    thread can take several seconds and only ever updates the ONE
+    conversation thread it ran for, so a correction typed in /chat
+    wouldn't be visible to a follow-up asked in /chat/global (a different
+    message history) until that write actually lands. These are the raw,
+    not-yet-processed statements, shown ahead of and explicitly trusted
+    over the structured sections below, which can lag behind by design."""
     if not is_enabled() or not user_id:
         return ""
+
+    recent_lines = []
+    if recent_statements:
+        recent_lines = [
+            "\nWhat this user said very recently, in this or another active session, not yet folded "
+            "into the structured sections below (that takes a short while to process in the "
+            "background) -- TRUST THESE over the structured facts/preferences/beliefs/memories below "
+            "if they conflict, since these are strictly more current:"
+        ]
+        recent_lines += [f"- {s}" for s in recent_statements]
+
     try:
         conn = _connect()
         try:
             cur = conn.cursor()
             subject_id = _resolve_subject_id(cur, user_id)
             if subject_id is None:
-                return ""
+                return "\n".join(recent_lines) if recent_lines else ""
 
             facts = _search_table(cur, "facts", subject_id, question,
                                    "predicate, object", "created_at DESC", 15, tiebreak_col="confidence",
@@ -263,12 +303,13 @@ def get_user_cognitive_context(user_id, question: str | None = None) -> str:
             _release(conn)
     except Exception as exc:
         _log_failure("get_user_cognitive_context", exc)
-        return ""
+        return "\n".join(recent_lines) if recent_lines else ""
 
     if not facts and not preferences and not beliefs and not memories:
-        return ""
+        return "\n".join(recent_lines) if recent_lines else ""
 
-    lines = [
+    lines = list(recent_lines)
+    lines += [
         "Additional context -- this user's own accumulated cognitive memory "
         "(facts, preferences, beliefs, and memories extracted from their past conversations). "
         "Each section is labeled 'showing X of Y total' -- Y is the TRUE total count; X is just "
@@ -336,3 +377,65 @@ def get_friend_relationship_insight(user_id, friend_id) -> dict | None:
     except Exception as exc:
         _log_failure("get_friend_relationship_insight", exc)
         return None
+
+
+def trigger_chat_feedback_extraction(user_id, message_content) -> None:
+    """Fire-and-forget: call this from a background thread right AFTER
+    /chat or /chat/global has already sent its reply (same pattern app.py
+    already uses for run_background_analysis) -- so a correction typed in
+    chat (e.g. "actually Emma is my niece, not my daughter") lands in the
+    facts table within seconds, not on the next scheduled twice-daily
+    pipeline run. This is the ChatGPT-like piece: fast reply, near-instant
+    persistent memory, without adding latency to the user-facing response.
+
+    Tagged with a distinct run_type so it never advances chat_feedback_
+    extraction.py's own batch watermark -- see process_batch()'s docstring
+    for why that separation matters (a silently-failed real-time call must
+    never cause the scheduled batch to skip that message forever). The
+    tradeoff: a message this handles successfully also gets re-checked by
+    the next scheduled run -- redundant, not incorrect.
+
+    Never raises and never blocks -- this always runs after the chat
+    response has already been sent, so a failure here must never surface
+    to the user, and doing this for every chat message roughly doubles
+    the LLM call volume for chat traffic specifically (an extra
+    extraction check alongside every reply) -- a deliberate, known cost
+    for near-real-time correction, not an oversight. Bare closing
+    acknowledgments ("ok", "cool", "thanks") are the one case skipped
+    outright, before spending a call to learn they had nothing to extract."""
+    if not is_enabled() or not user_id or not (message_content or "").strip():
+        return
+    if is_closing_acknowledgment(message_content):
+        return
+    try:
+        import sys
+        from pathlib import Path
+
+        import psycopg2.extras
+
+        # Every other script in this folder bare-imports its siblings
+        # (e.g. "from real_user_extraction import ..."), which only
+        # resolves when this folder itself is on sys.path. That's true
+        # when ei_adapter.py is run/imported directly from inside this
+        # folder, but NOT when app.py imports it as the package-qualified
+        # "emotional_intelligence.ei_adapter" -- this is the first function
+        # in this file that needed a sibling import, which is what exposed
+        # this (confirmed: raised ModuleNotFoundError from within app.py's
+        # own process before this fix).
+        ei_folder = str(Path(__file__).resolve().parent)
+        if ei_folder not in sys.path:
+            sys.path.insert(0, ei_folder)
+
+        from chat_feedback_extraction import process_batch
+        from real_user_extraction import ensure_user_subject
+
+        conn = _connect()
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            subject_id = ensure_user_subject(cur, user_id)
+            process_batch(cur, subject_id, [{"content": message_content}],
+                           run_type="chat_feedback_extraction_realtime")
+        finally:
+            _release(conn)
+    except Exception as exc:
+        _log_failure("trigger_chat_feedback_extraction", exc)
