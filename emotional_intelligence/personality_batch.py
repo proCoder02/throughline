@@ -10,12 +10,19 @@ Scope: only subjects with >= MIN_DATA_POINTS combined facts+beliefs+memories
 threshold of 5, dominated by the 6 main cast plus real recurring characters
 -- thin-data subjects would just produce an unreliable/noisy estimate).
 
-Idempotent: only processes subjects without an existing personality_batch
-analysis_runs success row, same resume-safe pattern as extraction_pipeline.py.
+Re-snapshots over time, not just once: a subject with a prior successful
+snapshot re-qualifies once >= MIN_NEW_DATA new facts/beliefs/memories have
+accumulated since that snapshot's timestamp, producing a genuine timeline
+(personality_snapshots has no unique constraint on subject_id and is
+indexed (subject_id, created_at DESC) specifically for this -- the schema
+already anticipated multiple snapshots per subject, this was the first
+script to actually produce more than one). A subject who's never been
+snapshotted still only needs MIN_DATA_POINTS total, same as before.
 
 Usage:
     python personality_batch.py
     python personality_batch.py --min-data 10   # narrower scope
+    python personality_batch.py --min-new-data 10   # require more new data before re-snapshotting
 """
 from __future__ import annotations
 
@@ -50,25 +57,31 @@ Reply with ONLY this JSON, no preamble/fences:
 {"openness": 0.5, "conscientiousness": 0.5, "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5, "confidence": 0.5}"""
 
 
-def fetch_qualifying_subjects(cur, min_data: int, limit: int) -> list[dict]:
+def fetch_qualifying_subjects(cur, min_data: int, min_new_data: int, limit: int) -> list[dict]:
     cur.execute(
         """
-        WITH subject_totals AS (
-            SELECT s.id, s.canonical_name,
+        WITH last_snapshot AS (
+            SELECT subject_id, MAX(created_at) AS last_at
+            FROM emotional_intelligence.analysis_runs
+            WHERE run_type = 'personality_batch' AND status = 'success'
+            GROUP BY subject_id
+        ),
+        subject_totals AS (
+            SELECT s.id, s.canonical_name, ls.last_at,
                 (SELECT count(*) FROM emotional_intelligence.facts f WHERE f.subject_id=s.id) +
                 (SELECT count(*) FROM emotional_intelligence.beliefs b WHERE b.subject_id=s.id) +
-                (SELECT count(*) FROM emotional_intelligence.memories m WHERE m.subject_id=s.id) AS total
+                (SELECT count(*) FROM emotional_intelligence.memories m WHERE m.subject_id=s.id) AS total,
+                (SELECT count(*) FROM emotional_intelligence.facts f WHERE f.subject_id=s.id AND (ls.last_at IS NULL OR f.created_at > ls.last_at)) +
+                (SELECT count(*) FROM emotional_intelligence.beliefs b WHERE b.subject_id=s.id AND (ls.last_at IS NULL OR b.created_at > ls.last_at)) +
+                (SELECT count(*) FROM emotional_intelligence.memories m WHERE m.subject_id=s.id AND (ls.last_at IS NULL OR m.created_at > ls.last_at)) AS new_since_last
             FROM emotional_intelligence.subjects s
-            WHERE NOT EXISTS (
-                SELECT 1 FROM emotional_intelligence.analysis_runs r
-                WHERE r.subject_id = s.id AND r.run_type = 'personality_batch' AND r.status = 'success'
-            )
+            LEFT JOIN last_snapshot ls ON ls.subject_id = s.id
         )
-        SELECT id, canonical_name, total FROM subject_totals
-        WHERE total >= %s
-        ORDER BY total DESC
+        SELECT id, canonical_name, total, last_at, new_since_last FROM subject_totals
+        WHERE total >= %s AND (last_at IS NULL OR new_since_last >= %s)
+        ORDER BY (last_at IS NULL) DESC, new_since_last DESC
         """ + (f" LIMIT {int(limit)}" if limit else ""),
-        (min_data,),
+        (min_data, min_new_data),
     )
     return [dict(row) for row in cur.fetchall()]
 
@@ -117,7 +130,8 @@ def process_subject(cur, subject: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate personality_snapshots for qualifying subjects.")
-    parser.add_argument("--min-data", type=int, default=5, help="Minimum combined facts+beliefs+memories to qualify.")
+    parser.add_argument("--min-data", type=int, default=5, help="Minimum combined facts+beliefs+memories to qualify a first snapshot.")
+    parser.add_argument("--min-new-data", type=int, default=5, help="Minimum NEW facts+beliefs+memories since the last snapshot to qualify a re-snapshot.")
     parser.add_argument("--limit", type=int, default=0, help="Max subjects to process (0 = all qualifying).")
     args = parser.parse_args()
 
@@ -126,12 +140,13 @@ def main() -> int:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     try:
-        subjects = fetch_qualifying_subjects(cur, args.min_data, args.limit)
+        subjects = fetch_qualifying_subjects(cur, args.min_data, args.min_new_data, args.limit)
         print(f"subjects_to_process={len(subjects)}")
 
         succeeded, failed = 0, 0
         for subj in subjects:
-            print(f"--- {subj['canonical_name']} (data_points={subj['total']}) ---")
+            kind = "first snapshot" if subj["last_at"] is None else f"re-snapshot, {subj['new_since_last']} new since last"
+            print(f"--- {subj['canonical_name']} (data_points={subj['total']}, {kind}) ---")
             try:
                 result = process_subject(cur, subj)
                 if result["status"] == "success":

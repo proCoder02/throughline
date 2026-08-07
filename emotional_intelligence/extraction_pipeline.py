@@ -107,7 +107,7 @@ EXTRACTION_SCHEMA_PROMPT = """You are analyzing one episode transcript (a script
 8. "subjects": for EACH main character who has a distinct personality moment in this episode, one object:
    {
      "name": "character name exactly as it appears in the transcript",
-     "facts": [{"predicate": "", "object": "", "confidence": 0.0-1.0}]  // verifiable/stated life details, e.g. predicate="works_at", object="a museum"
+     "facts": [{"predicate": "", "object": "", "confidence": 0.0-1.0}]  // verifiable/stated life details, e.g. predicate="works_at", object="a museum" -- NEVER a bare relative time word ("today"/"tomorrow"/"tonight"/"yesterday") as the object; a fact is read back as still true indefinitely, so "birthday: today" said once becomes a false claim on every future day it's read. If the detail is genuinely time-bound like that, put it in "memories" instead (a memory is inherently a past moment, not an ongoing claim) or state the durable part only, without the relative-time word, and omit it entirely if there's no durable part.
      "preferences": [{"category": "", "item": "", "weight": 0.0-1.0}]  // stated/clearly implied likes/dislikes
      "beliefs": [{"topic": "", "belief": "", "confidence": 0.0-1.0}]  // stated opinions/stances, distinct from facts -- an opinion, not a verifiable detail
      "memories": [{"summary": "", "importance": 0.0-1.0, "emotion": ""}]  // distinct, notable episodic moments for this character, not a recap of the whole episode

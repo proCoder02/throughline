@@ -35,6 +35,16 @@ def is_enabled() -> bool:
     return os.getenv("EMOTIONAL_INTELLIGENCE_ENABLED", "false").strip().lower() == "true"
 
 
+# facts.valid_until exists in the schema specifically for this, but nothing
+# ever read it before -- a fact like "birthday: today" or "quitting_job:
+# tomorrow", extracted from one line of dialogue, was read back literally
+# on every single future day, forever (confirmed: Ross's real account,
+# merged with the TV subject, was telling the real user "it's your
+# birthday today" months after that fact was extracted). Every facts read
+# now excludes anything past its valid_until.
+NOT_EXPIRED = "(valid_until IS NULL OR valid_until > now())"
+
+
 def _user_subject_key(user_id) -> str:
     return f"app_user:{user_id}"
 
@@ -236,7 +246,8 @@ def get_user_cognitive_context(user_id, question: str | None = None) -> str:
                 return ""
 
             facts = _search_table(cur, "facts", subject_id, question,
-                                   "predicate, object", "created_at DESC", 15, tiebreak_col="confidence")
+                                   "predicate, object", "created_at DESC", 15, tiebreak_col="confidence",
+                                   extra_where=NOT_EXPIRED)
             preferences = _search_table(cur, "preferences", subject_id, question,
                                          "category, item", "updated_at DESC", 10, tiebreak_col="weight")
             beliefs = _search_table(cur, "beliefs", subject_id, question,
@@ -244,7 +255,7 @@ def get_user_cognitive_context(user_id, question: str | None = None) -> str:
             memories = _search_table(cur, "memories", subject_id, question,
                                       "summary, emotion", "created_at DESC", 10, tiebreak_col="importance")
 
-            total_facts = _count_table(cur, "facts", subject_id)
+            total_facts = _count_table(cur, "facts", subject_id, extra_where=NOT_EXPIRED)
             total_preferences = _count_table(cur, "preferences", subject_id)
             total_beliefs = _count_table(cur, "beliefs", subject_id)
             total_memories = _count_table(cur, "memories", subject_id)
