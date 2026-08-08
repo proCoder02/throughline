@@ -1654,6 +1654,21 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     topics = [t for t in (parsed.get("topics") or []) if isinstance(t, str) and t.strip()][:5]
     questions = [q for q in (parsed.get("questions") or []) if isinstance(q, str) and q.strip()][:5]
 
+    # TEMPORARY diagnostic -- why aren't topics/questions showing up even
+    # when tasks are, for the live background_update path. Remove once
+    # resolved.
+    try:
+        with open("topics_debug.log", "a", encoding="utf-8") as f:
+            f.write(
+                f"\n--- {datetime.now().isoformat()} user={user_id} conv={conversation_id} ---\n"
+                f"delta_text={delta_text!r}\n"
+                f"raw_llm_content={content!r}\n"
+                f"parsed_topics={parsed.get('topics')!r} parsed_questions={parsed.get('questions')!r}\n"
+                f"final_topics={topics!r} final_questions={questions!r}\n"
+            )
+    except Exception as e:
+        print(f"[topics_debug] failed to write log: {e!r}")
+
     mood_label = (mood.get("label") or "").strip()
 
     conn = get_raw_connection()
