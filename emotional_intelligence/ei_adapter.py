@@ -53,6 +53,43 @@ def is_closing_acknowledgment(text: str) -> bool:
     return (text or "").strip().lower().rstrip(".!?,;: ") in _CLOSING_ACKNOWLEDGMENTS
 
 
+_QUESTION_STARTERS = (
+    "what", "who", "when", "where", "why", "how", "which", "whose",
+    "is", "are", "am", "was", "were", "do", "does", "did",
+    "can", "could", "would", "will", "should", "may", "might",
+)
+
+
+def is_probably_just_a_question(text: str) -> bool:
+    """Cheap, LLM-free pre-filter to skip trigger_chat_feedback_extraction's
+    correction-detection call for a message that's obviously just a plain
+    question -- e.g. "What should I get Ben?" asserts nothing new about the
+    user, so there's nothing for that extraction call to find.
+
+    Deliberately conservative: only fires when the ENTIRE message is a
+    single question with nothing else mixed in. A message can ask a
+    question AND state a correction in the same breath (e.g. "Actually my
+    birthday is in March, not April -- when's yours?"), and this must never
+    cause a real correction to go unextracted -- when in doubt, don't skip;
+    an extra LLM call is cheap, a missed correction is not."""
+    stripped = (text or "").strip()
+    if not stripped.endswith("?"):
+        return False
+    body = stripped[:-1].strip()
+    if not body:
+        return False
+    # Any other sentence-ending punctuation before the final "?" suggests
+    # more than one sentence/clause -- likely a statement plus a question,
+    # not a pure question. Bail out (don't skip) rather than guess.
+    if any(p in body for p in (".", "!", "?", ";")):
+        return False
+    first_word = body.split(" ", 1)[0].lower().strip(",")
+    # startswith(s + "'") catches common contractions (what's/who's/how's/
+    # where's/when's) without loosening the match enough to catch unrelated
+    # words that happen to start the same way.
+    return any(first_word == s or first_word.startswith(s + "'") for s in _QUESTION_STARTERS)
+
+
 # facts.valid_until exists in the schema specifically for this, but nothing
 # ever read it before -- a fact like "birthday: today" or "quitting_job:
 # tomorrow", extracted from one line of dialogue, was read back literally
@@ -406,6 +443,8 @@ def trigger_chat_feedback_extraction(user_id, message_content) -> None:
     if not is_enabled() or not user_id or not (message_content or "").strip():
         return
     if is_closing_acknowledgment(message_content):
+        return
+    if is_probably_just_a_question(message_content):
         return
     try:
         import sys
