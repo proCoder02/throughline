@@ -359,6 +359,62 @@ ALTER TABLE emotional_intelligence.memories ADD COLUMN IF NOT EXISTS search_tsv 
 CREATE INDEX IF NOT EXISTS idx_ei_memories_search_tsv ON emotional_intelligence.memories USING GIN (search_tsv);
 
 -- ----------------------------------------------------------------------------
+-- knowledge_cards -- global, subject-independent psychoeducation corpus
+-- (distilled from psychology literature, not extracted from any transcript).
+-- Unlike every table above, this isn't about a specific person -- it's
+-- reusable guidance retrieved by mood/situation and injected into a reply's
+-- context alongside whatever the subject-scoped tables know about the user.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS emotional_intelligence.knowledge_cards (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL UNIQUE,
+    moods TEXT[] NOT NULL DEFAULT '{}',
+    -- e.g. 'sadness' | 'anxiety' | 'happiness' | 'anger' | 'stress' | 'grief' |
+    -- 'planning' | 'conflict' | 'loneliness' -- app-validated, deliberately
+    -- open-ended (not a DB enum) so adding a new mood is a data change, not a
+    -- migration. One card can carry several moods (e.g. a grounding technique
+    -- applies to both anxiety and stress).
+    situation TEXT,               -- when this actually applies, e.g. "before a decision with no clearly best option"
+    framework_name TEXT,          -- short label, e.g. 'CBT: cognitive restructuring', 'GROW model' -- lets cards be grouped/cited without parsing `framework`
+    framework TEXT NOT NULL,      -- the technique itself, in plain language: what to actually do
+    example_prompt TEXT,          -- a sample phrasing back to the user, so the LLM has a concrete tone reference instead of improvising on a sensitive topic
+    source_citation TEXT,         -- paper/book this was distilled from
+    scope TEXT NOT NULL DEFAULT 'general',  -- 'general' | 'clinical_adjacent' -- app-validated; clinical_adjacent cards (drawn from clinical-disorder literature) get an extra "not a substitute for therapy" framing when injected
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    -- embedding vector(1536) -- add once semantic retrieval is implemented, same as facts/memories/relationship_profiles above
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ei_knowledge_cards_moods ON emotional_intelligence.knowledge_cards USING GIN (moods);
+CREATE INDEX IF NOT EXISTS idx_ei_knowledge_cards_active ON emotional_intelligence.knowledge_cards (is_active) WHERE is_active = TRUE;
+-- ei_adapter.py will full-text-search this table the same way it already
+-- does facts/beliefs/preferences/memories (see PRODUCTION_READINESS_ANALYSIS.md
+-- item 3) -- indexed rather than computing to_tsvector(...) fresh per row.
+-- Weighted (A: title + moods, B: situation/framework_name, C: framework body)
+-- rather than one flat tsvector -- moods is included as literal text so a
+-- query using one of the app's own canonical mood words ("anxious") gets a
+-- precise, high-weight hit even with no mood_logs signal at all, instead of
+-- relying only on situation/framework prose (which uses "anxiety" instead of
+-- "anxious" -- different stems in Postgres's English config, so they don't
+-- match each other -- and shares generic words like "feel" across nearly
+-- every card, which produced false-positive matches when tried unweighted).
+-- array_to_string() is marked STABLE, not IMMUTABLE (Postgres's blanket
+-- anyarray volatility, not anything actually non-deterministic about
+-- joining a text[] of lowercase mood words) -- a GENERATED column requires
+-- IMMUTABLE, so it's wrapped here rather than called directly below.
+CREATE OR REPLACE FUNCTION emotional_intelligence.array_to_string_immutable(arr TEXT[], sep TEXT)
+    RETURNS TEXT AS $$ SELECT array_to_string(arr, sep) $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+ALTER TABLE emotional_intelligence.knowledge_cards DROP COLUMN IF EXISTS search_tsv;
+ALTER TABLE emotional_intelligence.knowledge_cards ADD COLUMN search_tsv tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title, '') || ' ' || emotional_intelligence.array_to_string_immutable(moods, ' ')), 'A') ||
+        setweight(to_tsvector('english', coalesce(situation, '') || ' ' || coalesce(framework_name, '')), 'B') ||
+        setweight(to_tsvector('english', coalesce(framework, '')), 'C')
+    ) STORED;
+CREATE INDEX IF NOT EXISTS idx_ei_knowledge_cards_search_tsv ON emotional_intelligence.knowledge_cards USING GIN (search_tsv);
+
+-- ----------------------------------------------------------------------------
 -- transcript / transcript_scenes / transcript_speakers /
 -- transcript_speaker_turns -- the source ingestion tables populated by
 -- load_friends_transcripts.py, reconstructed here (that script's own

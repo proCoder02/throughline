@@ -2402,8 +2402,11 @@ def analyze_conversation():
     persona_context = build_persona_context(get_user_persona(cur, user_id))
     analysis_system_prompt = build_analysis_prompt(mode, persona_context)
     try:
-        from emotional_intelligence.ei_adapter import get_user_cognitive_context
+        from emotional_intelligence.ei_adapter import get_relevant_knowledge_cards, get_user_cognitive_context
         ei_context = get_user_cognitive_context(user_id)
+        knowledge_context = get_relevant_knowledge_cards(user_id)
+        if knowledge_context:
+            ei_context = f"{ei_context}\n\n{knowledge_context}" if ei_context else knowledge_context
         if ei_context:
             analysis_system_prompt = f"{analysis_system_prompt}\n\n{ei_context}"
     except Exception:
@@ -3902,10 +3905,13 @@ def chat():
     persona_context = build_persona_context(get_user_persona(cur, user_id))
     chat_system_prompt = build_chat_system_prompt(mode, persona_context)
     try:
-        from emotional_intelligence.ei_adapter import get_user_cognitive_context
+        from emotional_intelligence.ei_adapter import get_relevant_knowledge_cards, get_user_cognitive_context
         ei_context = get_user_cognitive_context(
             user_id, question=prompt, recent_statements=get_ei_recent_statements(user_id)
         )
+        knowledge_context = get_relevant_knowledge_cards(user_id, question=prompt)
+        if knowledge_context:
+            ei_context = f"{ei_context}\n\n{knowledge_context}" if ei_context else knowledge_context
         if ei_context:
             chat_system_prompt = f"{chat_system_prompt}\n\n{ei_context}"
     except Exception:
@@ -4017,10 +4023,17 @@ def chat_global():
 
     ei_context = ""
     try:
-        from emotional_intelligence.ei_adapter import get_friend_relationship_insight, get_user_cognitive_context
+        from emotional_intelligence.ei_adapter import (
+            get_friend_relationship_insight,
+            get_relevant_knowledge_cards,
+            get_user_cognitive_context,
+        )
         ei_context = get_user_cognitive_context(
             user_id, question=prompt, recent_statements=get_ei_recent_statements(user_id)
         )
+        knowledge_context = get_relevant_knowledge_cards(user_id, question=prompt)
+        if knowledge_context:
+            ei_context = f"{ei_context}\n\n{knowledge_context}" if ei_context else knowledge_context
         if matched:
             cur.execute(
                 "SELECT u.id FROM friendships f JOIN users u ON u.id = f.friend_id "

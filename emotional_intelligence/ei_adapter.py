@@ -26,6 +26,7 @@ app_user:<id> subject as before.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 _pool = None  # lazily created -- see _get_pool()
@@ -414,6 +415,199 @@ def get_friend_relationship_insight(user_id, friend_id) -> dict | None:
     except Exception as exc:
         _log_failure("get_friend_relationship_insight", exc)
         return None
+
+
+# A mood logged longer ago than this no longer counts as "their current
+# mood" -- without a cutoff, one Listen session that happened to log
+# "anxious" would keep steering every unrelated future chat message
+# (e.g. a pasta-recipe question) toward anxiety cards indefinitely.
+_MOOD_SIGNAL_MAX_AGE_HOURS = 24
+
+# Cheap, LLM-free gate on the mood-only fallback below: without this, a mood
+# logged during Listen would keep steering a reply toward a coping card even
+# for a completely unrelated message ("recommend a movie") for the next
+# _MOOD_SIGNAL_MAX_AGE_HOURS, just because nothing else matched. Deliberately
+# broad/permissive -- a false negative here only means "no card offered",
+# same as before this check existed, while a false positive (an anxiety card
+# injected into a movie question) is exactly what this exists to prevent, so
+# it's fine to err toward matching.
+_EMOTIONAL_SIGNAL_WORDS = (
+    "feel", "feeling", "feelings", "felt",
+    "mood", "emotion", "emotional", "emotionally",
+    "stress", "stressed", "stressful", "stressing",
+    "anxious", "anxiety", "worried", "worry", "worrying", "nervous", "panic", "panicking",
+    "sad", "sadness", "down", "depressed", "depression", "upset", "crying", "cried", "hurt",
+    "happy", "happiness", "excited", "grateful", "gratitude", "glad",
+    "angry", "anger", "frustrated", "frustrating", "annoyed", "irritated", "mad",
+    "overwhelmed", "exhausted", "tired", "burnt out", "burned out",
+    "lonely", "alone", "isolated",
+    "struggling", "struggle", "stuck", "lost", "confused",
+    "grief", "grieving", "loss", "miss", "missing",
+    "calm", "relaxed", "peaceful", "at peace",
+)
+
+
+def _seems_emotionally_substantive(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(re.search(r"\b" + re.escape(w) + r"\b", lowered) for w in _EMOTIONAL_SIGNAL_WORDS)
+
+
+def _resolve_recent_mood(cur, user_id) -> str | None:
+    """This user's most recently logged mood (public.mood_logs, populated by
+    run_background_analysis during Listen conversations), if logged within
+    the last _MOOD_SIGNAL_MAX_AGE_HOURS -- used as a fallback signal for
+    which knowledge_cards apply when the current message itself doesn't say
+    anything specific (see get_relevant_knowledge_cards: the message's own
+    words are tried first and win if they match, since they're the more
+    current signal). A user with no recent Listen history simply has no
+    mood signal, and retrieval falls back to matching the question text
+    alone."""
+    cur.execute(
+        "SELECT mood_label FROM mood_logs WHERE user_id = %s "
+        "AND created_at > now() - make_interval(hours => %s) "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id, _MOOD_SIGNAL_MAX_AGE_HOURS),
+    )
+    row = cur.fetchone()
+    label = (row[0] or "").strip().lower() if row and row[0] else None
+    return label or None
+
+
+# Below this ts_rank score, a "match" is typically just a generic word
+# (e.g. "feel", "good") that this whole corpus happens to share, not a real
+# topical hit -- confirmed while testing: an anxiety question surfaced
+# grief/gratitude cards purely because their prose used the word "feel"
+# (weight C), and separately "recommend a good action movie" matched
+# Gratitude/Savoring purely on "good" appearing once in their framework
+# text.
+#
+# There's no cutoff that separates these cleanly in both directions --
+# confirmed empirically a coincidental single-word hit can outscore a real
+# one (a bare "good" in "what's a good recipe for pasta" scored 0.091,
+# HIGHER than "worrying" genuinely matching "worried" in a card's situation
+# text at 0.061, because the first happened to land in a shorter field).
+# Biased toward fewer false positives, not fewer false negatives: a missed
+# real match just means no card is offered (harmless), while a false
+# positive injects an irrelevant psychological framework into an unrelated
+# reply (a visibly worse outcome) -- so the bar sits above the coincidental
+# "good" case even though that misses some genuine single-weight-B hits
+# like "worrying". A structural limit of lexical search at this corpus
+# size, not something further threshold tuning fixes -- see
+# COGNITIVE_INTELLIGENCE_IMPROVEMENTS.md item 2 (semantic/embedding
+# retrieval) for the real fix, once the corpus is big enough to need it.
+_MIN_KNOWLEDGE_RANK = 0.1
+
+
+def get_relevant_knowledge_cards(user_id, question: str | None = None, limit: int = 2) -> str:
+    """Extra system-prompt text for app.py's /analyze, /chat, and
+    /chat/global calls -- general psychoeducation (coping techniques,
+    problem-solving frameworks), distinct from get_user_cognitive_context
+    above, which is this specific user's own facts/beliefs/memories.
+    knowledge_cards is a global, subject-independent table (see
+    emotional_intelligence_schema.sql), so there's no subject resolution
+    step here at all.
+
+    Retrieval, in priority order -- the current message's own words win over
+    a logged mood when both exist and disagree, since what someone is
+    saying right now is the more current signal than a mood logged up to
+    _MOOD_SIGNAL_MAX_AGE_HOURS ago (e.g. Listen logged "happy" yesterday,
+    but they just typed "I'm having a panic attack" -- that message must
+    not get filtered down to happy-tagged cards only, which an earlier
+    version of this function did):
+    (1) keyword search across the WHOLE corpus, gated by a minimum rank so
+    a throwaway shared word (e.g. "feel") can't alone produce a match --
+    only a real topical hit (typically the message naming a mood word or
+    matching a card's situation) clears this bar.
+    (2) if that found nothing, the message is either absent (/analyze, which
+    has no separate "message" to check -- the mood was just extracted from
+    the very transcript being analyzed) or reads as emotionally substantive
+    (_seems_emotionally_substantive), AND this user has a recent logged
+    mood, use it as a filter -- moods is a small, precise, hand-authored tag
+    array, so once a card qualifies by mood it's RANKED (not excluded) by
+    whatever question relevance exists, falling back to a stable curated
+    order (id ASC). Tried gating on a search_tsv match within the mood-
+    filtered set too -- confirmed too aggressive: mood='sad' + "I don't feel
+    like doing anything today" excluded the one card that's exactly about
+    that (behavioral activation) because the literal word overlap was only
+    the generic "feel", which happened to score another sad-tagged card
+    higher. The emotional-substance check exists so a mood logged hours ago
+    doesn't keep injecting a coping card into an unrelated question ("recommend
+    a movie") for the rest of its validity window.
+    Returns "" -- never a random unrelated card -- if neither step finds
+    anything, disabled, or on any failure."""
+    if not is_enabled():
+        return ""
+    try:
+        conn = _connect()
+        try:
+            cur = conn.cursor()
+            select_cols = "title, framework_name, framework, example_prompt, scope"
+            rows = []
+            if question:
+                or_question = " OR ".join(question.split())
+                cur.execute(
+                    f"""
+                    SELECT {select_cols} FROM emotional_intelligence.knowledge_cards
+                    WHERE is_active = TRUE
+                      AND search_tsv @@ websearch_to_tsquery('english', %s)
+                      AND ts_rank(search_tsv, websearch_to_tsquery('english', %s)) > %s
+                    ORDER BY ts_rank(search_tsv, websearch_to_tsquery('english', %s)) DESC
+                    LIMIT %s
+                    """,
+                    (or_question, or_question, _MIN_KNOWLEDGE_RANK, or_question, limit),
+                )
+                rows = cur.fetchall()
+            # No question at all (e.g. /analyze, which has no separate "message" --
+            # the mood was just extracted from the very transcript being analyzed)
+            # skips the substantive-check entirely; there's nothing to gate on and
+            # the mood is already maximally relevant by construction. A question
+            # that IS present but reads as pure logistics ("recommend a movie")
+            # blocks this fallback instead of injecting an unrelated coping card.
+            if not rows and (question is None or _seems_emotionally_substantive(question)):
+                mood = _resolve_recent_mood(cur, user_id) if user_id else None
+                if mood:
+                    or_question = " OR ".join(question.split()) if question else None
+                    cur.execute(
+                        f"""
+                        SELECT {select_cols} FROM emotional_intelligence.knowledge_cards
+                        WHERE is_active = TRUE AND moods @> ARRAY[%s]
+                        ORDER BY
+                            CASE WHEN %s::text IS NOT NULL
+                                 THEN ts_rank(search_tsv, websearch_to_tsquery('english', %s))
+                                 ELSE 0 END DESC,
+                            id ASC
+                        LIMIT %s
+                        """,
+                        (mood, or_question, or_question, limit),
+                    )
+                    rows = cur.fetchall()
+        finally:
+            _release(conn)
+    except Exception as exc:
+        _log_failure("get_relevant_knowledge_cards", exc)
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = [
+        "\nRelevant psychological framework(s) that may help, from a curated general-knowledge base "
+        "(NOT this user's own data -- general psychoeducation) -- use these to inform how you approach "
+        "the reply (tone, structure, what to suggest); don't recite them verbatim or cite them as "
+        "'a study says':"
+    ]
+    for title, framework_name, framework, example_prompt, scope in rows:
+        label = f"{title} ({framework_name})" if framework_name else title
+        lines.append(f"- {label}: {framework}")
+        if example_prompt:
+            lines.append(f"  Example phrasing: {example_prompt}")
+        if scope == "clinical_adjacent":
+            lines.append(
+                "  (Distilled from clinical treatment literature -- frame as general coping guidance, "
+                "never as a diagnosis or treatment plan, and don't discourage seeking a real therapist "
+                "if the conversation suggests it would help.)"
+            )
+    return "\n".join(lines)
 
 
 def trigger_chat_feedback_extraction(user_id, message_content) -> None:
