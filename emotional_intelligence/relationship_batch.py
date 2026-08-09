@@ -32,10 +32,28 @@ fact_versions); out of scope here since other code (ei_adapter.py's
 get_friend_relationship_insight) reads this table expecting exactly one
 row per pair.
 
+Also covers real app users, using shared calls (public.call_participants) as
+the co-occurrence signal instead of shared Friends episodes -- the same
+"mechanically countable co-occurrence, LLM only for qualitative judgment"
+split, just a different source of co-occurrence. Two real users qualify as a
+pair once they've both actually joined (call_participants.status='joined')
+the same call together at least --min-shared-calls times. Reuses
+fetch_existing_pairs/count_new_data_since as-is (both already operate purely
+on subject_id, with no Friends-specific assumption) so the same "new vs due
+for refresh" logic applies uniformly; process_real_user_pair mirrors
+process_pair's LLM-call/insert-upsert logic but is a separate function
+(rather than a shared one with more parameters) so this addition can't
+regress the existing, already-verified Friends-pair path. shared_topics has
+no real equivalent here yet (no per-call topic extraction exists) and is
+left an empty list rather than inventing one out of scope.
+
 Usage:
     python relationship_batch.py
-    python relationship_batch.py --min-shared-episodes 15   # narrower scope
+    python relationship_batch.py --min-shared-episodes 15   # narrower scope (Friends pairs)
+    python relationship_batch.py --min-shared-calls 2       # narrower scope (real-user pairs)
     python relationship_batch.py --min-new-data 10          # require more new data before refreshing
+    python relationship_batch.py --skip-fictional           # real users only
+    python relationship_batch.py --skip-real-users          # Friends pairs only (old behavior)
 """
 from __future__ import annotations
 
@@ -130,6 +148,130 @@ def count_new_data_since(cur, subject_id: int, since) -> int:
     return cur.fetchone()["n"]
 
 
+def fetch_real_user_subject_map(cur) -> dict[int, dict]:
+    """user_id -> {"id": subject_id, "canonical_name": ...} for every real
+    user who already has a resolvable EI subject -- either an explicit
+    app_user_subject_links row (an opt-in merge into a pre-existing
+    subject) or the namespaced "app_user:<id>" fallback that
+    real_user_extraction.py's ensure_user_subject creates. Read-only lookup
+    (mirrors ensure_user_subject's own resolution order but never creates
+    anything): a batch job shouldn't silently create a subject for a user
+    real_user_extraction.py has never actually processed."""
+    cur.execute(
+        """
+        SELECT l.user_id AS user_id, s.id AS subject_id, s.canonical_name
+        FROM emotional_intelligence.app_user_subject_links l
+        JOIN emotional_intelligence.subjects s ON s.id = l.subject_id
+        UNION
+        SELECT (regexp_match(s.canonical_name, '^app_user:(\\d+)$'))[1]::int AS user_id,
+               s.id AS subject_id, s.canonical_name
+        FROM emotional_intelligence.subjects s
+        WHERE s.canonical_name ~ '^app_user:\\d+$'
+        """
+    )
+    return {row["user_id"]: {"id": row["subject_id"], "canonical_name": row["canonical_name"]} for row in cur.fetchall()}
+
+
+def fetch_user_call_cooccurrence(cur) -> dict[tuple[int, int], int]:
+    """(user_id_a, user_id_b) [a<b] -> count of distinct calls both users
+    actually joined together -- the real-user equivalent of two Friends
+    characters both speaking in the same episode. Works for both 1:1 and
+    group calls: any two participants who both actually joined the same
+    call_id co-occurred in that call.
+
+    Uses joined_at IS NOT NULL, NOT status='joined' -- app.py's leave_call
+    overwrites status to 'left' once someone exits (see app.py's
+    UPDATE call_participants SET status = 'left' ... on leave), so by the
+    time any call has actually ended, its real participants show status
+    'left', not 'joined'. status='joined' only ever matches someone on a
+    STILL-ACTIVE call, which would have silently made this whole feature
+    find ~0 pairs against real (mostly-ended) call history -- confirmed by
+    testing against live data before this fix. joined_at is set once (at
+    the same moment status becomes 'joined') and never cleared afterward,
+    so it reliably means "was actually connected to this call at some
+    point," regardless of whether they've since left."""
+    cur.execute(
+        """
+        SELECT cp1.user_id AS u1, cp2.user_id AS u2, count(DISTINCT cp1.call_id) AS n
+        FROM call_participants cp1
+        JOIN call_participants cp2
+            ON cp2.call_id = cp1.call_id AND cp2.user_id > cp1.user_id
+        WHERE cp1.joined_at IS NOT NULL AND cp2.joined_at IS NOT NULL
+        GROUP BY cp1.user_id, cp2.user_id
+        """
+    )
+    return {(row["u1"], row["u2"]): row["n"] for row in cur.fetchall()}
+
+
+def fetch_total_calls(cur) -> int:
+    """Denominator for communication_frequency, mirroring total_episodes --
+    keeps the field's meaning consistent between fictional and real-user
+    pairs (share of ALL co-occurrence opportunities in the system), rather
+    than inventing a differently-scoped metric for real users."""
+    cur.execute("SELECT count(*) AS n FROM calls")
+    return cur.fetchone()["n"]
+
+
+def process_real_user_pair(cur, subject_a: dict, subject_b: dict, shared_calls: int, total_calls: int) -> dict:
+    """Mirrors process_pair's LLM-call/insert-upsert logic exactly, but for
+    a pair of real-user subjects with call-based co-occurrence instead of
+    Friends-episode-based -- kept as its own function (not a shared one
+    with more parameters) so this addition can't regress the existing,
+    already-verified Friends-pair path above."""
+    memory_block, stats = assemble_multi_subject_memory(cur, [subject_a["canonical_name"], subject_b["canonical_name"]])
+    messages = [
+        {"role": "system", "content": RELATIONSHIP_PROMPT},
+        {"role": "user", "content": memory_block},
+    ]
+    try:
+        content, raw_response = call_llm(messages)
+    except Exception as e:
+        return {"status": "error", "error": f"LLM call failed: {e!r}"}
+
+    parsed = extract_json(content)
+    if not parsed:
+        return {"status": "error", "error": "unparseable LLM response"}
+
+    communication_frequency = shared_calls / total_calls if total_calls else None
+    shared_topics: list[str] = []  # no per-call topic extraction exists yet
+
+    tokens = (raw_response.get("prompt_eval_count") or 0) + (raw_response.get("eval_count") or 0)
+    cur.execute(
+        """
+        INSERT INTO emotional_intelligence.analysis_runs (run_type, model, prompt_version, tokens, status)
+        VALUES ('relationship_batch', %s, %s, %s, 'success')
+        RETURNING id
+        """,
+        (raw_response.get("model"), PROMPT_VERSION, tokens or None),
+    )
+    run_id = cur.fetchone()["id"]
+
+    a, b = sorted([subject_a["id"], subject_b["id"]])  # schema CHECK (subject_a < subject_b)
+    cur.execute(
+        """
+        INSERT INTO emotional_intelligence.relationship_profiles
+            (subject_a, subject_b, analysis_run_id, trust_score, communication_frequency,
+             conflict_score, emotional_support, shared_topics, relationship_summary)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (subject_a, subject_b) DO UPDATE SET
+            analysis_run_id = EXCLUDED.analysis_run_id,
+            trust_score = EXCLUDED.trust_score,
+            communication_frequency = EXCLUDED.communication_frequency,
+            conflict_score = EXCLUDED.conflict_score,
+            emotional_support = EXCLUDED.emotional_support,
+            shared_topics = EXCLUDED.shared_topics,
+            relationship_summary = EXCLUDED.relationship_summary,
+            updated_at = now()
+        """,
+        (
+            a, b, run_id,
+            parsed.get("trust_score"), communication_frequency, parsed.get("conflict_score"),
+            parsed.get("emotional_support"), shared_topics, parsed.get("relationship_summary"),
+        ),
+    )
+    return {"status": "success", "run_id": run_id, "shared_calls": shared_calls}
+
+
 def compute_shared_topics(cur, episode_ids_text: set[str], limit: int = 5) -> list[str]:
     if not episode_ids_text:
         return []
@@ -208,9 +350,12 @@ def process_pair(cur, subject_a: dict, subject_b: dict, shared_episode_ids: set[
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate relationship_profiles for qualifying subject pairs.")
     parser.add_argument("--min-data", type=int, default=5, help="Minimum combined facts+beliefs+memories per subject to qualify.")
-    parser.add_argument("--min-shared-episodes", type=int, default=10, help="Minimum co-occurring episodes for a pair to qualify.")
+    parser.add_argument("--min-shared-episodes", type=int, default=10, help="Minimum co-occurring episodes for a Friends pair to qualify.")
+    parser.add_argument("--min-shared-calls", type=int, default=1, help="Minimum shared joined calls for a real-user pair to qualify.")
     parser.add_argument("--min-new-data", type=int, default=5, help="Minimum NEW facts+beliefs+memories (either subject) since last assessment to qualify a refresh of an existing pair.")
-    parser.add_argument("--limit", type=int, default=0, help="Max pairs to process (0 = all qualifying).")
+    parser.add_argument("--limit", type=int, default=0, help="Max pairs to process per category (0 = all qualifying).")
+    parser.add_argument("--skip-fictional", action="store_true", help="Skip the Friends-episode-based pairs entirely.")
+    parser.add_argument("--skip-real-users", action="store_true", help="Skip the call-based real-user pairs entirely.")
     args = parser.parse_args()
 
     conn = psycopg2.connect(DB_URL)
@@ -218,39 +363,85 @@ def main() -> int:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     try:
-        cur.execute("SELECT count(*) AS n FROM emotional_intelligence.episodes")
-        total_episodes = cur.fetchone()["n"]
+        existing = fetch_existing_pairs(cur)  # (a, b) -> last assessed at (or None) -- shared by both categories below, since it's purely subject_id-keyed
 
-        subjects = fetch_qualifying_subjects(cur, args.min_data)
-        subj_episodes = fetch_subject_episode_sets(cur)
-        existing = fetch_existing_pairs(cur)  # (a, b) -> last assessed at (or None)
+        candidates = []  # (subject_a, subject_b, process_fn, process_arg, label, sort_key)
 
-        candidates = []
-        for i in range(len(subjects)):
-            for j in range(i + 1, len(subjects)):
-                sa, sb = subjects[i], subjects[j]
-                a, b = sorted([sa["id"], sb["id"]])
-                shared = subj_episodes.get(sa["id"], set()) & subj_episodes.get(sb["id"], set())
-                if len(shared) < args.min_shared_episodes:
+        if not args.skip_fictional:
+            cur.execute("SELECT count(*) AS n FROM emotional_intelligence.episodes")
+            total_episodes = cur.fetchone()["n"]
+
+            subjects = fetch_qualifying_subjects(cur, args.min_data)
+            subj_episodes = fetch_subject_episode_sets(cur)
+
+            fictional_candidates = []
+            for i in range(len(subjects)):
+                for j in range(i + 1, len(subjects)):
+                    sa, sb = subjects[i], subjects[j]
+                    a, b = sorted([sa["id"], sb["id"]])
+                    shared = subj_episodes.get(sa["id"], set()) & subj_episodes.get(sb["id"], set())
+                    if len(shared) < args.min_shared_episodes:
+                        continue
+                    last_at = existing.get((a, b), "not_existing")
+                    if last_at == "not_existing":
+                        kind = "new"
+                    else:
+                        new_data = count_new_data_since(cur, a, last_at) + count_new_data_since(cur, b, last_at)
+                        if new_data < args.min_new_data:
+                            continue
+                        kind = f"refresh, {new_data} new since last"
+                    fictional_candidates.append({
+                        "sa": sa, "sb": sb, "kind": kind, "sort": len(shared),
+                        "label": f"{sa['canonical_name']} <-> {sb['canonical_name']} (shared_episodes={len(shared)}, {kind})",
+                        "run": lambda cur, sa=sa, sb=sb, shared=shared: process_pair(cur, sa, sb, shared, total_episodes),
+                    })
+            fictional_candidates.sort(key=lambda c: c["sort"], reverse=True)
+            if args.limit:
+                fictional_candidates = fictional_candidates[: args.limit]
+            candidates.extend(fictional_candidates)
+
+        if not args.skip_real_users:
+            real_subjects = fetch_real_user_subject_map(cur)  # user_id -> {id, canonical_name}
+            cooccurrence = fetch_user_call_cooccurrence(cur)  # (user_id_a, user_id_b) -> shared call count
+            total_calls = fetch_total_calls(cur)
+
+            real_candidates = []
+            for (uid_a, uid_b), shared_calls in cooccurrence.items():
+                if shared_calls < args.min_shared_calls:
                     continue
+                sa, sb = real_subjects.get(uid_a), real_subjects.get(uid_b)
+                # Both users need a resolvable EI subject -- i.e.
+                # real_user_extraction.py has actually run for them. A user
+                # who's never had a conversation analyzed yet has nothing to
+                # assess a relationship from.
+                if sa is None or sb is None:
+                    continue
+                a, b = sorted([sa["id"], sb["id"]])
                 last_at = existing.get((a, b), "not_existing")
                 if last_at == "not_existing":
-                    candidates.append((sa, sb, shared, "new"))
-                    continue
-                new_data = count_new_data_since(cur, a, last_at) + count_new_data_since(cur, b, last_at)
-                if new_data >= args.min_new_data:
-                    candidates.append((sa, sb, shared, f"refresh, {new_data} new since last"))
-        candidates.sort(key=lambda c: len(c[2]), reverse=True)
-        if args.limit:
-            candidates = candidates[: args.limit]
+                    kind = "new"
+                else:
+                    new_data = count_new_data_since(cur, a, last_at) + count_new_data_since(cur, b, last_at)
+                    if new_data < args.min_new_data:
+                        continue
+                    kind = f"refresh, {new_data} new since last"
+                real_candidates.append({
+                    "sa": sa, "sb": sb, "kind": kind, "sort": shared_calls,
+                    "label": f"{sa['canonical_name']} <-> {sb['canonical_name']} (shared_calls={shared_calls}, {kind})",
+                    "run": lambda cur, sa=sa, sb=sb, shared_calls=shared_calls: process_real_user_pair(cur, sa, sb, shared_calls, total_calls),
+                })
+            real_candidates.sort(key=lambda c: c["sort"], reverse=True)
+            if args.limit:
+                real_candidates = real_candidates[: args.limit]
+            candidates.extend(real_candidates)
 
         print(f"pairs_to_process={len(candidates)}")
 
         succeeded, failed = 0, 0
-        for sa, sb, shared, kind in candidates:
-            print(f"--- {sa['canonical_name']} <-> {sb['canonical_name']} (shared_episodes={len(shared)}, {kind}) ---")
+        for c in candidates:
+            print(f"--- {c['label']} ---")
             try:
-                result = process_pair(cur, sa, sb, shared, total_episodes)
+                result = c["run"](cur)
                 if result["status"] == "success":
                     conn.commit()
                     succeeded += 1
