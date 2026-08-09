@@ -702,14 +702,31 @@ def email_reminder_worker():
             conn = get_raw_connection()
             cur = dict_cursor(conn)
             now = datetime.now(timezone.utc)
-            cur.execute(
+            _BASE_REMINDER_QUERY = (
                 "SELECT tasks.id, tasks.user_id, tasks.description, tasks.owner, tasks.due_date, "
                 "tasks.reminder_at, users.email FROM tasks "
-                "JOIN users ON tasks.user_id = users.id "
+                "JOIN users ON tasks.user_id = users.id {extra} "
                 "WHERE tasks.reminder_at IS NOT NULL AND tasks.email_sent = FALSE "
-                "AND tasks.reminder_at <= %s AND users.email IS NOT NULL AND users.email != ''",
-                (now,),
+                "AND tasks.reminder_at <= %s AND users.email IS NOT NULL AND users.email != '' {filter}"
             )
+            try:
+                # COALESCE(..., TRUE) treats a user with no nudges.user_settings
+                # row (or the setting never touched) as still enabled -- see
+                # nudge_engine.get_user_settings's identical default.
+                cur.execute(
+                    _BASE_REMINDER_QUERY.format(
+                        extra="LEFT JOIN nudges.user_settings s ON s.user_id = tasks.user_id",
+                        filter="AND COALESCE(s.task_reminder_notifications_enabled, TRUE) = TRUE",
+                    ),
+                    (now,),
+                )
+            except Exception:
+                # nudges.user_settings may not exist yet (schema not applied on
+                # this deployment) -- task reminder emails are core, pre-existing
+                # functionality and must never break just because that optional
+                # table is missing.
+                conn.rollback()
+                cur.execute(_BASE_REMINDER_QUERY.format(extra="", filter=""), (now,))
             rows = cur.fetchall()
             for row in rows:
                 sent = send_reminder_email(
@@ -1000,6 +1017,97 @@ def update_settings():
     )
     db.commit()
     return jsonify({"ok": True, "personalization": personalization})
+
+
+@app.route("/settings/nudges", methods=["GET"])
+@login_required
+def get_nudge_settings():
+    """Delegates entirely to nudges/nudge_engine.py -- this endpoint owns no
+    logic of its own, matching how every other nudges/emotional_intelligence
+    touchpoint in this file works. Not wrapped in a swallow-errors try/except
+    like the optional-context injections elsewhere: this endpoint's only job
+    IS the nudges module, so a failure here should surface, not be hidden."""
+    from nudges.nudge_engine import get_user_settings
+    return jsonify(get_user_settings(current_user_id()))
+
+
+def _notify_setting_toggled(user_id, feature_label, enabled):
+    """Confirms a settings toggle via the same push_notification (WS) +
+    send_fcm_to_user (real device notification) pair every other
+    significant event in this file uses -- e.g. task_created,
+    reminder_email_sent. The WS side is a no-op today (notify_provider.dart's
+    _handle switch has no case for 'setting_toggled', and has no default
+    case either, so an unrecognized type is silently ignored, not an
+    error) -- sent anyway for consistency with that pattern; the FCM side
+    is what the user actually sees, and needs no client-side handling
+    since it's a plain notification with no action buttons or deep link."""
+    state = "on" if enabled else "off"
+    event = {"type": "setting_toggled", "feature": feature_label, "enabled": enabled}
+    push_notification(user_id, event)
+    send_fcm_to_user(
+        user_id, title="Setting updated", body=f"You've turned {state} {feature_label}.",
+        data={"type": "setting_toggled", "feature": feature_label, "enabled": str(enabled)},
+    )
+
+
+_INDIVIDUAL_SMART_FEATURE_FIELDS = (
+    "nudges_enabled",
+    "cognitive_intelligence_enabled",
+    "task_reminder_notifications_enabled",
+    "tags_questions_enabled",
+)
+
+
+@app.route("/settings/nudges", methods=["POST"])
+@login_required
+def update_nudge_settings():
+    """Explicit product decision: only the combined "Smart features" master
+    toggle (smart_features_enabled) is notification-worthy. The four
+    underlying settings it controls (nudges, cognitive intelligence, task
+    reminder notifications, tags/questions) never send their own individual
+    notification, even if changed directly via this same endpoint -- so a
+    granular per-field update stays silent on purpose.
+
+    Standard parent/child toggle semantics: children are only individually
+    changeable while the parent is on. The Flutter client already disables
+    those switches in the UI when smart_features_enabled is false, but that
+    alone is just a UI affordance -- this 400 is what actually enforces it
+    (e.g. against a stale client, or a direct API call)."""
+    from nudges.nudge_engine import get_user_settings, set_user_settings
+    data = request.get_json(silent=True) or {}
+    user_id = current_user_id()
+
+    smart_features_enabled = data.get("smart_features_enabled")
+    if smart_features_enabled is not None:
+        # Cascade DOWN only: the master switch sets all four underlying
+        # features to match itself. It deliberately does NOT get recomputed
+        # from them the other way -- toggling an individual feature off
+        # later (via the branch below) leaves smart_features_enabled exactly
+        # as it is here, so it keeps reading as on until explicitly turned
+        # off again, regardless of what the individual features are doing.
+        result = set_user_settings(
+            user_id,
+            smart_features_enabled=smart_features_enabled,
+            nudges_enabled=smart_features_enabled,
+            cognitive_intelligence_enabled=smart_features_enabled,
+            task_reminder_notifications_enabled=smart_features_enabled,
+            tags_questions_enabled=smart_features_enabled,
+        )
+        _notify_setting_toggled(user_id, "Smart features", smart_features_enabled)
+        return jsonify(result)
+
+    wants_individual_change = any(data.get(f) is not None for f in _INDIVIDUAL_SMART_FEATURE_FIELDS)
+    if wants_individual_change and not get_user_settings(user_id)["smart_features_enabled"]:
+        return jsonify({"error": "Turn on Smart features before changing an individual feature"}), 400
+
+    result = set_user_settings(
+        user_id,
+        nudges_enabled=data.get("nudges_enabled"),
+        cognitive_intelligence_enabled=data.get("cognitive_intelligence_enabled"),
+        task_reminder_notifications_enabled=data.get("task_reminder_notifications_enabled"),
+        tags_questions_enabled=data.get("tags_questions_enabled"),
+    )
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1619,6 +1727,25 @@ def save_conversation():
     return jsonify({"conversation_id": conversation_id})
 
 
+def _apply_tags_questions_setting(user_id, topics, questions):
+    """Blanks topics/questions if this user has turned off "tags/questions
+    in conversations" -- suppresses what's SHOWN, not the extraction itself
+    (topics/questions come from the same shared LLM call as tasks/speakers/
+    mood in both call sites below, so there's no separate call to skip).
+    Defaults to showing them if the nudges module/table isn't available for
+    any reason -- this is a pre-existing, user-visible feature, so its
+    absence must never look like a bug caused by an unrelated optional
+    module. Shared by run_background_analysis and /analyze -- both surface
+    topics/questions to the user, so both respect this setting."""
+    try:
+        from nudges.nudge_engine import get_user_settings
+        if not get_user_settings(user_id)["tags_questions_enabled"]:
+            return [], []
+    except Exception:
+        pass
+    return topics, questions
+
+
 def run_background_analysis(user_id, conversation_id, delta_text, push):
     """Runs in its own thread with its own pooled connection -- Flask's
     request-scoped `g` connection can't be shared across threads. Extracts
@@ -1653,6 +1780,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     mood = parsed.get("mood") or {}
     topics = [t for t in (parsed.get("topics") or []) if isinstance(t, str) and t.strip()][:5]
     questions = [q for q in (parsed.get("questions") or []) if isinstance(q, str) and q.strip()][:5]
+    topics, questions = _apply_tags_questions_setting(user_id, topics, questions)
 
     # TEMPORARY diagnostic -- why aren't topics/questions showing up even
     # when tasks are, for the live background_update path. Remove once
@@ -2437,6 +2565,7 @@ def analyze_conversation():
     mood = parsed.get("mood") or {}
     topics = [t for t in (parsed.get("topics") or []) if isinstance(t, str) and t.strip()][:5]
     questions = [q for q in (parsed.get("questions") or []) if isinstance(q, str) and q.strip()][:5]
+    topics, questions = _apply_tags_questions_setting(user_id, topics, questions)
 
     created_tasks = []
     for task in tasks:
@@ -4156,6 +4285,18 @@ def chat_global():
 
 verify_db_connection()
 
+def _start_nudge_worker_safely():
+    """The nudges/ module is optional and additive, same convention as
+    emotional_intelligence -- an import failure here (missing dependency,
+    schema not yet applied, etc.) must never prevent the main app from
+    starting."""
+    try:
+        from nudges.nudge_engine import start_nudge_worker
+        start_nudge_worker(push_notification, send_fcm_to_user)
+    except Exception as e:
+        print(f"[nudges] worker not started: {e!r}")
+
+
 # Under a WSGI server (gunicorn etc.) this module is imported, not run as
 # __main__ -- the dev-server startup block below never executes there, so
 # the reminder-email worker needs its own start path here instead. Only
@@ -4164,6 +4305,7 @@ verify_db_connection()
 if __name__ != "__main__" and IS_WEB_ROLE:
     threading.Thread(target=email_reminder_worker, daemon=True).start()
     threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
+    _start_nudge_worker_safely()
 
 if __name__ == "__main__":
     # Mic access (getUserMedia) only works over "secure contexts" -- https,
@@ -4182,5 +4324,6 @@ if __name__ == "__main__":
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true" and IS_WEB_ROLE:
         threading.Thread(target=email_reminder_worker, daemon=True).start()
         threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
+        _start_nudge_worker_safely()
 
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True, ssl_context=ssl_context)
