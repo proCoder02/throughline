@@ -262,6 +262,21 @@ input, textarea { font-family: inherit; }
 .conv-link-btn:hover { background: var(--wa-hover); color: var(--wa-accent); }
 .conv-link-btn svg { width: 14px; height: 14px; }
 
+.dm-chat-btn { position: relative; }
+.dm-badge {
+  position: absolute; top: -3px; right: -3px; min-width: 15px; height: 15px; padding: 0 3px;
+  border-radius: 999px; background: #EA0038; color: #fff;
+  font-size: 9.5px; font-weight: 600; line-height: 15px; text-align: center;
+}
+
+/* Single tick (sent) -> double grey (delivered) -> double blue (read),
+   same three states as the mobile client's DirectMessage.tickState. */
+.dm-tick { display: inline-flex; vertical-align: -2px; margin-left: 3px; color: var(--wa-text-soft); }
+.dm-tick svg { width: 14px; height: 14px; }
+.dm-tick.read { color: var(--wa-accent); }
+
+.typing-indicator { color: var(--wa-accent); font-weight: 500; }
+
 .detail-meta-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .detail-meta-row .conv-link-btn { margin-top: 1px; }
 

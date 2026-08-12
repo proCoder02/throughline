@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
-import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, CheckIcon, InfoIcon } from '../icons.jsx';
+import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, ChatIcon, CheckIcon, InfoIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
+import DirectMessageThread from './DirectMessageThread.jsx';
 
 // WhatsApp/Telegram-style: today's time, "Yesterday", or a short date for
 // anything older -- mirrors the Flutter client's formatCallTimestamp.
@@ -24,12 +25,12 @@ function formatLastCallSubtitle(f) {
   return `${formatCallTimestamp(f.last_call_at)}${countPart}  ${direction}`;
 }
 
-export default function FriendsSection({ onStartCall }) {
+export default function FriendsSection({ onStartCall, notify, myUserId }) {
   const [friends, setFriends] = useState([]);
   const [selected, setSelected] = useState(null);
-  // 'calls' (default, opened by clicking a friend row) or 'mood' (opened via
-  // the (i) button) -- mirrors the Flutter client's CallHistoryScreen with
-  // its (i) action into FriendMoodScreen.
+  // 'calls' (default, opened by clicking a friend row), 'mood' (opened via
+  // the (i) button), or 'chat' (opened via the chat button) -- mirrors the
+  // Flutter client's CallHistoryScreen/FriendMoodScreen/DirectMessageScreen.
   const [view, setView] = useState('calls');
   const [callHistory, setCallHistory] = useState(null);
   const [mood, setMood] = useState(null);
@@ -44,6 +45,10 @@ export default function FriendsSection({ onStartCall }) {
 
   const load = () => apiJson('/friends').then(setFriends).catch(() => {});
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    apiJson('/friends/unread_message_counts').then(notify.seedDmUnreadCounts).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // See ChatsSection's identical effect -- swaps list/detail on mobile widths.
   useEffect(() => {
@@ -69,6 +74,12 @@ export default function FriendsSection({ onStartCall }) {
     setView('calls');
     const data = await apiJson(`/friends/${f.id}/calls`).catch(() => []);
     setCallHistory(data);
+  };
+
+  const openChat = (e, f) => {
+    e.stopPropagation();
+    setSelected(f);
+    setView('chat');
   };
 
   const showMood = async () => {
@@ -151,9 +162,15 @@ export default function FriendsSection({ onStartCall }) {
             {pickingCall ? (
               callSelection.includes(f.id) && <CheckIcon />
             ) : (
-              <button className="conv-link-btn" title={`Call ${f.nickname || f.username}`} onClick={(e) => callFriend(e, f.id)}>
-                <PhoneIcon />
-              </button>
+              <>
+                <button className="conv-link-btn dm-chat-btn" title={`Message ${f.nickname || f.username}`} onClick={(e) => openChat(e, f)}>
+                  <ChatIcon />
+                  {notify.dmUnreadCounts[f.id] > 0 && <span className="dm-badge">{notify.dmUnreadCounts[f.id]}</span>}
+                </button>
+                <button className="conv-link-btn" title={`Call ${f.nickname || f.username}`} onClick={(e) => callFriend(e, f.id)}>
+                  <PhoneIcon />
+                </button>
+              </>
             )}
           </div>
         ))}
@@ -165,6 +182,9 @@ export default function FriendsSection({ onStartCall }) {
           </div>
         )}
       </ListPane>
+      {view === 'chat' && selected ? (
+        <DirectMessageThread friend={selected} myUserId={myUserId} notify={notify} onBack={() => setSelected(null)} />
+      ) : (
       <div className="detail-pane detail-view" style={{ flex: 1 }}>
         {selected ? (
           <div className="detail-card">
@@ -236,6 +256,7 @@ export default function FriendsSection({ onStartCall }) {
           <div className="hint">Select a friend to see their calls and mood.</div>
         )}
       </div>
+      )}
     </>
   );
 }

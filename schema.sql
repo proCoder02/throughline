@@ -331,6 +331,49 @@ ALTER TABLE call_participants ADD COLUMN IF NOT EXISTS conversation_id INTEGER R
 -- after just reuses it -- see app.py.
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS shared_title TEXT;
 
+-- ============================================================================
+-- Direct messages (1:1 text chat between real users) -- friends-only, same
+-- trust boundary as calling (app-side check against the friendships table).
+-- Delivered live via the same /ws/notify channel + push_notification()
+-- every other real-time event already uses (task_created,
+-- call_conversation_ready, etc.) -- no separate transport needed.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS direct_messages (
+    id SERIAL PRIMARY KEY,
+    sender_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    recipient_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- WhatsApp/Telegram's three-state tick model: created_at alone is
+    -- "sent" (single tick); delivered_at is "reached the recipient's
+    -- device" (double grey tick), set by an explicit client ack (see
+    -- POST .../messages/delivered) rather than inferred from whether the
+    -- WS push send succeeded -- a successful TCP send doesn't guarantee the
+    -- app layer actually processed it. read_at is "opened" (double blue
+    -- tick) and implies delivered_at (see mark_direct_messages_read, which
+    -- backfills delivered_at too in case a client jumps straight to "read"
+    -- without a separate delivered ack, e.g. opening a thread from a
+    -- notification tap).
+    delivered_at TIMESTAMPTZ,
+    read_at TIMESTAMPTZ,
+    CHECK (sender_id <> recipient_id)
+);
+-- LEAST/GREATEST gives a canonical, order-independent key for "the thread
+-- between these two users" -- one index serves the history query
+-- (WHERE (sender=A AND recipient=B) OR (sender=B AND recipient=A)) as a
+-- single equality-range scan instead of an OR of two conditions.
+CREATE INDEX IF NOT EXISTS idx_direct_messages_thread
+    ON direct_messages (LEAST(sender_id, recipient_id), GREATEST(sender_id, recipient_id), created_at DESC);
+-- Partial index for the unread-count query -- only rows still unread ever
+-- match it, same "index only the hot subset" reasoning as
+-- idx_tasks_pending_email above.
+CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_unread
+    ON direct_messages (recipient_id, sender_id) WHERE read_at IS NULL;
+-- The table already existed before delivered_at was added -- CREATE TABLE
+-- IF NOT EXISTS alone won't add a column to a table that already exists
+-- (same reasoning as every other ADD COLUMN IF NOT EXISTS in this file).
+ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+
 -- FCM device tokens for mobile push (calls, tasks, reminder emails, friend
 -- mood updates) -- one row per device; UNIQUE(token) lets registration be a
 -- plain upsert (token refresh, or the same device logging into a different
