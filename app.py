@@ -1942,6 +1942,25 @@ def push_notification(user_id, event):
         _queue_pending_event(user_id, event)
 
 
+def relay_ephemeral(user_id, event):
+    """Same live-delivery path as push_notification (local connection first,
+    ALWAYS followed by cross-process pub/sub too -- covers a user with a
+    second connection held by a different worker process, same reasoning
+    push_notification's own unconditional publish already has), but
+    deliberately skips the durable pending queue -- used for typing
+    indicators, which are meaningless once stale (unlike a task/message
+    notification, "was typing 10 minutes ago" isn't worth surfacing the
+    next time the recipient reconnects)."""
+    _deliver_to_local_connections(user_id, event)
+    try:
+        redis_client.publish(
+            _NOTIFY_CHANNEL,
+            json.dumps({"user_id": user_id, "event": event, "origin": _PROCESS_ID}),
+        )
+    except redis.RedisError:
+        pass
+
+
 def _notify_pubsub_listener():
     """Cross-process delivery: if some other worker process holds the live
     connection for a user an event was just published for, this delivers it
@@ -2176,6 +2195,64 @@ def unregister_device():
     return jsonify({"ok": True})
 
 
+def _handle_notify_client_message(user_id, msg):
+    """Direct-message delivery/read receipts, WhatsApp-style: they ride this
+    same persistent connection as an inbound message on it, rather than a
+    separate REST call per ack -- no per-tick HTTP connection setup, and it
+    reuses the exact channel that's already open for everything else. Each
+    ack batches every currently-pending message from that friend in one
+    UPDATE (an implicit watermark -- "everything not yet delivered/read, as
+    of now" -- rather than needing the client to track/send individual
+    message ids), the same batching a real client does by sending one
+    "read up to X" marker instead of N separate acks.
+
+    Also handles 'typing' -- a pure relay (see relay_ephemeral), never
+    written to the database at all. Not batched/watermarked like the acks
+    above since there's nothing to batch: each keystroke-driven client send
+    is already its own complete, disposable signal."""
+    msg_type = msg.get("type")
+    if msg_type not in ("ack_delivered", "ack_read", "typing"):
+        return
+    friend_id = msg.get("friend_id")
+    if not isinstance(friend_id, int):
+        return
+
+    if msg_type == "typing":
+        relay_ephemeral(friend_id, {"type": "friend_typing", "friend_id": user_id})
+        return
+
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        if msg_type == "ack_delivered":
+            cur.execute(
+                "UPDATE direct_messages SET delivered_at = now() "
+                "WHERE sender_id = %s AND recipient_id = %s AND delivered_at IS NULL "
+                "RETURNING id",
+                (friend_id, user_id),
+            )
+            event_type = "direct_messages_delivered"
+        else:
+            cur.execute(
+                "UPDATE direct_messages SET read_at = now(), delivered_at = COALESCE(delivered_at, now()) "
+                "WHERE sender_id = %s AND recipient_id = %s AND read_at IS NULL "
+                "RETURNING id",
+                (friend_id, user_id),
+            )
+            event_type = "direct_messages_read"
+        ids = [row[0] for row in cur.fetchall()]
+        conn.commit()
+    except Exception as e:
+        print(f"[ws_notify] ack handling error: {e!r}")
+        conn.rollback()
+        ids = []
+    finally:
+        release_raw_connection(conn)
+
+    if ids:
+        push_notification(friend_id, {"type": event_type, "friend_id": user_id, "message_ids": ids})
+
+
 @sock.route("/ws/notify")
 def ws_notify(ws):
     user_id = session.get("user_id")
@@ -2196,10 +2273,21 @@ def ws_notify(ws):
 
     try:
         while True:
-            # No client->server messages expected on this channel; this
-            # just blocks until the browser closes the tab/connection.
-            if ws.receive() is None:
+            raw = ws.receive()
+            if raw is None:
                 break
+            # Only direct-message delivery/read acks are expected inbound on
+            # this channel (see _handle_notify_client_message) -- anything
+            # else (malformed JSON, an unrecognized type) is just ignored,
+            # never lets a bad client message kill the connection.
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            try:
+                _handle_notify_client_message(user_id, msg)
+            except Exception as e:
+                print(f"[ws_notify] client message handling failed: {e!r}")
     finally:
         with _notify_lock:
             conns = _notify_connections.get(user_id, [])
@@ -3127,6 +3215,107 @@ def friend_mood(friend_id):
         pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
 
     return jsonify(response)
+
+
+@app.route("/friends/<int:friend_id>/messages", methods=["GET"])
+@login_required
+def list_direct_messages(friend_id):
+    """Message history with one friend, oldest-first (matching every other
+    message list in this app), paginated via ?before_id= for loading older
+    messages on scroll-up -- the client's LocalCache keeps the most recent
+    page on-device, so this is only hit for a thread's first load or when
+    scrolling past what's cached."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s", (user_id, friend_id))
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    limit = min(request.args.get("limit", type=int) or 50, 100)
+    before_id = request.args.get("before_id", type=int)
+    params = {"me": user_id, "friend": friend_id, "limit": limit}
+    extra = ""
+    if before_id:
+        extra = "AND direct_messages.id < %(before_id)s"
+        params["before_id"] = before_id
+    cur.execute(
+        f"SELECT id, sender_id, recipient_id, content, created_at, delivered_at, read_at FROM direct_messages "
+        f"WHERE ((sender_id = %(me)s AND recipient_id = %(friend)s) "
+        f"OR (sender_id = %(friend)s AND recipient_id = %(me)s)) {extra} "
+        f"ORDER BY id DESC LIMIT %(limit)s",
+        params,
+    )
+    messages = [serialize_row(r) for r in cur.fetchall()]
+    messages.reverse()
+    return jsonify(messages)
+
+
+@app.route("/friends/<int:friend_id>/messages", methods=["POST"])
+@login_required
+def send_direct_message(friend_id):
+    data = request.get_json(silent=True) or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s", (user_id, friend_id))
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "INSERT INTO direct_messages (sender_id, recipient_id, content) VALUES (%s, %s, %s) "
+        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at",
+        (user_id, friend_id, content),
+    )
+    message = serialize_row(cur.fetchone())
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    sender_name = cur.fetchone()["username"]
+
+    # Same real-time transport every other push-worthy event in this app
+    # already uses (task_created, call_conversation_ready, ...) -- no new
+    # WS route or delivery mechanism needed. sender_username rides along so
+    # the client can show a real name in a foreground local notification
+    # without a separate lookup (mirrors the FCM title below).
+    push_notification(friend_id, {"type": "direct_message", "message": message, "sender_username": sender_name})
+    send_fcm_to_user(
+        friend_id, title=sender_name, body=content,
+        data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message["id"])},
+    )
+
+    try:
+        # Feeds the same cognitive-intelligence pipeline /chat and
+        # /chat/global already trigger after every message -- a correction
+        # or new fact stated to a friend ("actually I start the new job
+        # Monday, not next week") is exactly the kind of thing that pipeline
+        # already looks for, regardless of which surface it was said on.
+        from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, content), daemon=True).start()
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+
+    return jsonify(message)
+
+
+@app.route("/friends/unread_message_counts", methods=["GET"])
+@login_required
+def unread_message_counts():
+    """Per-friend unread count for the Friends-list badge -- same shape as
+    the task/chat badge counts NotifyProvider already tracks."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT sender_id AS friend_id, count(*) AS unread FROM direct_messages "
+        "WHERE recipient_id = %s AND read_at IS NULL GROUP BY sender_id",
+        (user_id,),
+    )
+    return jsonify({str(r["friend_id"]): r["unread"] for r in cur.fetchall()})
 
 
 @app.route("/mood/history", methods=["GET"])
@@ -4139,13 +4328,29 @@ def chat_global():
     persona_context = build_persona_context(get_user_persona(cur, user_id))
 
     # Cheap local keyword match against this user's known people -- no extra
-    # LLM call just to figure out who the question is about.
+    # LLM call just to figure out who the question is about. Two separate
+    # identity spaces, checked independently: speaker_profiles only covers
+    # people labeled in a Listen transcript (a friend you've only ever
+    # messaged/called, never dictated a conversation naming, would never
+    # appear there) -- matched_friend below covers real friendships instead,
+    # which is what unlocks the direct-message content further down.
     cur.execute("SELECT id, name FROM speaker_profiles WHERE user_id = %s", (user_id,))
     matched = None
     prompt_lower = prompt.lower()
     for p in cur.fetchall():
         if re.search(r"\b" + re.escape(p["name"].lower()) + r"\b", prompt_lower):
             matched = p
+            break
+
+    cur.execute(
+        "SELECT u.id, COALESCE(f.nickname, u.username) AS name FROM friendships f "
+        "JOIN users u ON u.id = f.friend_id WHERE f.user_id = %s",
+        (user_id,),
+    )
+    matched_friend = None
+    for f in cur.fetchall():
+        if re.search(r"\b" + re.escape(f["name"].lower()) + r"\b", prompt_lower):
+            matched_friend = f
             break
 
     remember_ei_recent_statement(user_id, prompt)
@@ -4163,24 +4368,40 @@ def chat_global():
         knowledge_context = get_relevant_knowledge_cards(user_id, question=prompt)
         if knowledge_context:
             ei_context = f"{ei_context}\n\n{knowledge_context}" if ei_context else knowledge_context
-        if matched:
-            cur.execute(
-                "SELECT u.id FROM friendships f JOIN users u ON u.id = f.friend_id "
-                "WHERE f.user_id = %s AND lower(u.username) LIKE lower(%s)",
-                (user_id, f"%{matched['name']}%"),
-            )
-            friend_row = cur.fetchone()
-            if friend_row:
-                insight = get_friend_relationship_insight(user_id, friend_row["id"])
-                if insight:
-                    insight_text = (
-                        f"Relationship insight with {matched['name']}: trust={insight['trust_score']}, "
-                        f"conflict={insight['conflict_score']}, emotional_support={insight['emotional_support']}. "
-                        f"{insight['relationship_summary'] or ''}"
-                    )
-                    ei_context = f"{ei_context}\n\n{insight_text}" if ei_context else insight_text
+        if matched_friend:
+            insight = get_friend_relationship_insight(user_id, matched_friend["id"])
+            if insight:
+                insight_text = (
+                    f"Relationship insight with {matched_friend['name']}: trust={insight['trust_score']}, "
+                    f"conflict={insight['conflict_score']}, emotional_support={insight['emotional_support']}. "
+                    f"{insight['relationship_summary'] or ''}"
+                )
+                ei_context = f"{ei_context}\n\n{insight_text}" if ei_context else insight_text
     except Exception:
         ei_context = ""  # EI engine is optional and additive -- never affects this endpoint's own behavior
+
+    # Recent direct-message history with a matched friend -- the gap this
+    # was added to close: /chat/global previously had no path to this table
+    # at all, so "what did Kunal and I talk about" could never be answered
+    # even though the messages exist, because retrieval below only ever
+    # looked at Listen-derived conversations.
+    GLOBAL_CHAT_DM_LIMIT = 30
+    direct_messages_context = ""
+    if matched_friend:
+        cur.execute(
+            "SELECT sender_id, content, created_at FROM direct_messages "
+            "WHERE (sender_id = %(me)s AND recipient_id = %(friend)s) "
+            "OR (sender_id = %(friend)s AND recipient_id = %(me)s) "
+            "ORDER BY id DESC LIMIT %(limit)s",
+            {"me": user_id, "friend": matched_friend["id"], "limit": GLOBAL_CHAT_DM_LIMIT},
+        )
+        dm_rows = list(reversed(cur.fetchall()))
+        if dm_rows:
+            dm_lines = [f"Your direct-message chat with {matched_friend['name']} (most recent {len(dm_rows)} messages):"]
+            for r in dm_rows:
+                who = "You" if r["sender_id"] == user_id else matched_friend["name"]
+                dm_lines.append(f"- {who}: {r['content']}")
+            direct_messages_context = "\n".join(dm_lines)
 
     # Your own past observations about this person (from personality_notes,
     # written by /analyze whenever they showed up as a speaker in one of
@@ -4215,7 +4436,7 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
-    if not conversations and not ei_context and not personal_notes_context:
+    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context:
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -4239,8 +4460,11 @@ def chat_global():
     transcripts_section = "\n\n---\n\n".join(blocks) if blocks else "(No saved conversation transcripts available.)"
     if personal_notes_context:
         transcripts_section = f"{personal_notes_context}\n\n---\n\n{transcripts_section}"
+    if direct_messages_context:
+        transcripts_section = f"{direct_messages_context}\n\n---\n\n{transcripts_section}"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
-    global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched["name"] if matched else None)
+    matched_name = matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
+    global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched_name)
     if ei_context:
         global_chat_system_prompt = f"{global_chat_system_prompt}\n\n{ei_context}"
     messages = [{"role": "system", "content": global_chat_system_prompt}]

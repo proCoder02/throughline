@@ -121,7 +121,7 @@ export default function App() {
       )}
       {section === 'tasks' && <TasksSection notify={notify} onOpenConversation={openConversationInChats} />}
       {section === 'profiles' && <ProfilesSection onOpenConversation={openConversationInChats} />}
-      {section === 'friends' && <FriendsSection onStartCall={call.startCall} />}
+      {section === 'friends' && <FriendsSection onStartCall={call.startCall} notify={notify} myUserId={auth.user.id} />}
       <CallOverlay
         incomingCall={call.activeCall ? null : notify.incomingCall}
         activeCall={call.activeCall}

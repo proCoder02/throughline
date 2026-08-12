@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { SendIcon } from '../icons.jsx';
 
-export default function Composer({ onSend, disabled, placeholder, extraButton }) {
+export default function Composer({ onSend, disabled, placeholder, extraButton, onTyping }) {
   const [value, setValue] = useState('');
 
   const send = () => {
@@ -17,7 +17,10 @@ export default function Composer({ onSend, disabled, placeholder, extraButton })
         rows={1}
         placeholder={placeholder || 'Type a message'}
         value={value}
-        onChange={(e) => setValue(e.target.value)}
+        onChange={(e) => {
+          setValue(e.target.value);
+          if (e.target.value.trim()) onTyping?.();
+        }}
         onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
       />
       {extraButton}
