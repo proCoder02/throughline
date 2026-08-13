@@ -28,20 +28,65 @@ export function useNotifications(enabled) {
   // with no registered listener falls back to just bumping the badge count,
   // matching the mobile client's "active thread" suppression logic.
   const dmListenersRef = useRef(new Map());
+  // Reconnect bookkeeping -- previously this socket was fire-and-forget: no
+  // onclose handler at all, so any drop (backend restart, network blip, the
+  // tab sleeping) killed ticks/messages permanently until a manual page
+  // refresh (this is what the "had to refresh react to get double tick"
+  // symptom actually was). Mirrors the Flutter client's NotifySocket:
+  // backoff on drop, plus an immediate reconnect on tab-visible so this
+  // behaves like WhatsApp/Telegram rather than sitting on a stale timer.
+  const reconnectTimerRef = useRef(null);
+  const reconnectAttemptRef = useRef(0);
+  const closingRef = useRef(false);
 
   useEffect(() => {
     if (!enabled) return;
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const token = getToken();
-    const url = `${proto}//${window.location.host}/ws/notify` + (token ? `?token=${encodeURIComponent(token)}` : '');
-    const socket = new WebSocket(url);
-    socketRef.current = socket;
-    socket.onopen = () => {
-      const pending = outboxRef.current;
-      outboxRef.current = [];
-      for (const obj of pending) sendNow(obj);
+    closingRef.current = false;
+
+    const connectSocket = () => {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const token = getToken();
+      const url = `${proto}//${window.location.host}/ws/notify` + (token ? `?token=${encodeURIComponent(token)}` : '');
+      const socket = new WebSocket(url);
+      socketRef.current = socket;
+      socket.onopen = () => {
+        reconnectAttemptRef.current = 0;
+        const pending = outboxRef.current;
+        outboxRef.current = [];
+        for (const obj of pending) sendNow(obj);
+      };
+      socket.onclose = scheduleReconnect;
+      socket.onerror = () => socket.close();
+      socket.onmessage = handleMessage;
     };
-    socket.onmessage = (event) => {
+
+    const scheduleReconnect = () => {
+      if (closingRef.current) return;
+      clearTimeout(reconnectTimerRef.current);
+      // Tightened from [1000, 2000, 5000, 10000, 20000] to match the Flutter
+      // client's NotifySocket -- real-device testing found the first
+      // connection attempt frequently fails right at startup, and the old
+      // schedule let recovery take 1-2+ minutes before task_created/
+      // direct_message pushes were actually receivable again.
+      const delays = [500, 1000, 2000, 3000, 5000];
+      const delay = delays[Math.min(reconnectAttemptRef.current, delays.length - 1)];
+      reconnectAttemptRef.current += 1;
+      reconnectTimerRef.current = setTimeout(connectSocket, delay);
+    };
+
+    // Tab was backgrounded/asleep and the socket dropped in the meantime --
+    // reconnect the instant it's visible again instead of waiting out
+    // whatever backoff delay happened to be running.
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (socketRef.current?.readyState === WebSocket.OPEN) return;
+      clearTimeout(reconnectTimerRef.current);
+      reconnectAttemptRef.current = 0;
+      connectSocket();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    const handleMessage = (event) => {
       const msg = JSON.parse(event.data);
       if (msg.type === 'task_created') {
         setTaskCount((c) => c + 1);
@@ -88,7 +133,15 @@ export function useNotifications(enabled) {
         setTypingFriends((prev) => (prev.has(friendId) ? prev : new Set(prev).add(friendId)));
       }
     };
-    return () => socket.close();
+
+    connectSocket();
+
+    return () => {
+      closingRef.current = true;
+      clearTimeout(reconnectTimerRef.current);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      socketRef.current?.close();
+    };
   }, [enabled]);
 
   const clearTasks = () => setTaskCount(0);

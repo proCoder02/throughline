@@ -1878,6 +1878,99 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     })
 
 
+# Cheap pre-filter before spending an LLM call on reminder detection below --
+# most chat messages aren't a reminder request at all, so this must be cheap
+# and skip the vast majority of traffic (same role as ei_adapter.py's
+# is_closing_acknowledgment/is_probably_just_a_question).
+_REMINDER_INTENT_RE = re.compile(
+    r"\bremind(?:er|ers)?\b|\bdon'?t let me forget\b", re.IGNORECASE
+)
+
+REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
+
+The user just said this in chat. Determine whether they're asking to be reminded of something (a task, event, or commitment) -- not just using the word "remind" in passing.
+
+If yes, extract:
+- description: short (<20 words) description of what to be reminded about, in your own words
+- due_date: short human phrase as said/implied (e.g. "Saturday", "tonight"), else null
+- reminder_at: resolve any date/time phrase against today's date above into exact ISO 8601 "YYYY-MM-DDTHH:MM:SS" (assume 09:00:00 if only a day is given, no time). Else null. Do not guess if nothing time-related was said.
+
+If this is not a genuine reminder request, reply with {{"is_reminder": false}}.
+
+The user's message:
+{message}
+
+Reply with ONLY this JSON, no preamble/fences:
+{{"is_reminder": true, "description": "", "due_date": null, "reminder_at": null}}"""
+
+
+def trigger_reminder_extraction(user_id, message_content) -> None:
+    """Fire-and-forget, mirrors trigger_chat_feedback_extraction exactly --
+    call from a background thread right after /chat or /chat/global has
+    already sent its reply, so "remind me to X on Saturday" typed in chat
+    becomes a real task with a resolved reminder_at, without adding latency
+    to the user-facing response. Once inserted, _check_overdue_tasks
+    (nudges/nudge_engine.py) and email_reminder_worker (above) already pick
+    it up automatically off reminder_at/status -- nothing else needed.
+
+    Never raises and never blocks -- same reasoning as
+    trigger_chat_feedback_extraction: this always runs after the chat
+    response is already on its way, so a failure here must never surface to
+    the user."""
+    message_content = (message_content or "").strip()
+    if not user_id or not message_content:
+        return
+    if not _REMINDER_INTENT_RE.search(message_content):
+        return
+
+    try:
+        now_local = datetime.now().astimezone()
+        prompt = REMINDER_EXTRACTION_PROMPT_TEMPLATE.format(
+            today=now_local.strftime("%A, %Y-%m-%d"),
+            now=now_local.strftime("%H:%M %Z"),
+            message=message_content,
+        )
+        content = call_llm([{"role": "user", "content": prompt}])
+        parsed = extract_json(content)
+        if not parsed or not parsed.get("is_reminder"):
+            return
+        description = (parsed.get("description") or "").strip()
+        if not description:
+            return
+
+        conn = get_raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
+                "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
+                (user_id, description, parsed.get("due_date"), normalize_reminder_at(parsed.get("reminder_at"))),
+            )
+            task_id = cur.fetchone()[0]
+            conn.commit()
+        except Exception as e:
+            print(f"[trigger_reminder_extraction] DB error: {e!r}")
+            conn.rollback()
+            return
+        finally:
+            release_raw_connection(conn)
+
+        # Identical event shape to run_background_analysis's task_created
+        # push above -- existing client handling (notify_provider.dart's
+        # case 'task_created', and the React equivalent) picks this up with
+        # no changes needed.
+        push_notification(user_id, {
+            "type": "task_created", "task_id": task_id, "description": description,
+            "conversation_id": None,
+        })
+        send_fcm_to_user(
+            user_id, title="New task", body=description,
+            data={"type": "task_created", "task_id": task_id, "conversation_id": ""},
+        )
+    except Exception as e:
+        print(f"[trigger_reminder_extraction] failed: {e!r}")
+
+
 # ---------------------------------------------------------------------------
 # Live notifications (WebSocket + Redis-backed pending queue + pub/sub)
 #
@@ -3889,6 +3982,22 @@ CHAT_CLOSING_GUIDANCE = (
     "conversation rest there."
 )
 
+# This reply and the actual reminder-scheduling (trigger_reminder_extraction,
+# a separate background LLM call fired after this reply is already sent) are
+# fully decoupled -- without this guidance the model has no idea reminders
+# are a real, supported capability and defaults to denying it ("I can't set
+# reminders, but a calendar alarm would work"), directly contradicting the
+# task that silently gets created moments later. This just keeps the visible
+# reply honest/consistent; it has no effect on whether a task actually gets
+# created, which _REMINDER_INTENT_RE + the LLM extraction below decide
+# independently of what this reply says.
+CHAT_REMINDER_GUIDANCE = (
+    "If the user asks to be reminded about something (e.g. \"remind me to X on Saturday\"), "
+    "acknowledge it naturally and confirm you'll remind them -- reminders ARE a real, supported "
+    "feature here and get scheduled automatically from this conversation. Never say you can't set "
+    "reminders, and never suggest a calendar app or phone alarm instead."
+)
+
 
 def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_context=""):
     base = (
@@ -3903,6 +4012,7 @@ def build_chat_system_prompt(personalization=DEFAULT_PERSONALIZATION, persona_co
         + PERSONALIZATION_GUIDANCE[normalize_personalization(personalization)]
         + " " + CHAT_FORMATTING_GUIDANCE
         + " " + CHAT_CLOSING_GUIDANCE
+        + " " + CHAT_REMINDER_GUIDANCE
     )
     return base + (f" {persona_context}" if persona_context else "")
 
@@ -3920,7 +4030,7 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
         "continuous conversation. Ground your answer only in what's in these excerpts; if the "
         "answer isn't there, say so briefly rather than guessing. Be concise, no preamble. "
-        + CHAT_FORMATTING_GUIDANCE + " " + CHAT_CLOSING_GUIDANCE
+        + CHAT_FORMATTING_GUIDANCE + " " + CHAT_CLOSING_GUIDANCE + " " + CHAT_REMINDER_GUIDANCE
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
@@ -4274,6 +4384,7 @@ def chat():
     except Exception:
         pass  # EI engine is optional and additive -- never affects this endpoint's own behavior, and this
               # runs in the background after the reply below is already on its way -- never blocks the user.
+    threading.Thread(target=trigger_reminder_extraction, args=(user_id, prompt), daemon=True).start()
 
     return jsonify({"reply": reply})
 
@@ -4499,6 +4610,7 @@ def chat_global():
         threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
     except Exception:
         pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+    threading.Thread(target=trigger_reminder_extraction, args=(user_id, prompt), daemon=True).start()
 
     return jsonify({
         "reply": reply,

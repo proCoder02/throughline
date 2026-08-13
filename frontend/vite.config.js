@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-const FLASK = 'http://localhost:5000';
+const FLASK = 'http://129.213.21.239';
 
 // Existing Flask routes are unprefixed (no /api), so the dev proxy forwards
 // each one by exact path instead of renaming the whole backend surface.

@@ -21,6 +21,16 @@ export default function TasksSection({ notify, onOpenConversation }) {
   // Runs once per mount -- App remounts this section fresh each time the
   // user switches to it, so this fires exactly on "now viewing Tasks".
   useEffect(() => { notify?.clearTasks(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Covers the one gap the mount-time load above doesn't: a task_created
+  // push (e.g. a reminder detected in chat) arriving while already sitting
+  // on this tab, which wouldn't otherwise trigger a remount.
+  useEffect(() => {
+    if (notify?.taskCount > 0) {
+      notify.clearTasks();
+      load();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notify?.taskCount]);
 
   const toggle = async (t) => {
     await post(`/tasks/${t.id}/${t.status === 'done' ? 'reopen' : 'complete'}`, {});
