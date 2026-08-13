@@ -1,0 +1,164 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - postgresql
+  - postgresql-contrib
+  - redis-server
+  - nginx
+  - python3-venv
+  - python3-pip
+  - git
+  - certbot
+  - python3-certbot-nginx
+
+write_files:
+  - path: /opt/throughline/.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      ${indent(6, env_file_contents)}
+
+%{ if has_firebase_creds ~}
+  - path: /opt/throughline/firebase-credentials.json
+    owner: root:root
+    permissions: '0600'
+    encoding: b64
+    content: ${firebase_json_b64}
+%{ endif ~}
+
+  - path: /etc/systemd/system/throughline.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Throughline Flask backend (gunicorn)
+      After=network.target postgresql.service redis-server.service
+      Requires=postgresql.service redis-server.service
+
+      [Service]
+      Type=simple
+      User=root
+      WorkingDirectory=/opt/throughline/app/${app_subdirectory}
+      EnvironmentFile=/opt/throughline/.env
+      # -w 1 is not a tuning knob -- app.py's background workers (email
+      # reminders, the notify pub/sub listener, the nudge engine) assume a
+      # single process; a second gunicorn worker would start duplicate
+      # copies of all of them.
+      ExecStart=/opt/throughline/venv/bin/gunicorn -k gevent -w 1 -b 127.0.0.1:5000 --timeout 120 app:app
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/nginx/sites-available/throughline
+    permissions: '0644'
+    content: |
+      server {
+          listen 80;
+          server_name ${domain_name != "" ? domain_name : "_"};
+
+          client_max_body_size 50M;
+
+          location / {
+              proxy_pass http://127.0.0.1:5000;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              # WebSocket connections (/ws/notify, /ws/listen) are long-lived
+              # -- nginx's default proxy read timeout (60s) would silently
+              # drop an idle-but-still-open connection.
+              proxy_read_timeout 3600s;
+          }
+      }
+
+  - path: /opt/throughline/setup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Re-runnable: safe to call again by hand after a `git pull` to
+      # redeploy (it won't recreate the DB role/database if they already
+      # exist, and pip/systemd steps are naturally idempotent).
+      set -euo pipefail
+
+      # --- Postgres -------------------------------------------------------
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='throughline'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE ROLE throughline WITH LOGIN PASSWORD '${database_password}';"
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='throughline'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE DATABASE throughline OWNER throughline;"
+
+      # --- Node.js (frontend build only -- nothing at runtime needs it) ---
+      # Ubuntu 22.04's own apt repo ships Node 12, too old for this Vite 5
+      # frontend -- NodeSource's setup script swaps in their repo for a
+      # current LTS before the actual install.
+      if ! command -v node >/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 18 ]; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        apt-get install -y nodejs
+      fi
+
+      # --- App source -------------------------------------------------------
+      if [ ! -d /opt/throughline/app ]; then
+        git clone --branch "${app_repo_branch}" --depth 1 "${app_repo_url}" /opt/throughline/app
+      else
+        git -C /opt/throughline/app fetch origin "${app_repo_branch}"
+        git -C /opt/throughline/app checkout "${app_repo_branch}"
+        git -C /opt/throughline/app reset --hard "origin/${app_repo_branch}"
+      fi
+
+      cd /opt/throughline/app/${app_subdirectory}
+
+      # --- Python env -------------------------------------------------------
+      if [ ! -d /opt/throughline/venv ]; then
+        python3 -m venv /opt/throughline/venv
+      fi
+      /opt/throughline/venv/bin/pip install --upgrade pip
+      /opt/throughline/venv/bin/pip install -r requirements.txt
+      # Not in requirements.txt -- only needed for the production WSGI
+      # server, not local `python app.py` development.
+      /opt/throughline/venv/bin/pip install gunicorn gevent
+
+      # --- Frontend build -------------------------------------------------
+      # vite.config.js's build.outDir (../static/app) lands this directly
+      # where app.py's own catch-all route already expects it
+      # (app.static_folder + "/app/index.html") -- same-origin in
+      # production, no CORS/proxy config needed, matching how the dev-only
+      # Vite proxy in that same config explicitly does NOT apply here.
+      if [ -d frontend ]; then
+        ( cd frontend && npm install && npm run build )
+      fi
+
+      # --- Schema -------------------------------------------------------
+      set -a; source /opt/throughline/.env; set +a
+      /opt/throughline/venv/bin/python postgres_setup.py
+      if [ -f emotional_intelligence/apply_emotional_intelligence_schema.py ]; then
+        /opt/throughline/venv/bin/python emotional_intelligence/apply_emotional_intelligence_schema.py
+      fi
+      if [ -f nudges/apply_nudges_schema.py ]; then
+        /opt/throughline/venv/bin/python nudges/apply_nudges_schema.py
+      fi
+
+      # --- Services -------------------------------------------------------
+      ln -sf /etc/nginx/sites-available/throughline /etc/nginx/sites-enabled/throughline
+      rm -f /etc/nginx/sites-enabled/default
+      nginx -t
+
+      systemctl daemon-reload
+      systemctl enable --now postgresql redis-server
+      systemctl enable --now throughline
+      systemctl restart nginx
+
+runcmd:
+  - [ bash, /opt/throughline/setup.sh ]
+%{ if domain_name != "" ~}
+  # Only attempts a cert once DNS for the domain actually resolves to this
+  # instance -- harmless to leave in even before that's true, it just fails
+  # and logs a message rather than blocking the rest of setup; re-run by
+  # hand once DNS is live: `certbot --nginx -d ${domain_name}`.
+  - [ certbot, --nginx, -d, "${domain_name}", --non-interactive, --agree-tos, -m, "admin@${domain_name}", --redirect ]
+%{ endif ~}
+
+final_message: "Throughline backend provisioning complete after $UPTIME seconds. Check systemctl status throughline / journalctl -u throughline if the app isn't responding."

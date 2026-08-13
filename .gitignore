@@ -16,6 +16,10 @@ env/
 firebase-credentials*.json
 *-firebase-adminsdk-*.json
 
+# OCI API signing key (referenced by ~/.oci/config's key_file)
+oraclekey.pem
+*.pem
+
 # Database files
 *.db
 *.sqlite3
