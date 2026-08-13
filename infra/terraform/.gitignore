@@ -4,3 +4,10 @@ terraform.tfvars
 .terraform/
 .terraform.lock.hcl
 crash.log
+
+# Saved plan files (`terraform plan -out=...`) store every variable's fully
+# resolved value in plaintext, including ones marked `sensitive = true` --
+# that flag only redacts CLI output, not the plan file itself.
+tfplan
+*.tfplan
+*.plan

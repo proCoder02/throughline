@@ -158,25 +158,33 @@ locals {
   # Rendered once here (not inline in the .tftpl) so the .env content and
   # the DB password used to actually create the Postgres role can't drift
   # apart from each other.
+  #
+  # Every value is double-quoted -- setup.sh does `source /opt/throughline/.env`
+  # to load these into a real bash shell (not just systemd's EnvironmentFile
+  # parser), and an unquoted value containing spaces -- e.g. a Gmail app
+  # password like "nnml zrqe obkg vred" -- gets parsed as a command line
+  # rather than an assignment, aborting the script under `set -e`. Quoting is
+  # safe for both bash `source` and systemd's EnvironmentFile (which also
+  # strips surrounding double quotes).
   env_file_contents = join("\n", [
-    "DATABASE_URL=postgresql://throughline:${var.database_password}@localhost:5432/throughline",
-    "REDIS_URL=redis://localhost:6379/0",
-    "FLASK_SECRET_KEY=${var.flask_secret_key}",
-    "DEEPGRAM_API_KEY=${var.deepgram_api_key}",
-    "GROQ_API_KEY=${var.groq_api_key}",
-    "sarvam_api=${var.sarvam_api_key}",
-    "olama_api_key=${var.ollama_api_key}",
-    "SMTP_HOST=${var.smtp_host}",
-    "SMTP_PORT=${var.smtp_port}",
-    "SMTP_USERNAME=${var.smtp_username}",
-    "SMTP_PASSWORD=${var.smtp_password}",
-    "LIVEKIT_URL=${var.livekit_url}",
-    "LIVEKIT_API_KEY=${var.livekit_api_key}",
-    "LIVEKIT_API_SECRET=${var.livekit_api_secret}",
-    "FIREBASE_CREDENTIALS_PATH=/opt/throughline/firebase-credentials.json",
-    "USE_GROQ_STT=${var.use_groq_stt}",
-    "EMOTIONAL_INTELLIGENCE_ENABLED=${var.emotional_intelligence_enabled}",
-    "NUDGE_FEATURE_ENABLED=${var.nudge_feature_enabled}",
-    "PORT=5000",
+    "DATABASE_URL=\"postgresql://throughline:${var.database_password}@localhost:5432/throughline\"",
+    "REDIS_URL=\"redis://localhost:6379/0\"",
+    "FLASK_SECRET_KEY=\"${var.flask_secret_key}\"",
+    "DEEPGRAM_API_KEY=\"${var.deepgram_api_key}\"",
+    "GROQ_API_KEY=\"${var.groq_api_key}\"",
+    "sarvam_api=\"${var.sarvam_api_key}\"",
+    "olama_api_key=\"${var.ollama_api_key}\"",
+    "SMTP_HOST=\"${var.smtp_host}\"",
+    "SMTP_PORT=\"${var.smtp_port}\"",
+    "SMTP_USERNAME=\"${var.smtp_username}\"",
+    "SMTP_PASSWORD=\"${var.smtp_password}\"",
+    "LIVEKIT_URL=\"${var.livekit_url}\"",
+    "LIVEKIT_API_KEY=\"${var.livekit_api_key}\"",
+    "LIVEKIT_API_SECRET=\"${var.livekit_api_secret}\"",
+    "FIREBASE_CREDENTIALS_PATH=\"/opt/throughline/firebase-credentials.json\"",
+    "USE_GROQ_STT=\"${var.use_groq_stt}\"",
+    "EMOTIONAL_INTELLIGENCE_ENABLED=\"${var.emotional_intelligence_enabled}\"",
+    "NUDGE_FEATURE_ENABLED=\"${var.nudge_feature_enabled}\"",
+    "PORT=\"5000\"",
   ])
 }
