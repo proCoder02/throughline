@@ -1,0 +1,30 @@
+# Copy this file to terraform.tfvars and fill in real values.
+# terraform.tfvars itself is gitignored -- never commit it.
+
+region           = "us-ashburn-1"
+compartment_ocid = "ocid1.tenancy.oc1..xxxxxxxx" # your tenancy OCID works fine here for a single-app setup
+
+ssh_public_key = "ssh-ed25519 AAAA... you@yourmachine"
+
+# Leave blank to serve over plain HTTP by IP until you're ready to point a
+# domain at it -- see infra/README.md for the follow-up steps once you do.
+domain_name = ""
+
+database_password = "pick-a-real-password"
+flask_secret_key  = "generate-with-python-secrets-token_hex-32"
+
+deepgram_api_key = ""
+groq_api_key     = ""
+sarvam_api_key   = ""
+ollama_api_key   = ""
+
+smtp_username = ""
+smtp_password = ""
+
+livekit_url         = ""
+livekit_api_key     = ""
+livekit_api_secret  = ""
+
+# Paste the full contents of your Firebase service-account JSON file here,
+# e.g. firebase_credentials_json = file("../../speechtotext-xxx-firebase-adminsdk-xxx.json")
+firebase_credentials_json = ""
