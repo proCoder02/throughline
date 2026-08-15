@@ -141,6 +141,18 @@ write_files:
         /opt/throughline/venv/bin/python nudges/apply_nudges_schema.py
       fi
 
+      # --- Host firewall ----------------------------------------------------
+      # Oracle's stock Ubuntu image ships its own iptables ruleset independent
+      # of the OCI security list -- by default it only ACCEPTs SSH (22) and
+      # REJECTs everything else, so 80/443 stay unreachable from outside even
+      # though the security list already allows them. Idempotent: only
+      # inserts if a dport 80/443 ACCEPT rule isn't already present.
+      iptables -C INPUT -m state --state NEW -p tcp --dport 80 -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 5 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+      iptables -C INPUT -m state --state NEW -p tcp --dport 443 -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+      netfilter-persistent save
+
       # --- Services -------------------------------------------------------
       ln -sf /etc/nginx/sites-available/throughline /etc/nginx/sites-enabled/throughline
       rm -f /etc/nginx/sites-enabled/default

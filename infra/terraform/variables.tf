@@ -50,9 +50,9 @@ variable "app_repo_url" {
 }
 
 variable "app_repo_branch" {
-  description = "Branch to deploy."
+  description = "Branch to deploy. The GitHub remote has only \"dev\" and \"main\" -- no \"master\"."
   type        = string
-  default     = "master"
+  default     = "dev"
 }
 
 variable "app_subdirectory" {
