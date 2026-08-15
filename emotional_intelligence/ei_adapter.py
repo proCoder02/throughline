@@ -417,6 +417,42 @@ def get_friend_relationship_insight(user_id, friend_id) -> dict | None:
         return None
 
 
+def get_and_mark_weekly_digest_viewed(user_id) -> dict | None:
+    """The current user's most recent weekly digest (written by
+    nudges/nudge_engine.py's _check_weekly_digest, via
+    emotional_intelligence/weekly_digest.py) -- content is the JSON array
+    of insight cards. Marks it viewed on first read, same "GET = read
+    receipt" shape used elsewhere in this app. Returns None if disabled,
+    none exists yet, or on any failure -- GET /insights/digest treats that
+    exactly like "no digest yet", not an error."""
+    if not is_enabled() or not user_id:
+        return None
+    try:
+        conn = _connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, content, generated_at, viewed_at FROM emotional_intelligence.weekly_digests "
+                "WHERE user_id = %s ORDER BY generated_at DESC LIMIT 1",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            digest_id, content, generated_at, viewed_at = row
+            if viewed_at is None:
+                cur.execute(
+                    "UPDATE emotional_intelligence.weekly_digests SET viewed_at = now() WHERE id = %s",
+                    (digest_id,),
+                )
+            return {"cards": content, "generated_at": generated_at.isoformat()}
+        finally:
+            _release(conn)
+    except Exception as exc:
+        _log_failure("get_and_mark_weekly_digest_viewed", exc)
+        return None
+
+
 # A mood logged longer ago than this no longer counts as "their current
 # mood" -- without a cutoff, one Listen session that happened to log
 # "anxious" would keep steering every unrelated future chat message

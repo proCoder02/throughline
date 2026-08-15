@@ -415,6 +415,30 @@ ALTER TABLE emotional_intelligence.knowledge_cards ADD COLUMN search_tsv tsvecto
 CREATE INDEX IF NOT EXISTS idx_ei_knowledge_cards_search_tsv ON emotional_intelligence.knowledge_cards USING GIN (search_tsv);
 
 -- ----------------------------------------------------------------------------
+-- weekly_digests -- one row per generated "here's what I've noticed about
+-- you" digest (nudges/nudge_engine.py's _check_weekly_digest writes these,
+-- GET /insights/digest in app.py reads them). user_id points at
+-- public.users directly (unlike the subject-scoped tables above) since this
+-- is real-app-user-facing content, not research data -- no FK across
+-- schemas by convention elsewhere in this file, so left unconstrained same
+-- as other user_id columns here.
+--
+-- content is a JSON array of insight cards: [{"category", "label",
+-- "headline", "body"}, ...] -- see weekly_digest.py. Each card MAY carry a
+-- "world" key (a real-world suggestion matched to that insight) once that
+-- feature ships; it's intentionally omitted for now rather than a null
+-- placeholder, so adding it later is additive, not a migration.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS emotional_intelligence.weekly_digests (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    content JSONB NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    viewed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_ei_weekly_digests_user_generated ON emotional_intelligence.weekly_digests (user_id, generated_at DESC);
+
+-- ----------------------------------------------------------------------------
 -- transcript / transcript_scenes / transcript_speakers /
 -- transcript_speaker_turns -- the source ingestion tables populated by
 -- load_friends_transcripts.py, reconstructed here (that script's own

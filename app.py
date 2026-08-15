@@ -3310,6 +3310,25 @@ def friend_mood(friend_id):
     return jsonify(response)
 
 
+@app.route("/insights/digest", methods=["GET"])
+@login_required
+def latest_digest():
+    """Returns the current user's most recent weekly digest (a JSON array
+    of insight cards -- see emotional_intelligence/weekly_digest.py and
+    nudges/nudge_engine.py's _check_weekly_digest, which writes these).
+    Marks it viewed on first fetch. Empty response (not an error) if none
+    exists yet -- a brand-new account, or one with no EI data yet, simply
+    hasn't had a digest generated."""
+    user_id = current_user_id()
+    digest = None
+    try:
+        from emotional_intelligence.ei_adapter import get_and_mark_weekly_digest_viewed
+        digest = get_and_mark_weekly_digest_viewed(user_id)
+    except Exception:
+        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+    return jsonify({"digest": digest})
+
+
 @app.route("/friends/<int:friend_id>/messages", methods=["GET"])
 @login_required
 def list_direct_messages(friend_id):

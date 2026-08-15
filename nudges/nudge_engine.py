@@ -25,6 +25,7 @@ os.environ once at startup, not live-reloaded).
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -310,6 +311,66 @@ def _check_relationship_touchpoints(cur) -> list[dict]:
 
 
 # ----------------------------------------------------------------------------
+# 4. Weekly personal-insight digest
+# ----------------------------------------------------------------------------
+
+WEEKLY_DIGEST_COOLDOWN_DAYS = 7
+
+
+def _check_weekly_digest(cur) -> list[dict]:
+    """One digest per user per WEEKLY_DIGEST_COOLDOWN_DAYS -- the cooldown
+    IS the cadence, no separate day-of-week scheduling needed. Unlike the
+    three checkers above, this one has a side effect of its own (writing
+    the generated digest into emotional_intelligence.weekly_digests) -- the
+    LLM-generated content has to be persisted regardless of whether the
+    notification itself succeeds, so it can't wait for run_nudge_cycle's
+    own delivery loop the way a pure DB-read candidate can.
+    generate_weekly_digest() itself decides whether there's anything
+    genuinely new (returns None otherwise, including for a user with no EI
+    subject at all yet) -- that decision never spends the cooldown, so a
+    quiet user is simply re-checked next cycle instead of waiting a full
+    week for nothing."""
+    cur.execute(
+        """
+        SELECT u.id FROM users u
+        LEFT JOIN nudges.user_settings s ON s.user_id = u.id
+        WHERE COALESCE(s.nudges_enabled, TRUE) = TRUE
+        """
+    )
+    user_ids = [row[0] for row in cur.fetchall()]
+
+    out = []
+    for user_id in user_ids:
+        if _recently_sent(cur, user_id, "weekly_digest", "latest", WEEKLY_DIGEST_COOLDOWN_DAYS):
+            continue
+        try:
+            from emotional_intelligence.weekly_digest import generate_weekly_digest
+            cards = generate_weekly_digest(user_id)
+        except Exception as exc:
+            _log(f"generate_weekly_digest for user {user_id}", exc)
+            continue
+        if not cards:
+            continue
+
+        try:
+            cur.execute(
+                "INSERT INTO emotional_intelligence.weekly_digests (user_id, content) VALUES (%s, %s)",
+                (user_id, json.dumps(cards)),
+            )
+        except Exception as exc:
+            _log(f"storing weekly_digest for user {user_id}", exc)
+            continue
+
+        out.append({
+            "user_id": user_id, "nudge_type": "weekly_digest", "reference_id": "latest",
+            "title": "Your weekly insight is ready",
+            "body": "Tap to see what I've noticed this week.",
+            "data": {"type": "digest_ready"},
+        })
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Cycle runner + worker
 # ----------------------------------------------------------------------------
 
@@ -329,6 +390,7 @@ def run_nudge_cycle(push_fn, fcm_fn) -> int:
             candidates += _check_overdue_tasks(cur)
             candidates += _check_mood_trends(cur)
             candidates += _check_relationship_touchpoints(cur)
+            candidates += _check_weekly_digest(cur)
             for c in candidates:
                 try:
                     push_fn(c["user_id"], {"type": c["data"]["type"], **c["data"]})
