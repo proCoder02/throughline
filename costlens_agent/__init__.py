@@ -87,17 +87,68 @@ def _classify(url: str):
     return _PROVIDER_HOSTS.get(host)
 
 
-def _extract_tokens(response) -> int:
-    """Best-effort token count from an OpenAI-schema-compatible JSON body
-    (Groq and Ollama both are). Never raises — returns 0 on anything unusual."""
+# Estimated per-million-token USD pricing, keyed by (provider, model).
+# NOT verified against each provider's actual bill -- explicitly a
+# best-effort stand-in, per the user's own choice when this was added,
+# because real rates aren't available for the models actually in use here:
+#   - Ollama Cloud bills GPU-time against session/weekly quotas, not a
+#     stable per-token rate at all. The estimate below uses Groq's own
+#     published rate for gpt-oss-120b -- the literal same open-weight model,
+#     just hosted differently -- as the closest available comparable.
+#   - qwen/qwen3.6-27b (Groq's vision model, see GROQ_VISION_MODEL in
+#     app.py) has no published Groq rate of its own (preview model). The
+#     estimate below uses Qwen3 32B's published Groq rate -- same model
+#     family, closest available size class.
+# Verify/replace with real rates before trusting this for anything beyond a
+# rough directional signal. (input_per_million, output_per_million) in USD.
+_MODEL_PRICING_PER_MILLION_TOKENS = {
+    ("ollama", "gpt-oss:120b"): (0.15, 0.60),
+    ("groq", "qwen/qwen3.6-27b"): (0.29, 0.59),
+}
+
+
+def _estimate_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
+    rates = _MODEL_PRICING_PER_MILLION_TOKENS.get((provider, model))
+    if not rates:
+        return 0.0
+    input_rate, output_rate = rates
+    return round((input_tokens * input_rate + output_tokens * output_rate) / 1_000_000, 6)
+
+
+def _extract_usage(response, provider: str):
+    """Best-effort (input_tokens, output_tokens, model, cost). Never raises
+    -- returns zeros on anything unusual, e.g. Groq's Whisper transcription
+    responses, which have no usage/model fields at all (app.py requests
+    response_format="json", not "verbose_json", so there's no audio-duration
+    field to cost from either -- STT calls are tracked for latency/count
+    only, cost stays 0 rather than a fabricated number).
+
+    Two different response shapes in play here, not one -- confirmed via a
+    live call, initially missed (shipped as 0/0/0 for every Ollama call
+    until caught): Groq's endpoints are OpenAI-compatible
+    (`usage.prompt_tokens`/`usage.completion_tokens`), but app.py's call_llm
+    hits Ollama's own *native* /api/chat endpoint, not an OpenAI-compatible
+    /v1/chat/completions path -- its token counts are top-level
+    `prompt_eval_count`/`eval_count` fields, no nested `usage` object at
+    all (same field names chat_feedback_extraction.py already reads
+    elsewhere in this codebase for the same reason)."""
     try:
         content_type = response.headers.get("content-type", "")
         if "application/json" not in content_type:
-            return 0
+            return 0, 0, "", 0.0
         data = response.json()
-        return int(data.get("usage", {}).get("total_tokens", 0))
+        model = data.get("model") or ""
+        if "usage" in data:  # OpenAI-compatible shape (Groq)
+            usage = data.get("usage") or {}
+            input_tokens = int(usage.get("prompt_tokens", 0))
+            output_tokens = int(usage.get("completion_tokens", 0))
+        else:  # Ollama's native /api/chat shape
+            input_tokens = int(data.get("prompt_eval_count", 0))
+            output_tokens = int(data.get("eval_count", 0))
+        cost = _estimate_cost(provider, model, input_tokens, output_tokens)
+        return input_tokens, output_tokens, model, cost
     except Exception:
-        return 0
+        return 0, 0, "", 0.0
 
 
 def _patch_requests(tracker):
@@ -116,11 +167,16 @@ def _patch_requests(tracker):
 
         @_safe
         def report():
+            input_tokens, output_tokens, model, cost = _extract_usage(response, provider)
             tracker.log(
                 provider=provider,
                 endpoint=urlparse(request.url).path,
                 method=request.method,
-                tokens_used=_extract_tokens(response),
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                tokens_used=input_tokens + output_tokens,
+                cost=cost,
                 latency_ms=elapsed_ms,
                 status_code=response.status_code,
             )

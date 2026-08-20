@@ -22,6 +22,9 @@ class UsageRecord:
     method: str = "POST"
     feature_tag: str = "untagged"
     request_count: int = 1
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
     tokens_used: int = 0
     cost: float = 0.0
     latency_ms: int = 0
@@ -55,6 +58,9 @@ class CostLensTracker:
         method: str = "POST",
         feature_tag: str = "untagged",
         request_count: int = 1,
+        model: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
         tokens_used: int = 0,
         cost: float = 0.0,
         latency_ms: int = 0,
@@ -66,6 +72,9 @@ class CostLensTracker:
             method=method,
             feature_tag=feature_tag,
             request_count=request_count,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             tokens_used=tokens_used,
             cost=cost,
             latency_ms=latency_ms,
