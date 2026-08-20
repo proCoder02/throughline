@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import MessageBubble from './MessageBubble.jsx';
 import Composer from './Composer.jsx';
+import ImageComposePreview from './ImageComposePreview.jsx';
 import { BackIcon, TrashIcon, MicIcon, CloseIcon } from '../icons.jsx';
 
 export default function ChatThread({
@@ -8,9 +9,15 @@ export default function ChatThread({
   pendingSpeakerIndex = null, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
   tags, onTagClick, onDismissTag,
   messages, onSend, sending, onDelete, onListen, onStopListen, onBack,
-  subtitle, placeholder, emptyHint,
+  subtitle, placeholder, emptyHint, onSendImage,
 }) {
   const scrollRef = useRef(null);
+  // Only relevant when onSendImage is provided (global chat today) -- a
+  // picked-but-not-yet-sent image, held here rather than in the parent so
+  // the parent only has to care about the final send, same shape as how
+  // Composer already owns its own in-progress text without the parent
+  // knowing about every keystroke.
+  const [pendingImage, setPendingImage] = useState(null);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages.length]);
@@ -53,7 +60,7 @@ export default function ChatThread({
 
       <div className="messages" ref={scrollRef}>
         {messages.map((m, i) => (
-          <MessageBubble key={i} role={m.role} content={m.content} />
+          <MessageBubble key={i} role={m.role} content={m.content} imageUrl={m.imageUrl} />
         ))}
         {!messages.length && (
           <div className="list-empty">{emptyHint || 'Ask a question about this conversation to get started.'}</div>
@@ -77,21 +84,34 @@ export default function ChatThread({
         </div>
       )}
 
-      <Composer
-        onSend={onSend}
-        disabled={sending}
-        placeholder={placeholder || 'Ask about this conversation...'}
-        extraButton={onListen && (
-          <button
-            className="send-btn"
-            style={isLive ? { background: '#EA0038' } : undefined}
-            title={isLive ? 'Stop listening' : 'Resume listening on this conversation'}
-            onClick={isLive ? onStopListen : onListen}
-          >
-            <MicIcon />
-          </button>
-        )}
-      />
+      {pendingImage ? (
+        <ImageComposePreview
+          file={pendingImage}
+          sending={sending}
+          onCancel={() => setPendingImage(null)}
+          onSend={(description) => {
+            onSendImage(pendingImage, description);
+            setPendingImage(null);
+          }}
+        />
+      ) : (
+        <Composer
+          onSend={onSend}
+          disabled={sending}
+          placeholder={placeholder || 'Ask about this conversation...'}
+          onImageSelected={onSendImage ? setPendingImage : undefined}
+          extraButton={onListen && (
+            <button
+              className="send-btn"
+              style={isLive ? { background: '#EA0038' } : undefined}
+              title={isLive ? 'Stop listening' : 'Resume listening on this conversation'}
+              onClick={isLive ? onStopListen : onListen}
+            >
+              <MicIcon />
+            </button>
+          )}
+        />
+      )}
     </div>
   );
 }

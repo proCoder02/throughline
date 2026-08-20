@@ -144,6 +144,7 @@ input, textarea { font-family: inherit; }
 .bubble.in { background: var(--wa-bubble-in); border-top-left-radius: 0; }
 .bubble.out { background: var(--wa-bubble-out); border-top-right-radius: 0; }
 .bubble-time { font-size: 11px; color: var(--wa-text-soft); float: right; margin: 4px 0 -4px 8px; }
+.bubble-image { display: block; max-width: 100%; border-radius: 6px; margin-bottom: 6px; }
 .msg-line:empty { min-height: 0.6em; }
 .msg-list { margin: 2px 0 2px 18px; padding: 0; }
 .msg-list li { margin: 1px 0; }
@@ -163,6 +164,16 @@ input, textarea { font-family: inherit; }
 }
 .composer .send-btn:disabled { opacity: 0.5; cursor: default; }
 .composer .send-btn svg { width: 19px; height: 19px; }
+
+.image-compose-row { display: flex; align-items: flex-end; gap: 8px; flex: 1; }
+.image-compose-thumb {
+  width: 40px; height: 40px; border-radius: 8px; object-fit: cover; flex-shrink: 0;
+}
+.image-compose-row textarea {
+  flex: 1; resize: none; border: none; border-radius: 20px; padding: 9px 16px;
+  font-size: 15px; max-height: 100px; background: var(--wa-panel);
+}
+.image-compose-row textarea:focus { outline: none; }
 
 .speaker-prompt { margin: 10px 6% 0; padding: 12px 14px; background: #FFF3CD; border-radius: 8px; font-size: 13.5px; }
 .speaker-prompt .row2 { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }

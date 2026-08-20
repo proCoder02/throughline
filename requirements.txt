@@ -16,3 +16,4 @@ firebase-admin
 av
 numpy
 sarvamai
+Pillow
