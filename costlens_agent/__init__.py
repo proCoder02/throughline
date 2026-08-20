@@ -1,10 +1,21 @@
 """
-costlens_agent – zero-touch usage tracking for speech2text.
+costlens_agent – usage tracking for speech2text, activated purely via env
+vars (COSTLENS_SDK=true, COSTLENS_API_KEY, COSTLENS_URL).
 
-Activated purely via env vars (COSTLENS_SDK=true, COSTLENS_API_KEY,
-COSTLENS_URL) and a `sitecustomize.py` that calls install() at interpreter
-startup — see sitecustomize.py at the repo root for how this gets loaded
-without any import/edit in app.py itself.
+install() is called explicitly from app.py, right after load_dotenv() and
+before db_pool is created. This used to be done via a root-level
+sitecustomize.py instead (auto-imported by Python at interpreter startup,
+before any app code runs at all) specifically to avoid touching app.py --
+but that broke in production two different ways: Ubuntu ships its own
+no-op sitecustomize.py in /usr/lib/python3.X/ (for apport crash reporting),
+which sits earlier on sys.path and silently wins the import every time, so
+tracking never actually activated; forcing ours to win instead (via
+PYTHONPATH) made this module's `import httpx` (-> ssl) run before
+gunicorn's gevent worker calls monkey.patch_all(), leaving gevent's SSL
+patching incomplete and causing real RecursionErrors elsewhere in the app.
+Calling install() from app.py sidesteps both: app.py is only ever imported
+*after* the gevent worker has already monkey-patched, and there's no
+sys.path race to lose.
 
 When COSTLENS_SDK is not "true", install() is a no-op: nothing is patched,
 so there's zero overhead and zero behavior change.

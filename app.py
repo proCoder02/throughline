@@ -37,6 +37,26 @@ from firebase_admin import credentials as firebase_credentials, messaging as fir
 
 load_dotenv()
 
+# CostLens usage tracking (costlens_agent/, optional/additive). Previously
+# activated via sitecustomize.py at interpreter startup -- that relied on
+# our sitecustomize.py winning an import race against the OS's own
+# /usr/lib/python3.X/sitecustomize.py (shipped by Ubuntu for apport crash
+# reporting), which sits earlier on sys.path and silently wins every time,
+# so tracking never actually activated in production despite everything
+# else being configured correctly. Forcing our copy to win (via PYTHONPATH)
+# was tried and reverted: it made costlens_agent's `import httpx` (-> ssl)
+# run before gunicorn's gevent worker calls monkey.patch_all(), which left
+# gevent's SSL monkey-patching incomplete and caused real RecursionErrors
+# in production. Calling install() here instead is safe: app.py is only
+# ever imported *after* the gevent worker has already monkey-patched, so
+# there's no ordering conflict, and this must run before db_pool below is
+# created (its own psycopg2.connect calls need to already be patched).
+try:
+    from costlens_agent import install as _install_costlens_tracking
+    _install_costlens_tracking()
+except Exception:
+    pass  # never affects app startup, tracking is best-effort
+
 # Set by worker.py (before importing this module) so the RQ worker process
 # doesn't also start the email-reminder thread or the notify pub/sub
 # listener -- both are meant to run exactly once per deployment, in the
