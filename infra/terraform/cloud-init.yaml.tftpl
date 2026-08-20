@@ -121,6 +121,18 @@ write_files:
       # server, not local `python app.py` development.
       /opt/throughline/venv/bin/pip install gunicorn gevent
 
+      # --- CostLens usage tracking (zero-touch, no app.py changes) --------
+      # sitecustomize.py is auto-imported by Python at interpreter startup,
+      # but only from paths already on sys.path at that point -- for
+      # gunicorn that's site-packages, not the working directory (which
+      # gunicorn only adds to sys.path later, when resolving `app:app`).
+      # So both files are copied into site-packages here, re-run on every
+      # deploy since site-packages isn't version-controlled and gets wiped
+      # on a fresh venv.
+      SITE_PACKAGES="$(/opt/throughline/venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+      cp -r costlens_agent "$SITE_PACKAGES/"
+      cp sitecustomize.py "$SITE_PACKAGES/"
+
       # --- Frontend build -------------------------------------------------
       # vite.config.js's build.outDir (../static/app) lands this directly
       # where app.py's own catch-all route already expects it

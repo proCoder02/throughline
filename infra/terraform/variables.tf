@@ -109,6 +109,24 @@ variable "ollama_api_key" {
   default   = ""
 }
 
+variable "costlens_sdk_enabled" {
+  description = "Toggles costlens_agent usage tracking on/off with zero app.py changes either way."
+  type        = bool
+  default     = false
+}
+
+variable "costlens_api_key" {
+  description = "Long-lived ingest key from CostLens Settings -> Ingest API Key."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "costlens_url" {
+  type    = string
+  default = "https://api.costlens.io/api/v1"
+}
+
 variable "smtp_host" {
   type    = string
   default = "smtp.gmail.com"
