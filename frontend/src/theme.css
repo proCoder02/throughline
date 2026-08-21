@@ -129,15 +129,37 @@ input, textarea { font-family: inherit; }
 .chat-header-actions button:hover { background: var(--wa-hover); }
 .chat-header-actions svg { width: 20px; height: 20px; }
 
+/* The brain icon builds up a pulsing "sonar ping" glow as new messages
+   accumulate since the last check (see DirectMessageThread's
+   AUTO_CHECK_THRESHOLD/PULSE_THRESHOLD) -- a visible "something might be
+   worth checking" cue that resolves itself automatically, rather than
+   requiring the user to notice and remember to click it every time. */
+@keyframes cogPulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--wa-accent) 45%, transparent); }
+  70% { box-shadow: 0 0 0 10px color-mix(in srgb, var(--wa-accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--wa-accent) 0%, transparent); }
+}
+.chat-header-actions button.pulse { animation: cogPulse 1.6s ease-out infinite; color: var(--wa-accent); }
+
 /* Cognitive Sharing's on-demand "find common ground" result -- deliberately
    NOT a message bubble (see COGNITIVE_SHARING_INTERVENTION_PLAN.md): a
    dismissible banner above the thread, each side dismisses independently. */
+@keyframes cogSuggestionIn {
+  from { opacity: 0; transform: translateY(-6px) scaleY(0.85); }
+  to { opacity: 1; transform: translateY(0) scaleY(1); }
+}
+@keyframes cogSuggestionOut {
+  from { opacity: 1; transform: translateY(0) scaleY(1); }
+  to { opacity: 0; transform: translateY(-6px) scaleY(0.85); }
+}
 .cognitive-suggestion-card {
   display: flex; align-items: flex-start; gap: 10px; margin: 8px 10px 0; padding: 10px 8px 10px 14px;
   background: color-mix(in srgb, var(--wa-accent) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--wa-accent) 35%, transparent);
-  border-radius: 12px; flex-shrink: 0;
+  border-radius: 12px; flex-shrink: 0; transform-origin: top;
+  animation: cogSuggestionIn 280ms ease;
 }
+.cognitive-suggestion-card.closing { animation: cogSuggestionOut 220ms ease forwards; }
 .cognitive-suggestion-card svg { width: 18px; height: 18px; color: var(--wa-accent); flex-shrink: 0; margin-top: 1px; }
 .cognitive-suggestion-text { flex: 1; font-size: 13.5px; line-height: 1.4; }
 .cognitive-suggestion-card button { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: var(--wa-text-soft); flex-shrink: 0; }

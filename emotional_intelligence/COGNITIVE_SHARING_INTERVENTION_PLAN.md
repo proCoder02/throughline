@@ -246,6 +246,15 @@ is available at all (requires both sides ≥ `limited`).
    suggestion appears to both participants without becoming a DM thread
    message, and dismissing it on one device doesn't affect the other
    participant's view.
-4. *(Deferred, own future phase)* automatic background triggering with a
-   cooldown, once (1)-(3) have real usage data to size the cooldown/rate
-   against instead of guessing.
+4. *(Built, lighter than originally scoped)* Rather than server-side
+   time-based cooldown polling (which would spend an LLM call on every
+   opted-in pair every N minutes regardless of whether anything changed),
+   the client tracks messages sent/received since the last check and
+   auto-fires the *same* on-demand `POST .../cognitive-suggestion` endpoint
+   once a threshold is crossed (`AUTO_CHECK_THRESHOLD` = 6 in both
+   `DirectMessageScreen`/`DirectMessageThread.jsx`), with a lower
+   `PULSE_THRESHOLD` (3) driving an attention-grabbing pulse animation on
+   the trigger icon beforehand. Cost scales with actual conversation
+   activity, not wall-clock time -- no server or schema change needed, since
+   it's still the same endpoint, same bilateral gate, same "return nothing
+   most of the time" behavior; only the caller became automatic.

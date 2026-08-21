@@ -30,6 +30,20 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
   const [sharingAvailable, setSharingAvailable] = useState(false); // both sides >= 'limited'
   const [requestingSuggestion, setRequestingSuggestion] = useState(false);
   const [suggestion, setSuggestion] = useState(null);
+  const [suggestionClosing, setSuggestionClosing] = useState(false);
+
+  // Event-driven auto-check: counts new messages (sent or received) since
+  // the last check, not wall-clock time -- an automatic re-check only ever
+  // fires when there's actually new conversation to reason about, so cost
+  // scales with real activity rather than a fixed polling interval. The
+  // pulse threshold is deliberately lower than the auto-fire one so the
+  // button visibly "builds up" before the automatic check happens, rather
+  // than a suggestion just appearing with no warning. Mirrors the Flutter
+  // client's DirectMessageScreen exactly.
+  const PULSE_THRESHOLD = 3;
+  const AUTO_CHECK_THRESHOLD = 6;
+  const [messagesSinceLastCheck, setMessagesSinceLastCheck] = useState(0);
+  const shouldPulse = sharingAvailable && !suggestion && !requestingSuggestion && messagesSinceLastCheck >= PULSE_THRESHOLD;
 
   const loadLatestSuggestion = () => {
     apiJson(`/friends/${friend.id}/cognitive-suggestion`)
@@ -65,6 +79,7 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
         // Arrived while this thread was already open -- read immediately.
         notify.sendDmAck({ type: 'ack_read', friend_id: friend.id });
         notify.clearDmUnread(friend.id);
+        bumpMessageActivity(1);
       } else if (msg.type === 'direct_messages_read' || msg.type === 'direct_messages_delivered') {
         const field = msg.type === 'direct_messages_read' ? 'read_at' : 'delivered_at';
         const ids = new Set(msg.message_ids);
@@ -85,27 +100,44 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [friend.id]);
 
-  const findCommonGround = async () => {
+  const findCommonGround = async (silent = false) => {
     if (requestingSuggestion) return;
     setRequestingSuggestion(true);
     try {
       const data = await post(`/friends/${friend.id}/cognitive-suggestion`, {});
+      setMessagesSinceLastCheck(0);
       if (data.suggestion) {
         setSuggestion(data.suggestion);
-      } else {
+      } else if (!silent) {
         alert('Nothing to suggest right now.');
       }
     } catch (e) {
-      alert('Could not check: ' + e.message);
+      if (!silent) alert('Could not check: ' + e.message);
     } finally {
       setRequestingSuggestion(false);
     }
   };
 
+  // Bumps the event-driven counter and silently auto-fires a check once it
+  // crosses AUTO_CHECK_THRESHOLD -- "silent" meaning no alert if it turns
+  // out there's nothing to suggest, unlike a manual click.
+  const bumpMessageActivity = (count) => {
+    if (!sharingAvailable || count <= 0 || suggestion) return;
+    setMessagesSinceLastCheck((prev) => {
+      const next = prev + count;
+      if (next >= AUTO_CHECK_THRESHOLD && !requestingSuggestion) findCommonGround(true);
+      return next;
+    });
+  };
+
   const dismissSuggestion = async () => {
     const current = suggestion;
     if (!current) return;
-    setSuggestion(null); // optimistic -- low-stakes, easily-repeatable action
+    setSuggestionClosing(true);
+    setTimeout(() => {
+      setSuggestion(null);
+      setSuggestionClosing(false);
+    }, 220); // matches .cognitive-suggestion-card.closing's animation duration
     try {
       await post(`/friends/${friend.id}/cognitive-suggestion/${current.id}/dismiss`, {});
     } catch {
@@ -123,6 +155,7 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
     try {
       const message = await post(`/friends/${friend.id}/messages`, { content: text });
       setMessages((prev) => [...(prev || []), message]);
+      bumpMessageActivity(1);
     } catch (e) {
       alert('Could not send: ' + e.message);
     } finally {
@@ -157,7 +190,12 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
         </div>
         {sharingAvailable && (
           <div className="chat-header-actions">
-            <button title="Find common ground" disabled={requestingSuggestion} onClick={findCommonGround}>
+            <button
+              className={shouldPulse ? 'pulse' : ''}
+              title="Find common ground"
+              disabled={requestingSuggestion}
+              onClick={() => findCommonGround()}
+            >
               <BrainIcon />
             </button>
           </div>
@@ -165,7 +203,7 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
       </div>
 
       {suggestion && (
-        <div className="cognitive-suggestion-card">
+        <div className={'cognitive-suggestion-card' + (suggestionClosing ? ' closing' : '')}>
           <BrainIcon />
           <span className="cognitive-suggestion-text">{suggestion.suggestion_text}</span>
           <button title="Dismiss" onClick={dismissSuggestion}><CloseIcon /></button>
