@@ -2005,20 +2005,20 @@ _REMINDER_INTENT_RE = re.compile(
 
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
 
-The user just said this in chat. Determine whether they're asking to be reminded of something (a task, event, or commitment) -- not just using the word "remind" in passing.
+The user just said this in chat. Determine whether they're asking to be reminded of one or more things (tasks, events, commitments, deadlines) -- not just using the word "remind" in passing. There can be MORE than one -- e.g. a list of exams/classes/bills where they asked for a reminder for each -- extract one entry per distinct thing to remind about, never one combined summary covering several of them.
 
-If yes, extract:
+For each one, extract:
 - description: short (<20 words) description of what to be reminded about, in your own words
 - due_date: short human phrase as said/implied (e.g. "Saturday", "tonight"), else null
 - reminder_at: resolve any date/time phrase against today's date above into exact ISO 8601 "YYYY-MM-DDTHH:MM:SS" (assume 09:00:00 if only a day is given, no time). Else null. Do not guess if nothing time-related was said.
 
-If this is not a genuine reminder request, reply with {{"is_reminder": false}}.
+If this is not a genuine reminder request, or you can't identify any specific things to remind about, reply with {{"reminders": []}}.
 
 The user's message:
 {message}
 
 Reply with ONLY this JSON, no preamble/fences:
-{{"is_reminder": true, "description": "", "due_date": null, "reminder_at": null}}"""
+{{"reminders": [{{"description": "", "due_date": null, "reminder_at": null}}]}}"""
 
 
 def trigger_reminder_extraction(user_id, message_content) -> None:
@@ -2029,6 +2029,12 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
     to the user-facing response. Once inserted, _check_overdue_tasks
     (nudges/nudge_engine.py) and email_reminder_worker (above) already pick
     it up automatically off reminder_at/status -- nothing else needed.
+
+    Extracts a LIST of reminders, not just one -- e.g. a photo of a class/exam
+    schedule with "remind me about each of these" needs one task per item, not
+    one task summarizing all of them. Ordinary single-reminder chat messages
+    just produce a one-item list, so this is a strict generalization, not a
+    behavior change for existing callers.
 
     Never raises and never blocks -- same reasoning as
     trigger_chat_feedback_extraction: this always runs after the chat
@@ -2049,21 +2055,24 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
         )
         content = call_llm([{"role": "user", "content": prompt}])
         parsed = extract_json(content)
-        if not parsed or not parsed.get("is_reminder"):
-            return
-        description = (parsed.get("description") or "").strip()
-        if not description:
+        reminders = (parsed or {}).get("reminders") or []
+        if not reminders:
             return
 
         conn = get_raw_connection()
+        created = []
         try:
             cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
-                "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
-                (user_id, description, parsed.get("due_date"), normalize_reminder_at(parsed.get("reminder_at"))),
-            )
-            task_id = cur.fetchone()[0]
+            for item in reminders:
+                description = (item.get("description") or "").strip()
+                if not description:
+                    continue
+                cur.execute(
+                    "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
+                    "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
+                    (user_id, description, item.get("due_date"), normalize_reminder_at(item.get("reminder_at"))),
+                )
+                created.append((cur.fetchone()[0], description))
             conn.commit()
         except Exception as e:
             print(f"[trigger_reminder_extraction] DB error: {e!r}")
@@ -2075,15 +2084,17 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
         # Identical event shape to run_background_analysis's task_created
         # push above -- existing client handling (notify_provider.dart's
         # case 'task_created', and the React equivalent) picks this up with
-        # no changes needed.
-        push_notification(user_id, {
-            "type": "task_created", "task_id": task_id, "description": description,
-            "conversation_id": None,
-        })
-        send_fcm_to_user(
-            user_id, title="New task", body=description,
-            data={"type": "task_created", "task_id": task_id, "conversation_id": ""},
-        )
+        # no changes needed. One push per task, same as if each had been
+        # typed as a separate reminder request.
+        for task_id, description in created:
+            push_notification(user_id, {
+                "type": "task_created", "task_id": task_id, "description": description,
+                "conversation_id": None,
+            })
+            send_fcm_to_user(
+                user_id, title="New task", body=description,
+                data={"type": "task_created", "task_id": task_id, "conversation_id": ""},
+            )
     except Exception as e:
         print(f"[trigger_reminder_extraction] failed: {e!r}")
 
@@ -5063,10 +5074,20 @@ def chat_global_image():
     if description:
         try:
             from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+            # description only, not extracted_text -- real_user_extraction.py's
+            # nightly batch already turns the conversations row inserted above
+            # into facts for free, so there's no gap here to fix.
             threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, description), daemon=True).start()
         except Exception:
             pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
-        threading.Thread(target=trigger_reminder_extraction, args=(user_id, description), daemon=True).start()
+        # Unlike trigger_chat_feedback_extraction above, this one has no
+        # nightly-batch fallback -- reminders need to exist right away, so it
+        # needs the actual image content, not just the instruction. Passing
+        # description alone (the original version of this code) meant "create
+        # a reminder for each exam and class" had no exams/classes to work
+        # from -- it could only ever produce one vague catch-all task.
+        reminder_content = f"{description}\n\nContent extracted from the image:\n{extracted_text}"
+        threading.Thread(target=trigger_reminder_extraction, args=(user_id, reminder_content), daemon=True).start()
 
     return jsonify({
         "reply": reply,
