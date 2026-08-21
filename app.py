@@ -3,6 +3,7 @@ import os
 import re
 import io
 import json
+import base64
 import hashlib
 import secrets
 import tempfile
@@ -35,6 +36,26 @@ import firebase_admin
 from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
 
 load_dotenv()
+
+# CostLens usage tracking (costlens_agent/, optional/additive). Previously
+# activated via sitecustomize.py at interpreter startup -- that relied on
+# our sitecustomize.py winning an import race against the OS's own
+# /usr/lib/python3.X/sitecustomize.py (shipped by Ubuntu for apport crash
+# reporting), which sits earlier on sys.path and silently wins every time,
+# so tracking never actually activated in production despite everything
+# else being configured correctly. Forcing our copy to win (via PYTHONPATH)
+# was tried and reverted: it made costlens_agent's `import httpx` (-> ssl)
+# run before gunicorn's gevent worker calls monkey.patch_all(), which left
+# gevent's SSL monkey-patching incomplete and caused real RecursionErrors
+# in production. Calling install() here instead is safe: app.py is only
+# ever imported *after* the gevent worker has already monkey-patched, so
+# there's no ordering conflict, and this must run before db_pool below is
+# created (its own psycopg2.connect calls need to already be patched).
+try:
+    from costlens_agent import install as _install_costlens_tracking
+    _install_costlens_tracking()
+except Exception:
+    pass  # never affects app startup, tracking is best-effort
 
 # Set by worker.py (before importing this module) so the RQ worker process
 # doesn't also start the email-reminder thread or the notify pub/sub
@@ -76,7 +97,7 @@ if not DATABASE_URL:
 # worker, and every open live-listening session all want a connection at
 # the same time. minconn kept warm, maxconn caps how many Postgres will
 # ever be asked to hand out at once.
-db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=2, maxconn=20, dsn=DATABASE_URL)
+db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=2, maxconn=100, dsn=DATABASE_URL)
 
 
 def get_raw_connection():
@@ -214,7 +235,7 @@ def remember_ei_recent_statement(user_id, text):
     key = f"ei_recent_statements:{user_id}"
     existing = cache_get_json(key) or []
     existing.append(text.strip())
-    cache_set_json(key, existing[-5:], ttl=EI_RECENT_STATEMENTS_TTL)
+    cache_set_json(key, existing[-10:], ttl=EI_RECENT_STATEMENTS_TTL)
 
 
 def get_ei_recent_statements(user_id):
@@ -267,10 +288,6 @@ def serialize_row(row):
         if isinstance(value, datetime):
             result[key] = value.isoformat()
     return result
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +368,7 @@ def is_valid_category_for_user(cur, user_id, value):
 # ---------------------------------------------------------------------------
 
 GENDER_OPTIONS = ["Male", "Female", "Non-binary", "Prefer not to say"]
-LANGUAGE_OPTIONS = ["English", "Hindi", "Spanish", "French", "German", "Mandarin", "Arabic"]
+LANGUAGE_OPTIONS = ["English", "Hindi"]
 HOBBY_OPTIONS = ["Reading", "Sports & Fitness", "Music", "Gaming", "Travel", "Cooking", "Art & Design"]
 INTEREST_OPTIONS = [
     "Technology", "Finance & Business", "Health & Wellness", "Arts & Culture",
@@ -1396,6 +1413,106 @@ def call_llm(messages):
     response.raise_for_status()
     result = response.json()
     return result.get("message", {}).get("content", "")
+
+
+# Strips a leading <think>...</think> reasoning block some models (e.g. Groq's
+# qwen/qwen3.6-27b, used by call_groq_vision below) prepend to their own
+# answer -- confirmed via a live test call that the chain-of-thought lands
+# inline in the same content string, not a separate field. Without this, that
+# reasoning monologue would end up stored as part of raw_transcript/the chat
+# reply instead of just the actual answer.
+_THINK_BLOCK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_think_block(text):
+    return _THINK_BLOCK_RE.sub("", text or "").strip()
+
+
+def call_groq_vision(image_bytes, mimetype, instruction):
+    """Vision-capable counterpart to call_llm, above -- deliberately a
+    separate function rather than a branch inside call_llm, since the
+    provider (Groq, not Ollama Cloud) and request shape (OpenAI-style
+    multimodal `content` blocks) both differ. GROQ_API_KEY is already live
+    in .env and already proven working for STT (USE_GROQ_STT) -- reusing it
+    here needs no new account/billing setup, unlike the earlier xAI/Grok
+    attempt that stalled on billing.
+
+    GROQ_VISION_MODEL is overridable via .env for the same reason
+    OLLAMA_MODEL is above: Groq's vision-capable models are preview/evaluation
+    models that get renamed or deprecated (meta-llama/llama-4-scout-17b-16e-
+    instruct, vision-capable, was already deprecated once) -- a future rename
+    should be a .env edit, not a code change."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GROQ_API_KEY")
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b"),
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": f"data:{mimetype};base64,{b64}"}},
+            ],
+        }],
+        "temperature": 0.2,
+    }
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=90,
+    )
+    response.raise_for_status()
+    result = response.json()
+    content = result["choices"][0]["message"]["content"]
+    return _strip_think_block(content)
+
+
+IMAGE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+IMAGE_MAX_DIMENSION = 1600
+
+
+def _prepare_image_for_vision(file_storage):
+    """Validates and normalizes an uploaded image before it's sent to Groq.
+    Raises ValueError with a user-facing message on anything invalid.
+
+    Saves to a temp file first (same tempfile.mkstemp()+.save() pattern
+    already used for audio uploads, e.g. upload_own_call_recording above)
+    rather than reading straight into memory, so Pillow can stream from disk.
+    The temp file is always removed in `finally` -- raw image bytes are never
+    persisted anywhere, matching how audio uploads are consumed then
+    discarded rather than stored long-term.
+
+    Client-supplied mimetype can't be trusted alone (a renamed file can claim
+    any Content-Type) -- Image.open(...).verify() is what actually rejects
+    non-image bytes. verify() invalidates the file object afterward, so the
+    image is reopened before any further use."""
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    fd, tmp_path = tempfile.mkstemp(prefix="img_vision_", suffix=".upload")
+    with os.fdopen(fd, "wb") as f:
+        file_storage.save(f)
+    try:
+        try:
+            with Image.open(tmp_path) as verify_img:
+                verify_img.verify()
+        except (UnidentifiedImageError, OSError):
+            raise ValueError("Could not read that as an image")
+
+        with Image.open(tmp_path) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            img.thumbnail((IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION))
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=85)
+            return buffer.getvalue(), "image/jpeg"
+    finally:
+        os.remove(tmp_path)
 
 
 def extract_json(text):
@@ -3258,6 +3375,72 @@ def set_friend_nickname(friend_id):
     return jsonify({"ok": True, "nickname": nickname})
 
 
+_COGNITIVE_SHARING_LEVELS = ("off", "limited", "collaborative")
+_COGNITIVE_SHARING_RANK = {level: i for i, level in enumerate(_COGNITIVE_SHARING_LEVELS)}
+
+
+@app.route("/friends/<int:friend_id>/cognitive-sharing", methods=["GET"])
+@login_required
+def get_cognitive_sharing(friend_id):
+    """My own sharing level for this friend, plus whether BOTH directions
+    are currently >= 'limited' (the bilateral gate the on-demand suggestion
+    feature is gated on -- see emotional_intelligence/
+    COGNITIVE_SHARING_INTERVENTION_PLAN.md). Deliberately never returns the
+    other side's actual level -- that itself would leak their privacy
+    posture; the UI only ever learns whether the feature is available."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "SELECT user_id, level FROM cognitive_sharing_settings "
+        "WHERE (user_id = %s AND friend_id = %s) OR (user_id = %s AND friend_id = %s)",
+        (user_id, friend_id, friend_id, user_id),
+    )
+    levels_by_user = {row["user_id"]: row["level"] for row in cur.fetchall()}
+    my_level = levels_by_user.get(user_id, "off")
+    their_level = levels_by_user.get(friend_id, "off")
+    both_enabled = (
+        _COGNITIVE_SHARING_RANK[my_level] >= _COGNITIVE_SHARING_RANK["limited"]
+        and _COGNITIVE_SHARING_RANK[their_level] >= _COGNITIVE_SHARING_RANK["limited"]
+    )
+    return jsonify({"my_level": my_level, "both_enabled": both_enabled})
+
+
+@app.route("/friends/<int:friend_id>/cognitive-sharing", methods=["POST"])
+@login_required
+def set_cognitive_sharing(friend_id):
+    data = request.get_json(silent=True) or {}
+    level = (data.get("level") or "").strip().lower()
+    if level not in _COGNITIVE_SHARING_LEVELS:
+        return jsonify({"error": f"level must be one of {_COGNITIVE_SHARING_LEVELS}"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "INSERT INTO cognitive_sharing_settings (user_id, friend_id, level) "
+        "VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id, friend_id) DO UPDATE SET level = EXCLUDED.level, updated_at = now()",
+        (user_id, friend_id, level),
+    )
+    db.commit()
+    return jsonify({"ok": True, "my_level": level})
+
+
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
 @login_required
 def friend_mood(friend_id):
@@ -4635,6 +4818,104 @@ def chat_global():
         "reply": reply,
         "matched_speaker": matched["name"] if matched else None,
         "conversations_used": len(conversations),
+    })
+
+
+IMAGE_UPLOAD_PLACEHOLDER = "[Image uploaded]"
+
+
+@app.route("/chat/global/image", methods=["POST"])
+@login_required
+def chat_global_image():
+    """Companion to chat_global above, for sending an image (e.g. a photo of
+    a bill or a handwritten note) into the global chat. Reuses the existing
+    machinery rather than building a parallel image-memory system: the
+    vision-extracted text is inserted as a normal `conversations` row, so
+    chat_global's own retrieval query (above) picks it up on the very next
+    question with zero new retrieval code, and real_user_extraction.py's
+    nightly batch turns it into structured facts for free, same as any other
+    conversation. `description` (the user-supplied caption, mandatory in
+    both frontends' UI, defensively optional here) is what
+    trigger_reminder_extraction/trigger_chat_feedback_extraction actually
+    run against below -- so "remind me to pay this by Friday" as the
+    description is what makes a real reminder get created, exactly like
+    typing the same words into a normal chat message already does."""
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+
+    image_file = request.files["image"]
+    content_length = request.content_length or 0
+    if content_length > IMAGE_MAX_UPLOAD_BYTES:
+        return jsonify({"error": "Image is too large (max 10MB)"}), 400
+
+    description = (request.form.get("description") or "").strip()
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    try:
+        image_bytes, mimetype = _prepare_image_for_vision(image_file)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    instruction = (
+        "This image was shared in a personal chat assistant. Extract ALL text and structured "
+        "information visible in it, thoroughly and literally (amounts, dates, merchant/sender names, "
+        "line items if it's a bill/receipt; the full text if it's a handwritten note) -- this will be "
+        "stored as searchable text, not shown directly to the user, so be exhaustive rather than "
+        "concise. The user's own description of the image: "
+        f"{description or '(none given)'}\n\n"
+        "Reply with exactly two labeled sections, nothing else:\n"
+        "EXTRACTED: <the thorough, literal extraction described above>\n"
+        "SUMMARY: <a brief, natural 1-2 sentence acknowledgment of what this image is, for a chat reply "
+        "-- don't repeat the extraction verbatim>"
+    )
+    try:
+        vision_reply = call_groq_vision(image_bytes, mimetype, instruction)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 500
+        try:
+            error_json = e.response.json()
+        except Exception:
+            error_json = {"error": str(e)}
+        return jsonify({"error": error_json}), status
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+
+    extracted_match = re.search(r"EXTRACTED:\s*(.*?)(?=\nSUMMARY:|\Z)", vision_reply, re.DOTALL)
+    summary_match = re.search(r"SUMMARY:\s*(.*)", vision_reply, re.DOTALL)
+    extracted_text = (extracted_match.group(1) if extracted_match else vision_reply).strip()
+    reply = (summary_match.group(1) if summary_match else vision_reply).strip()
+
+    if not extracted_text:
+        return jsonify({"error": "Could not extract any text from that image"}), 422
+
+    category = get_user_personalization(cur, user_id)
+    title = generate_conversation_title(extracted_text)
+    cur.execute(
+        "INSERT INTO conversations (user_id, title, raw_transcript, category) "
+        "VALUES (%s, %s, %s, %s) RETURNING id",
+        (user_id, title, extracted_text, category),
+    )
+    conversation_id = cur.fetchone()["id"]
+
+    user_message_content = description or IMAGE_UPLOAD_PLACEHOLDER
+    append_chat_messages(cur, user_id, None, user_message_content, reply)
+    db.commit()
+
+    if description:
+        try:
+            from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, description), daemon=True).start()
+        except Exception:
+            pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+        threading.Thread(target=trigger_reminder_extraction, args=(user_id, description), daemon=True).start()
+
+    return jsonify({
+        "reply": reply,
+        "conversation_id": conversation_id,
+        "title": title,
+        "category": category,
     })
 
 

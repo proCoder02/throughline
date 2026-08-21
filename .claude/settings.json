@@ -113,10 +113,30 @@
       "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT id, predicate, object, confidence, source, created_at FROM emotional_intelligence.facts WHERE subject_id = 582 AND \\(predicate ILIKE '\\\\''%emma%'\\\\'' OR object ILIKE '\\\\''%emma%'\\\\''\\) ORDER BY created_at DESC;')",
       "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT fv.id, fv.predicate, fv.object, fv.superseded_at FROM emotional_intelligence.fact_versions fv WHERE fv.predicate ILIKE '\\\\''%emma%'\\\\'' OR fv.object ILIKE '\\\\''%emma%'\\\\'' ORDER BY fv.superseded_at DESC LIMIT 5;')",
       "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c 'SELECT category, item, weight, confidence, updated_at FROM emotional_intelligence.preferences WHERE subject_id = 582 ORDER BY updated_at DESC LIMIT 5;')",
-      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c ' *)"
+      "Bash('/c/Program Files/PostgreSQL/17/bin/psql.exe' -h localhost -U postgres -d speech2text -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(.venv/Scripts/python.exe -m pip install --quiet Pillow)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/lib/screens/chats/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/lib/services/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/lib/models/**)",
+      "Read(//c/Users/P3INW57/Desktop/throughline/lib/widgets/**)",
+      "PowerShell(Get-Command flutter -ErrorAction SilentlyContinue)",
+      "PowerShell(cd C:\\\\Users\\\\P3INW57\\\\Desktop\\\\throughline; flutter analyze 2>&1 | Out-File -FilePath \"$env:TEMP\\\\flutter_analyze.log\" -Encoding utf8; Write-Output \"DONE\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" --max-time 3 http://localhost:5000/)",
+      "PowerShell(cd C:\\\\Users\\\\P3INW57\\\\Desktop\\\\speech2text; powershell -ExecutionPolicy Bypass -File .\\\\scripts\\\\backend-stop.ps1 2>&1 | Select-Object -Last 20)",
+      "Bash(cat \"/c/Users/P3INW57/AppData/Local/Temp/flutter_analyze.log\" 2>/dev/null | grep -A2 -B2 \"chat_message\\\\|message_bubble\\\\|global_chat_screen\\\\|conversation_service\\\\|error •\" | head -100)",
+      "Read(//c/Users/P3INW57/AppData/Local/Temp/**)",
+      "Bash(grep -n \"error •\\\\|^error\" \"/c/Users/P3INW57/AppData/Local/Temp/flutter_analyze.log\" 2>/dev/null)",
+      "PowerShell(cd C:\\\\Users\\\\P3INW57\\\\Desktop\\\\speech2text; powershell -ExecutionPolicy Bypass -File .\\\\scripts\\\\backend-start.ps1 2>&1 | Select-Object -Last 30)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" --max-time 5 http://localhost:5000/)",
+      "Bash(.venv/Scripts/python.exe \"C:/Users/P3INW57/AppData/Local/Temp/claude/c--Users-P3INW57-Desktop-speech2text/30352e48-9ff1-47c2-9aac-dfb439ef716b/scratchpad/verify_image_chat.py\")",
+      "PowerShell(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new ubuntu@129.213.21.239 \"sudo /opt/throughline/setup.sh 2>&1 | tail -60\")",
+      "PowerShell(ssh -o ConnectTimeout=10 ubuntu@129.213.21.239 \"sudo systemctl restart throughline && sleep 2 && sudo systemctl status throughline --no-pager -l | head -20\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" --max-time 10 -X POST http://129.213.21.239/chat/global/image)"
     ],
     "additionalDirectories": [
-      "C:\\Users\\P3INW57\\Desktop\\throughline"
+      "C:\\Users\\P3INW57\\Desktop\\throughline",
+      "C:\\Users\\P3INW57\\Desktop\\throughline\\lib\\widgets"
     ]
   }
 }

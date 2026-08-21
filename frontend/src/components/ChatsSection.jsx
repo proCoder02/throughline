@@ -4,7 +4,7 @@ import ChatThread from './ChatThread.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
-import { apiJson, post } from '../api.js';
+import { apiJson, post, postForm } from '../api.js';
 import { backfillConversationContent } from '../db.js';
 import { MicIcon, ChatIcon } from '../icons.jsx';
 
@@ -82,6 +82,24 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     setGlobalSending(true);
     try {
       const data = await post('/chat/global', { prompt });
+      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
+    } catch (e) {
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
+    } finally {
+      setGlobalSending(false);
+    }
+  };
+
+  const sendGlobalImageMessage = async (file, description) => {
+    const previewUrl = URL.createObjectURL(file);
+    setGlobalMessages((m) => [...m, { role: 'user', content: description, imageUrl: previewUrl }]);
+    setGlobalSending(true);
+    try {
+      const form = new FormData();
+      form.append('image', file);
+      form.append('description', description);
+      const data = await postForm('/chat/global/image', form);
       const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
       setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
     } catch (e) {
@@ -208,6 +226,7 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           emptyHint="Ask about a person or a past topic -- I'll pull in whichever conversations are relevant."
           messages={globalMessages}
           onSend={sendGlobalMessage}
+          onSendImage={sendGlobalImageMessage}
           sending={globalSending}
           onBack={() => setGlobalChatOpen(false)}
         />

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
-import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, ChatIcon, CheckIcon, InfoIcon } from '../icons.jsx';
+import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, ChatIcon, CheckIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
 import DirectMessageThread from './DirectMessageThread.jsx';
 
@@ -25,15 +25,24 @@ function formatLastCallSubtitle(f) {
   return `${formatCallTimestamp(f.last_call_at)}${countPart}  ${direction}`;
 }
 
+const SHARING_LEVELS = [
+  { value: 'off', label: 'Off', description: 'Your private cognitive information stays private.' },
+  { value: 'limited', label: 'Limited', description: 'AI may use selected context to find mutually useful outcomes.' },
+  { value: 'collaborative', label: 'Collaborative', description: 'AI can use approved context to actively help both of you coordinate.' },
+];
+
 export default function FriendsSection({ onStartCall, notify, myUserId }) {
   const [friends, setFriends] = useState([]);
   const [selected, setSelected] = useState(null);
-  // 'calls' (default, opened by clicking a friend row), 'mood' (opened via
-  // the (i) button), or 'chat' (opened via the chat button) -- mirrors the
-  // Flutter client's CallHistoryScreen/FriendMoodScreen/DirectMessageScreen.
-  const [view, setView] = useState('calls');
+  // 'profile' (default, opened by clicking a friend row -- shows everything
+  // at once, WhatsApp-contact-screen style, no tab-switching) or 'chat'
+  // (opened via the message button) -- mirrors the Flutter client's
+  // DirectMessageScreen for the latter.
+  const [view, setView] = useState('profile');
   const [callHistory, setCallHistory] = useState(null);
   const [mood, setMood] = useState(null);
+  const [sharing, setSharing] = useState(null); // {my_level, both_enabled}
+  const [savingSharing, setSavingSharing] = useState(false);
   const [code, setCode] = useState('');
   const [status, setStatus] = useState('');
   const [renaming, setRenaming] = useState(false);
@@ -69,11 +78,17 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
     }
   };
 
+  // WhatsApp-contact-screen style: everything about this friend loads and
+  // shows at once (mood, calls, cognitive sharing), no tab-switching.
   const openFriend = async (f) => {
     setSelected(f);
-    setView('calls');
-    const data = await apiJson(`/friends/${f.id}/calls`).catch(() => []);
-    setCallHistory(data);
+    setView('profile');
+    setCallHistory(null);
+    setMood(null);
+    setSharing(null);
+    apiJson(`/friends/${f.id}/calls`).then(setCallHistory).catch(() => setCallHistory([]));
+    apiJson(`/friends/${f.id}/mood`).then(setMood).catch(() => setMood(null));
+    apiJson(`/friends/${f.id}/cognitive-sharing`).then(setSharing).catch(() => setSharing(null));
   };
 
   const openChat = (e, f) => {
@@ -82,10 +97,20 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
     setView('chat');
   };
 
-  const showMood = async () => {
-    setView('mood');
-    const data = await apiJson(`/friends/${selected.id}/mood`).catch(() => null);
-    setMood(data);
+  const setSharingLevel = async (level) => {
+    if (!selected || savingSharing) return;
+    setSavingSharing(true);
+    try {
+      const data = await post(`/friends/${selected.id}/cognitive-sharing`, { level });
+      // Re-fetch rather than trust the POST response alone -- both_enabled
+      // depends on the OTHER side's row too, which this response can't know.
+      const fresh = await apiJson(`/friends/${selected.id}/cognitive-sharing`);
+      setSharing(fresh);
+    } catch (e) {
+      setStatus(e.message);
+    } finally {
+      setSavingSharing(false);
+    }
   };
 
   const removeFriend = async (f) => {
@@ -188,49 +213,102 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
       <div className="detail-pane detail-view" style={{ flex: 1 }}>
         {selected ? (
           <div className="detail-card">
-            <div className="detail-title-row">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                <button className="back-btn" title="Back" onClick={() => setSelected(null)}><BackIcon /></button>
-                {renaming ? (
+            <button className="back-btn" title="Back" onClick={() => setSelected(null)}><BackIcon /></button>
+
+            {/* Header: big centered avatar + name, WhatsApp-contact-screen style */}
+            <div style={{ textAlign: 'center', margin: '4px 0 16px' }}>
+              <span className="avatar lg" style={{ fontSize: 24, margin: '0 auto 10px' }}>
+                {(selected.nickname || selected.username)[0]}
+              </span>
+              {renaming ? (
+                <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
                   <input
-                    className="field" style={{ marginTop: 0 }} autoFocus
+                    className="field" style={{ marginTop: 0, maxWidth: 200 }} autoFocus
                     placeholder={selected.username} value={nicknameDraft}
                     onChange={(e) => setNicknameDraft(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && saveNickname()}
                   />
-                ) : (
-                  <div className="detail-title">
-                    {(selected.nickname || selected.username)}{view === 'mood' ? "'s mood" : "'s calls"}
-                  </div>
-                )}
-              </div>
-              {renaming ? (
-                <div style={{ display: 'flex', gap: 4 }}>
                   <button className="btn" onClick={saveNickname}>Save</button>
                   <button className="btn secondary" onClick={() => setRenaming(false)}>Cancel</button>
                 </div>
               ) : (
-                <div style={{ display: 'flex' }}>
-                  {view === 'mood' ? (
-                    <button className="conv-link-btn" title="View calls" onClick={() => setView('calls')}>
-                      <PhoneIcon />
-                    </button>
-                  ) : (
-                    <button className="conv-link-btn" title="View mood" onClick={showMood}>
-                      <InfoIcon />
-                    </button>
-                  )}
-                  <button className="conv-link-btn" title="Set nickname" onClick={startRename}>
-                    <PencilIcon />
+                <>
+                  <div className="detail-title" style={{ fontSize: 18 }}>{selected.nickname || selected.username}</div>
+                  {selected.nickname && <div className="hint" style={{ margin: '0 0 6px' }}>{selected.username}</div>}
+                  <button
+                    className="conv-link-btn" title="Set nickname" onClick={startRename}
+                    style={{ display: 'inline-flex', gap: 4, fontSize: 12, color: 'var(--wa-text-soft)' }}
+                  >
+                    <PencilIcon /> nickname
                   </button>
-                  <button className="conv-link-btn" title="Remove friend" onClick={() => removeFriend(selected)}>
-                    <TrashIcon />
-                  </button>
-                </div>
+                </>
               )}
             </div>
-            {view === 'mood' ? (
-              mood?.emoji ? (
+
+            {/* Action row */}
+            {!renaming && (
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 28, marginBottom: 20 }}>
+                <button
+                  className="conv-link-btn" title={`Message ${selected.nickname || selected.username}`}
+                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, fontSize: 11 }}
+                  onClick={() => setView('chat')}
+                >
+                  <ChatIcon /> Message
+                </button>
+                <button
+                  className="conv-link-btn" title={`Call ${selected.nickname || selected.username}`}
+                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, fontSize: 11 }}
+                  onClick={(e) => callFriend(e, selected.id)}
+                >
+                  <PhoneIcon /> Call
+                </button>
+                <button
+                  className="conv-link-btn" title="Remove friend"
+                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--wa-danger)' }}
+                  onClick={() => removeFriend(selected)}
+                >
+                  <TrashIcon /> Remove
+                </button>
+              </div>
+            )}
+
+            {/* Everything below is always visible -- no tab-switching */}
+
+            <div className="profile-section">
+              <div className="profile-section-title">Cognitive Sharing</div>
+              {sharing ? (
+                <>
+                  <div className="hint" style={{ marginTop: 0 }}>
+                    {sharing.both_enabled
+                      ? `You and ${selected.nickname || selected.username} can both see mutually-helpful suggestions.`
+                      : 'Both of you need to turn this on before suggestions can appear.'}
+                  </div>
+                  {SHARING_LEVELS.map((opt) => (
+                    <label key={opt.value} className="sharing-option" style={{ opacity: savingSharing ? 0.6 : 1 }}>
+                      <input
+                        type="radio"
+                        name="sharing-level"
+                        checked={sharing.my_level === opt.value}
+                        disabled={savingSharing}
+                        onChange={() => setSharingLevel(opt.value)}
+                      />
+                      <div>
+                        <div className="sharing-option-label">{opt.label}</div>
+                        <div className="hint" style={{ margin: 0 }}>{opt.description}</div>
+                      </div>
+                    </label>
+                  ))}
+                </>
+              ) : (
+                <div className="hint" style={{ marginTop: 0 }}>Loading…</div>
+              )}
+            </div>
+
+            <div className="profile-section">
+              <div className="profile-section-title">Mood</div>
+              {mood === null ? (
+                <div className="hint" style={{ marginTop: 0 }}>Loading…</div>
+              ) : mood?.emoji ? (
                 <div className="mood-compiled">
                   <div className="mood-compiled-emoji">{mood.emoji}</div>
                   <div className="detail-meta" style={{ textTransform: 'capitalize' }}>{mood.mood_label}</div>
@@ -239,21 +317,28 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
                     {'–'}{new Date(mood.window_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </div>
                 </div>
-              ) : <div className="hint">No mood data logged yet today.</div>
-            ) : callHistory?.length ? (
-              callHistory.map((c) => (
-                <div key={c.call_id} className="detail-meta-row">
-                  <span>{c.outgoing ? 'Outgoing' : 'Incoming'}</span>
-                  <span className="hint" style={{ margin: 0 }}>
-                    {formatCallTimestamp(c.created_at)}
-                    {c.ended_at && ` · ${Math.max(1, Math.round((new Date(c.ended_at) - new Date(c.created_at)) / 1000))}s`}
-                  </span>
-                </div>
-              ))
-            ) : <div className="hint">No calls yet.</div>}
+              ) : <div className="hint" style={{ marginTop: 0 }}>No mood data logged yet today.</div>}
+            </div>
+
+            <div className="profile-section">
+              <div className="profile-section-title">Calls</div>
+              {callHistory === null ? (
+                <div className="hint" style={{ marginTop: 0 }}>Loading…</div>
+              ) : callHistory.length ? (
+                callHistory.map((c) => (
+                  <div key={c.call_id} className="detail-meta-row">
+                    <span>{c.outgoing ? 'Outgoing' : 'Incoming'}</span>
+                    <span className="hint" style={{ margin: 0 }}>
+                      {formatCallTimestamp(c.created_at)}
+                      {c.ended_at && ` · ${Math.max(1, Math.round((new Date(c.ended_at) - new Date(c.created_at)) / 1000))}s`}
+                    </span>
+                  </div>
+                ))
+              ) : <div className="hint" style={{ marginTop: 0 }}>No calls yet.</div>}
+            </div>
           </div>
         ) : (
-          <div className="hint">Select a friend to see their calls and mood.</div>
+          <div className="hint">Select a friend to see their profile.</div>
         )}
       </div>
       )}

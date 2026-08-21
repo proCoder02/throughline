@@ -121,6 +121,18 @@ write_files:
       # server, not local `python app.py` development.
       /opt/throughline/venv/bin/pip install gunicorn gevent
 
+      # CostLens usage tracking (costlens_agent/) needs no deploy step of
+      # its own -- app.py imports it directly as a sibling module (see
+      # app.py's own costlens_agent.install() call, right after
+      # load_dotenv()), which resolves fine once gunicorn has this
+      # directory on sys.path to find app.py itself in the first place.
+      # (A previous version of this deploy copied costlens_agent and a
+      # root-level sitecustomize.py into the venv's site-packages, relying
+      # on Python auto-importing sitecustomize.py at interpreter startup --
+      # that broke in production: Ubuntu's own no-op sitecustomize.py in
+      # /usr/lib/python3.X/ sits earlier on sys.path and silently won every
+      # time, so tracking never actually activated.)
+
       # --- Frontend build -------------------------------------------------
       # vite.config.js's build.outDir (../static/app) lands this directly
       # where app.py's own catch-all route already expects it
