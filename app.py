@@ -3375,6 +3375,72 @@ def set_friend_nickname(friend_id):
     return jsonify({"ok": True, "nickname": nickname})
 
 
+_COGNITIVE_SHARING_LEVELS = ("off", "limited", "collaborative")
+_COGNITIVE_SHARING_RANK = {level: i for i, level in enumerate(_COGNITIVE_SHARING_LEVELS)}
+
+
+@app.route("/friends/<int:friend_id>/cognitive-sharing", methods=["GET"])
+@login_required
+def get_cognitive_sharing(friend_id):
+    """My own sharing level for this friend, plus whether BOTH directions
+    are currently >= 'limited' (the bilateral gate the on-demand suggestion
+    feature is gated on -- see emotional_intelligence/
+    COGNITIVE_SHARING_INTERVENTION_PLAN.md). Deliberately never returns the
+    other side's actual level -- that itself would leak their privacy
+    posture; the UI only ever learns whether the feature is available."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "SELECT user_id, level FROM cognitive_sharing_settings "
+        "WHERE (user_id = %s AND friend_id = %s) OR (user_id = %s AND friend_id = %s)",
+        (user_id, friend_id, friend_id, user_id),
+    )
+    levels_by_user = {row["user_id"]: row["level"] for row in cur.fetchall()}
+    my_level = levels_by_user.get(user_id, "off")
+    their_level = levels_by_user.get(friend_id, "off")
+    both_enabled = (
+        _COGNITIVE_SHARING_RANK[my_level] >= _COGNITIVE_SHARING_RANK["limited"]
+        and _COGNITIVE_SHARING_RANK[their_level] >= _COGNITIVE_SHARING_RANK["limited"]
+    )
+    return jsonify({"my_level": my_level, "both_enabled": both_enabled})
+
+
+@app.route("/friends/<int:friend_id>/cognitive-sharing", methods=["POST"])
+@login_required
+def set_cognitive_sharing(friend_id):
+    data = request.get_json(silent=True) or {}
+    level = (data.get("level") or "").strip().lower()
+    if level not in _COGNITIVE_SHARING_LEVELS:
+        return jsonify({"error": f"level must be one of {_COGNITIVE_SHARING_LEVELS}"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s",
+        (user_id, friend_id),
+    )
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    cur.execute(
+        "INSERT INTO cognitive_sharing_settings (user_id, friend_id, level) "
+        "VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id, friend_id) DO UPDATE SET level = EXCLUDED.level, updated_at = now()",
+        (user_id, friend_id, level),
+    )
+    db.commit()
+    return jsonify({"ok": True, "my_level": level})
+
+
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
 @login_required
 def friend_mood(friend_id):

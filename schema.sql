@@ -95,6 +95,21 @@ CREATE TABLE IF NOT EXISTS friendships (
     CHECK (user_id <> friend_id)
 );
 
+-- One row per direction, same shape as friendships itself -- each side sets
+-- their OWN sharing level for a given friend independently. No row means
+-- 'off' (the default); only written on explicit opt-in, never backfilled.
+-- See emotional_intelligence/COGNITIVE_SHARING_INTERVENTION_PLAN.md -- the
+-- bilateral gate (both directions >= 'limited') is enforced in app.py, not
+-- here, since it needs to read BOTH rows together.
+CREATE TABLE IF NOT EXISTS cognitive_sharing_settings (
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    friend_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    level TEXT NOT NULL DEFAULT 'off' CHECK (level IN ('off', 'limited', 'collaborative')),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, friend_id),
+    CHECK (user_id <> friend_id)
+);
+
 -- One row per distinct named person a user has ever labeled a speaker as,
 -- across all their conversations. This is what lets the "new speaker
 -- detected" prompt offer a pick-list of people already known instead of
