@@ -118,6 +118,12 @@ export function useNotifications(enabled) {
       } else if (msg.type === 'direct_messages_read' || msg.type === 'direct_messages_delivered') {
         const handler = dmListenersRef.current.get(msg.friend_id);
         if (handler) handler(msg);
+      } else if (msg.type === 'cognitive_suggestion') {
+        // Only relevant while that friend's thread is open (matches the
+        // mobile client's NotifyProvider) -- the on-demand feature has no
+        // Friends-list badge, unlike direct_message above.
+        const handler = dmListenersRef.current.get(msg.friend_id);
+        if (handler) handler(msg);
       } else if (msg.type === 'friend_typing') {
         const friendId = msg.friend_id;
         clearTimeout(typingTimersRef.current.get(friendId));

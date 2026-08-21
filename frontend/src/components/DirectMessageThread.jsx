@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import Composer from './Composer.jsx';
-import { BackIcon, CheckIcon, DoubleCheckIcon } from '../icons.jsx';
+import { BackIcon, BrainIcon, CheckIcon, CloseIcon, DoubleCheckIcon } from '../icons.jsx';
 import { apiJson, post } from '../api.js';
 
 function formatTime(iso) {
@@ -26,6 +26,17 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
   const [sending, setSending] = useState(false);
   const scrollRef = useRef(null);
 
+  // -- Cognitive Sharing (Phase 2/3) --------------------------------------
+  const [sharingAvailable, setSharingAvailable] = useState(false); // both sides >= 'limited'
+  const [requestingSuggestion, setRequestingSuggestion] = useState(false);
+  const [suggestion, setSuggestion] = useState(null);
+
+  const loadLatestSuggestion = () => {
+    apiJson(`/friends/${friend.id}/cognitive-suggestion`)
+      .then((data) => setSuggestion(data.suggestion || null))
+      .catch(() => {});
+  };
+
   useEffect(() => {
     let cancelled = false;
     apiJson(`/friends/${friend.id}/messages`).then((items) => {
@@ -43,6 +54,11 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
       notify.clearDmUnread(friend.id);
     });
 
+    apiJson(`/friends/${friend.id}/cognitive-sharing`)
+      .then((status) => { if (!cancelled) setSharingAvailable(!!status.both_enabled); })
+      .catch(() => {});
+    loadLatestSuggestion();
+
     const unregister = notify.registerDmListener(friend.id, (msg) => {
       if (msg.type === 'direct_message') {
         setMessages((prev) => [...(prev || []), msg.message]);
@@ -54,6 +70,11 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
         const ids = new Set(msg.message_ids);
         const now = new Date().toISOString();
         setMessages((prev) => (prev || []).map((m) => (ids.has(m.id) ? { ...m, [field]: now } : m)));
+      } else if (msg.type === 'cognitive_suggestion') {
+        // Payload only carries an id (never raw memory, see
+        // COGNITIVE_SHARING_INTERVENTION_PLAN.md's guardrails) -- fetch the
+        // actual text rather than trusting the WS event alone.
+        loadLatestSuggestion();
       }
     });
 
@@ -63,6 +84,35 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [friend.id]);
+
+  const findCommonGround = async () => {
+    if (requestingSuggestion) return;
+    setRequestingSuggestion(true);
+    try {
+      const data = await post(`/friends/${friend.id}/cognitive-suggestion`, {});
+      if (data.suggestion) {
+        setSuggestion(data.suggestion);
+      } else {
+        alert('Nothing to suggest right now.');
+      }
+    } catch (e) {
+      alert('Could not check: ' + e.message);
+    } finally {
+      setRequestingSuggestion(false);
+    }
+  };
+
+  const dismissSuggestion = async () => {
+    const current = suggestion;
+    if (!current) return;
+    setSuggestion(null); // optimistic -- low-stakes, easily-repeatable action
+    try {
+      await post(`/friends/${friend.id}/cognitive-suggestion/${current.id}/dismiss`, {});
+    } catch {
+      // Not worth surfacing an error for a dismiss -- worst case it
+      // reappears on next load, which is harmless.
+    }
+  };
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -105,7 +155,22 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack }
           <div className="chat-header-name">{friend.nickname || friend.username}</div>
           {isTyping && <div className="chat-header-sub typing-indicator">typing...</div>}
         </div>
+        {sharingAvailable && (
+          <div className="chat-header-actions">
+            <button title="Find common ground" disabled={requestingSuggestion} onClick={findCommonGround}>
+              <BrainIcon />
+            </button>
+          </div>
+        )}
       </div>
+
+      {suggestion && (
+        <div className="cognitive-suggestion-card">
+          <BrainIcon />
+          <span className="cognitive-suggestion-text">{suggestion.suggestion_text}</span>
+          <button title="Dismiss" onClick={dismissSuggestion}><CloseIcon /></button>
+        </div>
+      )}
 
       <div className="messages" ref={scrollRef}>
         {messages === null ? null : messages.length === 0 ? (

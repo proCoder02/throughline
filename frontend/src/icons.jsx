@@ -20,3 +20,7 @@ export const MailIcon = () => <svg {...base}><rect x="3" y="5" width="18" height
 export const CloseIcon = () => <svg {...base}><path d="M6 6l12 12M18 6L6 18"/></svg>;
 export const PhoneIcon = () => <svg {...base}><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>;
 export const AttachIcon = () => <svg {...base}><path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a3.5 3.5 0 014.95 4.95l-9.2 9.19a1.5 1.5 0 01-2.12-2.12l8.49-8.48"/></svg>;
+// Cognitive Sharing's "find common ground" action -- a simple brain glyph,
+// matching the Icons.psychology_outlined used for the same action on the
+// Flutter client.
+export const BrainIcon = () => <svg {...base}><path d="M9 4a3 3 0 00-3 3v.34A3.5 3.5 0 004 10.5 3.5 3.5 0 006 13.68V16a4 4 0 004 4M9 4a3 3 0 013 3v13M9 4c0-1.1.9-2 2-2M15 4a3 3 0 013 3v.34A3.5 3.5 0 0120 10.5 3.5 3.5 0 0118 13.68V16a4 4 0 01-4 4M15 4a3 3 0 00-3 3M15 4c0-1.1-.9-2-2-2"/></svg>;

@@ -129,6 +129,21 @@ input, textarea { font-family: inherit; }
 .chat-header-actions button:hover { background: var(--wa-hover); }
 .chat-header-actions svg { width: 20px; height: 20px; }
 
+/* Cognitive Sharing's on-demand "find common ground" result -- deliberately
+   NOT a message bubble (see COGNITIVE_SHARING_INTERVENTION_PLAN.md): a
+   dismissible banner above the thread, each side dismisses independently. */
+.cognitive-suggestion-card {
+  display: flex; align-items: flex-start; gap: 10px; margin: 8px 10px 0; padding: 10px 8px 10px 14px;
+  background: color-mix(in srgb, var(--wa-accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--wa-accent) 35%, transparent);
+  border-radius: 12px; flex-shrink: 0;
+}
+.cognitive-suggestion-card svg { width: 18px; height: 18px; color: var(--wa-accent); flex-shrink: 0; margin-top: 1px; }
+.cognitive-suggestion-text { flex: 1; font-size: 13.5px; line-height: 1.4; }
+.cognitive-suggestion-card button { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: var(--wa-text-soft); flex-shrink: 0; }
+.cognitive-suggestion-card button:hover { background: var(--wa-hover); }
+.cognitive-suggestion-card button svg { width: 16px; height: 16px; color: inherit; margin: 0; }
+
 .messages {
   flex: 1; overflow-y: auto; padding: 16px 6% 8px;
   background-image: radial-gradient(#00000008 1px, transparent 1px);

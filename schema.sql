@@ -389,6 +389,30 @@ CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient_unread
 -- (same reasoning as every other ADD COLUMN IF NOT EXISTS in this file).
 ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
 
+-- Phase 2 of COGNITIVE_SHARING_INTERVENTION_PLAN.md: one row per on-demand
+-- "find common ground" request that actually produced something (most
+-- requests produce nothing and insert no row here -- see
+-- emotional_intelligence/cognitive_sharing.generate_common_ground_suggestion).
+-- Canonical user_a < user_b ordering (matches relationship_profiles' own
+-- convention) -- one row per pair per suggestion, not two duplicated rows.
+-- Deliberately NOT part of direct_messages: a separate, dismissible surface
+-- delivered via push_notification: each side dismisses independently.
+CREATE TABLE IF NOT EXISTS cognitive_suggestions (
+    id SERIAL PRIMARY KEY,
+    user_a INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    user_b INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    suggestion_text TEXT NOT NULL,
+    source_message_id INTEGER REFERENCES direct_messages (id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    shown_to_a_at TIMESTAMPTZ,
+    shown_to_b_at TIMESTAMPTZ,
+    dismissed_by_a BOOLEAN NOT NULL DEFAULT false,
+    dismissed_by_b BOOLEAN NOT NULL DEFAULT false,
+    CHECK (user_a < user_b)
+);
+CREATE INDEX IF NOT EXISTS idx_cognitive_suggestions_pair
+    ON cognitive_suggestions (user_a, user_b, created_at DESC);
+
 -- FCM device tokens for mobile push (calls, tasks, reminder emails, friend
 -- mood updates) -- one row per device; UNIQUE(token) lets registration be a
 -- plain upsert (token refresh, or the same device logging into a different

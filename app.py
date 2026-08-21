@@ -3441,6 +3441,163 @@ def set_cognitive_sharing(friend_id):
     return jsonify({"ok": True, "my_level": level})
 
 
+COGNITIVE_SUGGESTION_DM_LIMIT = 30
+
+
+def _cognitive_sharing_levels(cur, user_id, friend_id):
+    """Both directions' levels for a pair -- shared by the on-demand
+    suggestion endpoint below and get_cognitive_sharing above (kept as a
+    separate small helper rather than refactoring get_cognitive_sharing
+    itself, so that already-shipped/verified endpoint's behavior can't
+    regress from a change made for this new one)."""
+    cur.execute(
+        "SELECT user_id, level FROM cognitive_sharing_settings "
+        "WHERE (user_id = %s AND friend_id = %s) OR (user_id = %s AND friend_id = %s)",
+        (user_id, friend_id, friend_id, user_id),
+    )
+    levels_by_user = {row["user_id"]: row["level"] for row in cur.fetchall()}
+    return levels_by_user.get(user_id, "off"), levels_by_user.get(friend_id, "off")
+
+
+def _serialize_cognitive_suggestion(row, viewer_id):
+    """Never includes user_a/user_b's raw memory -- only the already-
+    synthesized suggestion_text -- and reports dismissed/shown from the
+    viewer's own side only, mirroring get_cognitive_sharing's own
+    never-leak-the-other-side's-state discipline."""
+    is_a = row["user_a"] == viewer_id
+    return {
+        "id": row["id"],
+        "suggestion_text": row["suggestion_text"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "dismissed": row["dismissed_by_a"] if is_a else row["dismissed_by_b"],
+    }
+
+
+@app.route("/friends/<int:friend_id>/cognitive-suggestion", methods=["POST"])
+@login_required
+def request_cognitive_suggestion(friend_id):
+    """On-demand 'find common ground' trigger -- v1 per
+    COGNITIVE_SHARING_INTERVENTION_PLAN.md is deliberately on-demand only,
+    not automatic background triggering, to avoid unwanted LLM spend/spam
+    until there's real usage data. Bilateral gate is checked here, before
+    any subject resolution or LLM call touches either person's data -- not
+    an afterthought filter on the output."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s", (user_id, friend_id))
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    my_level, their_level = _cognitive_sharing_levels(cur, user_id, friend_id)
+    if _COGNITIVE_SHARING_RANK[my_level] < _COGNITIVE_SHARING_RANK["limited"]:
+        return jsonify({"error": "Turn on Cognitive Sharing for this friend first."}), 403
+    if _COGNITIVE_SHARING_RANK[their_level] < _COGNITIVE_SHARING_RANK["limited"]:
+        return jsonify({"error": "Ask them to turn on Cognitive Sharing too -- both sides need it on."}), 403
+
+    cur.execute(
+        "SELECT id, sender_id, content FROM direct_messages "
+        "WHERE (sender_id = %(me)s AND recipient_id = %(friend)s) "
+        "OR (sender_id = %(friend)s AND recipient_id = %(me)s) "
+        "ORDER BY id DESC LIMIT %(limit)s",
+        {"me": user_id, "friend": friend_id, "limit": COGNITIVE_SUGGESTION_DM_LIMIT},
+    )
+    dm_rows = list(reversed(cur.fetchall()))
+    last_message_id = dm_rows[-1]["id"] if dm_rows else None
+    recent_dm_context = "\n".join(
+        f"- {'Them' if r['sender_id'] == friend_id else 'Me'}: {r['content']}" for r in dm_rows
+    )
+
+    try:
+        from emotional_intelligence.cognitive_sharing import generate_common_ground_suggestion
+        suggestion_text = generate_common_ground_suggestion(cur, user_id, friend_id, recent_dm_context)
+    except Exception as exc:
+        print(f"[cognitive_sharing] request_cognitive_suggestion failed: {exc!r}")
+        suggestion_text = None
+
+    if not suggestion_text:
+        return jsonify({"suggestion": None, "message": "Nothing to suggest right now."})
+
+    user_a, user_b = (user_id, friend_id) if user_id < friend_id else (friend_id, user_id)
+    shown_column = "shown_to_a_at" if user_id == user_a else "shown_to_b_at"
+    cur.execute(
+        f"INSERT INTO cognitive_suggestions (user_a, user_b, suggestion_text, source_message_id, {shown_column}) "
+        f"VALUES (%s, %s, %s, %s, now()) "
+        f"RETURNING id, user_a, user_b, suggestion_text, created_at, dismissed_by_a, dismissed_by_b",
+        (user_a, user_b, suggestion_text, last_message_id),
+    )
+    row = cur.fetchone()
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    requester_name = cur.fetchone()["username"]
+    push_notification(friend_id, {
+        "type": "cognitive_suggestion", "suggestion_id": row["id"], "friend_id": user_id,
+    })
+    send_fcm_to_user(
+        friend_id, title="Cognitive Sharing", body=f"A suggestion for you and {requester_name}",
+        data={"type": "cognitive_suggestion", "suggestion_id": str(row["id"]), "friend_id": str(user_id)},
+    )
+
+    return jsonify({"suggestion": _serialize_cognitive_suggestion(row, user_id)})
+
+
+@app.route("/friends/<int:friend_id>/cognitive-suggestion", methods=["GET"])
+@login_required
+def get_latest_cognitive_suggestion(friend_id):
+    """Latest suggestion for this pair not yet dismissed by me -- used for
+    initial screen load and by whichever side didn't request it, after
+    they've been notified via push_notification/FCM (the notification
+    payload only carries an id; this is what actually loads the text).
+    Marks shown_to_<me>_at on first fetch."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s", (user_id, friend_id))
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    user_a, user_b = (user_id, friend_id) if user_id < friend_id else (friend_id, user_id)
+    dismissed_column = "dismissed_by_a" if user_id == user_a else "dismissed_by_b"
+    shown_column = "shown_to_a_at" if user_id == user_a else "shown_to_b_at"
+    cur.execute(
+        f"SELECT id, user_a, user_b, suggestion_text, created_at, dismissed_by_a, dismissed_by_b "
+        f"FROM cognitive_suggestions WHERE user_a = %s AND user_b = %s AND {dismissed_column} = false "
+        f"ORDER BY id DESC LIMIT 1",
+        (user_a, user_b),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"suggestion": None})
+
+    cur.execute(f"UPDATE cognitive_suggestions SET {shown_column} = COALESCE({shown_column}, now()) WHERE id = %s", (row["id"],))
+    db.commit()
+    return jsonify({"suggestion": _serialize_cognitive_suggestion(row, user_id)})
+
+
+@app.route("/friends/<int:friend_id>/cognitive-suggestion/<int:suggestion_id>/dismiss", methods=["POST"])
+@login_required
+def dismiss_cognitive_suggestion(friend_id, suggestion_id):
+    """Each side dismisses independently -- dismissing on my device must
+    never affect what the other participant still sees (guardrail #3 in
+    COGNITIVE_SHARING_INTERVENTION_PLAN.md)."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    user_a, user_b = (user_id, friend_id) if user_id < friend_id else (friend_id, user_id)
+    dismissed_column = "dismissed_by_a" if user_id == user_a else "dismissed_by_b"
+    cur.execute(
+        f"UPDATE cognitive_suggestions SET {dismissed_column} = true "
+        f"WHERE id = %s AND user_a = %s AND user_b = %s RETURNING id",
+        (suggestion_id, user_a, user_b),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "Suggestion not found"}), 404
+    return jsonify({"ok": True})
+
+
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
 @login_required
 def friend_mood(friend_id):
