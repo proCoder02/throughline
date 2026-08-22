@@ -77,6 +77,21 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 CORS(app, supports_credentials=True, origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","))
 
 
+# The one touch point CostLens' per-endpoint attribution needs in this file
+# -- everything else (which feature a call belongs to, propagating this into
+# background threads) lives inside costlens_agent itself. Route PATTERN
+# (e.g. "/friends/<int:friend_id>/messages"), not the resolved path with
+# real IDs, to keep cardinality bounded. A no-op when COSTLENS_SDK isn't
+# enabled (set_current_route just writes a contextvar nothing reads).
+@app.before_request
+def _costlens_set_route():
+    try:
+        from costlens_agent import set_current_route
+        set_current_route(request.url_rule.rule if request.url_rule else request.path)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Database helpers (Postgres via psycopg2)
 #

@@ -35,6 +35,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# CostLens usage tracking -- this and every other EI batch script run as
+# separate standalone processes (see run_daily_ei_pipeline.py), each needing
+# its own install() call; app.py's own install() only covers its own
+# process. Installed here (imported by real_user_extraction.py,
+# personality_batch.py, relationship_batch.py, fact_dedup.py, and
+# weekly_digest.py) plus cognitive_reasoning_demo.py (imported by
+# cognitive_sharing.py) together cover every EI script that makes its own
+# LLM calls, without needing a separate install() call added to each one
+# individually. Safe/idempotent if a script ends up importing both.
+import sys as _sys
+from pathlib import Path as _Path
+_repo_root = str(_Path(__file__).resolve().parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+try:
+    import costlens_agent as _costlens_agent
+    _costlens_agent.install()
+except Exception:
+    pass  # optional and additive -- never blocks this script's real work
+
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise SystemExit("DATABASE_URL is required")

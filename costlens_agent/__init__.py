@@ -22,9 +22,14 @@ so there's zero overhead and zero behavior change.
 """
 
 import os
+import sys
 import time
 import json
+import atexit
 import logging
+import inspect
+import threading
+import contextvars
 from urllib.parse import urlparse
 
 logger = logging.getLogger("costlens-agent")
@@ -40,6 +45,134 @@ _PROVIDER_HOSTS = {
     "ollama.com": "ollama",
     "api.ollama.com": "ollama",
 }
+
+# ---------------------------------------------------------------------------
+# Per-endpoint / per-feature attribution
+#
+# Deliberately kept entirely inside this vendored SDK rather than requiring
+# edits scattered across app.py, ei_adapter.py, and every EI batch script --
+# the goal was minimum touch-point to the actual speech2text backend code.
+# Two mechanisms do the work:
+#
+# 1. `source_route` (which Flask route triggered a call) -- set once, in a
+#    single app.py before_request hook, into the contextvar below. Read back
+#    here when an outbound call happens, on whichever thread it happens on
+#    (see _patch_threading, since a plain threading.Thread does NOT inherit
+#    the parent's contextvars.Context on its own -- that's only automatic
+#    for asyncio tasks / concurrent.futures).
+# 2. `feature_tag` (which product feature the call belongs to) -- inferred
+#    by walking the Python call stack at the moment of the outbound call
+#    (see _infer_feature_tag) and matching either the calling *file* (for
+#    the standalone EI batch scripts, where one file == one feature) or the
+#    calling *function name* (for app.py, where several features share one
+#    file). Falls back to a route->feature map for anything else synchronous.
+# ---------------------------------------------------------------------------
+
+_current_route: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "costlens_current_route", default=""
+)
+
+
+def set_current_route(route: str) -> None:
+    """Call once per request (e.g. a Flask before_request hook) with the
+    route PATTERN (request.url_rule.rule), not the resolved path with real
+    IDs substituted in -- keeps cardinality bounded to the known routes."""
+    _current_route.set(route or "")
+
+
+def _patch_threading() -> None:
+    """threading.Thread does not automatically copy the spawning thread's
+    contextvars.Context (unlike asyncio tasks) -- a plain background thread
+    (the pattern already used throughout app.py for trigger_chat_feedback_
+    extraction/trigger_reminder_extraction) starts with a fresh, empty
+    context, so set_current_route() above would silently read back "" on
+    those threads without this. Patching Thread.start once, here, to copy
+    the context is the same technique concurrent.futures uses internally --
+    it makes source_route (and any other contextvar) transparently follow a
+    request into any background thread it spawns, with no changes needed at
+    any of app.py's existing threading.Thread(...).start() call sites."""
+    original_start = threading.Thread.start
+
+    def patched_start(self):
+        ctx = contextvars.copy_context()
+        original_run = self.run
+
+        def run_with_context(*args, **kwargs):
+            return ctx.run(original_run, *args, **kwargs)
+
+        self.run = run_with_context
+        original_start(self)
+
+    threading.Thread.start = patched_start
+
+
+# One entry per standalone emotional_intelligence/ script that makes its own
+# LLM calls -- these run as separate Python processes (see
+# run_daily_ei_pipeline.py), so there's never any ambiguity about which
+# feature a call inside one of them belongs to.
+#
+# extraction_pipeline.py is deliberately NOT listed here even though it's
+# the Friends-TV research corpus script (research.friends_corpus, handled
+# separately below) -- it also defines call_llm/extract_json/PROMPT_VERSION,
+# imported and called BY every other script in this table. Since that
+# shared call_llm frame sits on the call stack for all of them, matching on
+# its filename here would mislabel every other script's calls as
+# research.friends_corpus too (the actual bug this comment is warning
+# against -- caught via a real test run before this was fixed).
+_MODULE_FEATURE_MAP = {
+    "chat_feedback_extraction.py": "ei.fact_extraction",
+    "real_user_extraction.py": "ei.fact_extraction",
+    "fact_dedup.py": "ei.fact_dedup",
+    "personality_batch.py": "ei.personality",
+    "relationship_batch.py": "ei.relationships",
+    "cognitive_sharing.py": "ei.cognitive_sharing",
+    "weekly_digest.py": "ei.weekly_digest",
+}
+
+# For calls made directly from app.py, several features share that one file
+# -- matched by the enclosing function's name instead, so e.g. the reminder
+# extraction fired from inside chat_global_image's background thread is
+# still tagged "reminders", not "chat.image" just because that's the route
+# that happened to trigger it.
+_FUNCTION_FEATURE_MAP = {
+    "chat": "chat.text",
+    "chat_global": "chat.text",
+    "chat_global_image": "chat.image",
+    "trigger_reminder_extraction": "reminders",
+    "request_cognitive_suggestion": "ei.cognitive_sharing",
+    "send_direct_message": "chat.text",
+}
+
+# Last-resort fallback when neither of the above matches (e.g. a future call
+# site nobody's tagged yet) -- keyed by the same route pattern source_route
+# carries, so at minimum the call still lands under the right endpoint.
+_ROUTE_FEATURE_MAP = {
+    "/chat": "chat.text",
+    "/chat/global": "chat.text",
+    "/chat/global/image": "chat.image",
+    "/friends/<int:friend_id>/cognitive-suggestion": "ei.cognitive_sharing",
+}
+
+
+def _infer_feature_tag(source_route: str) -> str:
+    try:
+        # Checked first, via the process entrypoint rather than the call
+        # stack -- extraction_pipeline.py run standalone (python
+        # extraction_pipeline.py ...) IS the Friends-TV research corpus
+        # pipeline; extraction_pipeline.py merely *imported* by another
+        # script (for its shared call_llm helper) is not, and must not be
+        # mistaken for it -- see _MODULE_FEATURE_MAP's docstring above.
+        if sys.argv and os.path.basename(sys.argv[0]) == "extraction_pipeline.py":
+            return "research.friends_corpus"
+        for frame_info in inspect.stack():
+            filename = os.path.basename(frame_info.filename)
+            if filename in _MODULE_FEATURE_MAP:
+                return _MODULE_FEATURE_MAP[filename]
+            if filename == "app.py" and frame_info.function in _FUNCTION_FEATURE_MAP:
+                return _FUNCTION_FEATURE_MAP[frame_info.function]
+    except Exception:
+        pass
+    return _ROUTE_FEATURE_MAP.get(source_route, "untagged")
 
 
 def install():
@@ -64,6 +197,19 @@ def install():
     _patch_requests(tracker)
     _patch_psycopg2(tracker)
     _patch_redis(tracker)
+    _patch_threading()
+
+    # Without this, a short-lived process (any of the emotional_intelligence/
+    # batch scripts run standalone, e.g. "real_user_extraction.py --limit 1"
+    # finishing in well under a second) can exit before the tracker's
+    # periodic flush thread ever wakes up (it sleeps flush_interval_seconds,
+    # default 5s, before its first flush) -- daemon threads are killed
+    # immediately when the process exits, so every buffered record from that
+    # run would be silently lost, every time, for any script fast enough to
+    # beat the interval. app.py itself never hits this (it runs for hours),
+    # which is exactly why this gap went unnoticed until a real batch-script
+    # test caught it with zero rows tracked.
+    atexit.register(tracker._flush)
 
     _installed = True
     logger.info("costlens_agent installed (provider hosts: %s)", list(_PROVIDER_HOSTS))
@@ -168,10 +314,13 @@ def _patch_requests(tracker):
         @_safe
         def report():
             input_tokens, output_tokens, model, cost = _extract_usage(response, provider)
+            source_route = _current_route.get()
             tracker.log(
                 provider=provider,
                 endpoint=urlparse(request.url).path,
                 method=request.method,
+                source_route=source_route,
+                feature_tag=_infer_feature_tag(source_route),
                 model=model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
