@@ -22,6 +22,7 @@ so there's zero overhead and zero behavior change.
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -336,6 +337,49 @@ def _patch_requests(tracker):
     requests.Session.send = patched_send
 
 
+_SQL_VERB_RE = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE|WITH)\b", re.IGNORECASE)
+_SQL_INTO_TABLE_RE = re.compile(r"\bINTO\s+([a-zA-Z_][a-zA-Z0-9_.]*)", re.IGNORECASE)
+_SQL_UPDATE_TABLE_RE = re.compile(r"\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_.]*)", re.IGNORECASE)
+_SQL_FROM_TABLE_RE = re.compile(r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_.]*)", re.IGNORECASE)
+
+
+def _sql_endpoint(query) -> str:
+    """Best-effort "VERB table" summary (e.g. "SELECT tasks", "INSERT
+    friendships") in place of the previous hardcoded "psycopg2.execute" --
+    that constant made every one of the app's database calls
+    indistinguishable from every other in CostLens, an intentional
+    real gap found and reported by the user rather than caught up front.
+
+    Deliberately only ever captures the query's fixed TEXT (which uses %s
+    placeholders throughout this codebase, e.g. "WHERE user_id = %s"), never
+    the `vars` tuple bound to it -- that's where actual user data
+    (usernames, message content, task descriptions) would live, and it is
+    never touched here. Falls back to the old generic label on anything
+    this simple regex approach can't parse (DDL, multi-statement scripts,
+    a non-string query object) rather than guessing wrong."""
+    try:
+        text = query.decode() if isinstance(query, bytes) else str(query)
+        verb_match = _SQL_VERB_RE.match(text)
+        if not verb_match:
+            return "psycopg2.execute"
+        verb = verb_match.group(1).upper()
+
+        if verb == "INSERT":
+            table_match = _SQL_INTO_TABLE_RE.search(text)
+        elif verb == "UPDATE":
+            table_match = _SQL_UPDATE_TABLE_RE.search(text)
+        else:  # SELECT, DELETE, WITH (a CTE's real operation is nested,
+            table_match = _SQL_FROM_TABLE_RE.search(text)  # but still has a FROM)
+        if not table_match:
+            return f"{verb} ?"
+
+        if verb == "WITH":
+            verb = "SELECT"  # the CTE wrapper isn't the real operation
+        return f"{verb} {table_match.group(1)}"
+    except Exception:
+        return "psycopg2.execute"
+
+
 def _patch_psycopg2(tracker):
     try:
         import psycopg2
@@ -362,7 +406,7 @@ def _patch_psycopg2(tracker):
                 def report():
                     tracker.log(
                         provider="database",
-                        endpoint="psycopg2.execute",
+                        endpoint=_sql_endpoint(query),
                         latency_ms=elapsed_ms,
                     )
                 report()
