@@ -2260,11 +2260,20 @@ def _query_nearby_places(lat: float, lon: float, tag_filter: str, element_types:
         el_lon = el.get("lon") or (el.get("center") or {}).get("lon")
         if el_lat is None or el_lon is None:
             continue
+        addr_parts = []
+        housenumber, street = tags.get("addr:housenumber"), tags.get("addr:street")
+        addr_parts.append(f"{housenumber} {street}" if housenumber and street else street)
+        addr_parts.append(tags.get("addr:city"))
+        address = ", ".join(p for p in addr_parts if p)
+
         results.append({
             "name": name,
             "category": tags.get("shop") or tags.get("amenity") or tags.get("leisure")
             or tags.get("tourism") or tags.get("route") or "",
             "distance_km": round(_haversine_km(lat, lon, el_lat, el_lon), 1),
+            "address": address,
+            "lat": el_lat,
+            "lon": el_lon,
         })
 
     results.sort(key=lambda r: r["distance_km"])
@@ -5096,10 +5105,16 @@ def chat_global():
             tag_filter, element_types = category_filter or _DEFAULT_NEARBY_FILTER
             places = _query_nearby_places(float(lat), float(lon), tag_filter, element_types)
             if places:
-                lines = [f"Real nearby places found (OpenStreetMap data, sorted nearest first):"]
+                lines = [
+                    "Real nearby places found (OpenStreetMap data, sorted nearest first). "
+                    "Each includes its address (when known) and a Google Maps link -- pass these "
+                    "along if the user asks where something is or how to get there:"
+                ]
                 for p in places:
                     label = f" ({p['category']})" if p["category"] else ""
-                    lines.append(f"- {p['name']}{label} -- {p['distance_km']} km away")
+                    where = p["address"] or f"{p['lat']:.5f}, {p['lon']:.5f}"
+                    maps_link = f"https://www.google.com/maps?q={p['lat']},{p['lon']}"
+                    lines.append(f"- {p['name']}{label} -- {p['distance_km']} km away, at {where} ({maps_link})")
                 nearby_context = "\n".join(lines)
             else:
                 nearby_context = (
