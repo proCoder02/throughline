@@ -2,6 +2,7 @@
 import os
 import re
 import io
+import math
 import json
 import base64
 import hashlib
@@ -2112,6 +2113,162 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
             )
     except Exception as e:
         print(f"[trigger_reminder_extraction] failed: {e!r}")
+
+
+# ---------------------------------------------------------------------------
+# Location-aware "nearby" suggestions (/chat/global)
+#
+# The LLM has no live knowledge of actual nearby businesses/trails -- this
+# fetches real data from OpenStreetMap's free Overpass API (no key, no
+# billing account, chosen deliberately over Google Places for that reason)
+# and feeds it into the prompt as grounding context, same "real data in,
+# synthesized reply out" shape chat_global_image already uses for vision
+# extraction. Never lets the LLM invent a place name on its own.
+# ---------------------------------------------------------------------------
+
+_NEARBY_INTENT_RE = re.compile(
+    r"\bnear(?:by)?\s+me\b|\bnear\s+here\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\bin\s+my\s+area\b",
+    re.IGNORECASE,
+)
+
+# keyword -> Overpass tag filter. Deliberately a small, hand-picked lookup
+# rather than a full NLP category classifier -- covers the two categories
+# named in the original request (trek/shop) plus a handful of obviously
+# useful others, matched by simple substring search against the prompt.
+# Falls back to a broad "any named point of interest" filter (see
+# _DEFAULT_NEARBY_TAG_FILTER) when nothing here matches but nearby-intent
+# is still present, e.g. "what's around me?" with no specific category.
+# Each value is (tag_filter, element_types) -- element_types matters, not
+# just cosmetic: OSM tags a hiking trail's route=hiking on the RELATION (the
+# multi-way path as a whole), essentially never on individual nodes/ways.
+# Searching node/way for that tag anyway isn't just useless, it's expensive
+# enough to time out Overpass outright (confirmed live near Yosemite: 504
+# Gateway Timeout on the way-search, 0 results even when it didn't time
+# out) -- so hiking is relation-only, and everything else (shops,
+# restaurants, etc., which really are tagged on nodes/ways) stays node+way.
+_NEARBY_CATEGORY_TAGS = {
+    "trek": ('["route"="hiking"]', ("relation",)),
+    "hike": ('["route"="hiking"]', ("relation",)),
+    "hiking": ('["route"="hiking"]', ("relation",)),
+    "trail": ('["route"="hiking"]', ("relation",)),
+    "shop": ('["shop"]', ("node", "way")),
+    "shopping": ('["shop"]', ("node", "way")),
+    "store": ('["shop"]', ("node", "way")),
+    "mall": ('["shop"="mall"]', ("node", "way")),
+    "restaurant": ('["amenity"="restaurant"]', ("node", "way")),
+    "food": ('["amenity"="restaurant"]', ("node", "way")),
+    "eat": ('["amenity"="restaurant"]', ("node", "way")),
+    "cafe": ('["amenity"="cafe"]', ("node", "way")),
+    "coffee": ('["amenity"="cafe"]', ("node", "way")),
+    "park": ('["leisure"="park"]', ("node", "way")),
+    "pharmacy": ('["amenity"="pharmacy"]', ("node", "way")),
+    "hospital": ('["amenity"="hospital"]', ("node", "way")),
+    "atm": ('["amenity"="atm"]', ("node",)),
+    "gym": ('["leisure"="fitness_centre"]', ("node", "way")),
+    "hotel": ('["tourism"="hotel"]', ("node", "way")),
+}
+_DEFAULT_NEARBY_FILTER = ('["name"]["shop"]', ("node", "way"))
+_NEARBY_SEARCH_RADIUS_METERS = 3000  # uniform radius across all categories, per explicit request
+_NEARBY_RESULT_LIMIT = 8
+
+
+def _detect_nearby_category(prompt_lower: str) -> tuple[str, tuple[str, ...]] | None:
+    """First matching category keyword's (tag_filter, element_types), or
+    None if the message doesn't look like a nearby-places request at all
+    (checked by the caller via _NEARBY_INTENT_RE OR a category keyword
+    alone -- "good trek spots?" has no "near me" but is still clearly
+    asking for one)."""
+    for keyword, spec in _NEARBY_CATEGORY_TAGS.items():
+        if re.search(r"\b" + keyword + r"\b", prompt_lower):
+            return spec
+    return None
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _query_nearby_places(lat: float, lon: float, tag_filter: str, element_types: tuple[str, ...]) -> list[dict]:
+    """Real nearby results from OpenStreetMap via the free Overpass API --
+    never raises, returns [] on any failure (timeout, malformed response,
+    Overpass rate-limiting) so a flaky external API degrades to "nothing
+    found" rather than a broken chat response. Each result carries the
+    haversine distance in km, sorted nearest-first. element_types is
+    per-category (see _NEARBY_CATEGORY_TAGS) rather than always querying
+    node+way+relation -- searching an element type a tag is never actually
+    stored on isn't just wasted, it can time Overpass out outright."""
+    body = "".join(
+        f"{el}{tag_filter}(around:{_NEARBY_SEARCH_RADIUS_METERS},{lat},{lon});"
+        for el in element_types
+    )
+    # Relation queries (hiking routes) are inherently slower -- a
+    # long-distance trail relation (the John Muir/Pacific Crest Trail
+    # passing through Yosemite, confirmed live) can have thousands of
+    # member ways, making the "around" geometry computation genuinely
+    # expensive rather than stuck/broken. Giving that case more time
+    # outright, once, beats retrying a slow-but-legitimate query on the
+    # same short budget -- a second attempt wouldn't make a huge relation
+    # smaller. Node/way categories (shops, restaurants) stay fast with the
+    # short-timeout+retry shape, since a failure there is far more likely
+    # transient server load than genuine query complexity.
+    is_relation_query = "relation" in element_types
+    overpass_timeout = 25 if is_relation_query else 10
+    request_timeout = 28 if is_relation_query else 12
+    max_attempts = 1 if is_relation_query else 2
+    query = (
+        f"[out:json][timeout:{overpass_timeout}];"
+        f"({body});"  # the union group must be its own terminated statement --
+        f"out center {_NEARBY_RESULT_LIMIT * 3};"  # missing this ';' is what caused a live 400 earlier
+    )
+    # The public Overpass instance is a shared, free community resource --
+    # confirmed via live testing to occasionally return a transient 400/504
+    # under load even for a well-formed query, distinct from the (also
+    # confirmed live) 406 it always returns without a real User-Agent. One
+    # retry after a short pause is enough to ride out the transient case
+    # without making a genuinely-empty result wait noticeably longer.
+    elements = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+                headers={"User-Agent": "throughline-app/1.0"},
+                timeout=request_timeout,
+            )
+            response.raise_for_status()
+            elements = response.json().get("elements", [])
+            break
+        except Exception as e:
+            print(f"[nearby_places] Overpass query failed (attempt {attempt + 1}/{max_attempts}): {e!r}")
+            if attempt < max_attempts - 1:
+                time.sleep(1.5)
+    if elements is None:
+        return []
+
+    results = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name:
+            continue  # unnamed OSM elements (most ways/relations) aren't useful to suggest
+        el_lat = el.get("lat") or (el.get("center") or {}).get("lat")
+        el_lon = el.get("lon") or (el.get("center") or {}).get("lon")
+        if el_lat is None or el_lon is None:
+            continue
+        results.append({
+            "name": name,
+            "category": tags.get("shop") or tags.get("amenity") or tags.get("leisure")
+            or tags.get("tourism") or tags.get("route") or "",
+            "distance_km": round(_haversine_km(lat, lon, el_lat, el_lon), 1),
+        })
+
+    results.sort(key=lambda r: r["distance_km"])
+    return results[:_NEARBY_RESULT_LIMIT]
 
 
 # ---------------------------------------------------------------------------
@@ -4817,6 +4974,8 @@ def chat_global():
     prompt = (data.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
+    lat = data.get("lat")
+    lon = data.get("lon")
 
     user_id = current_user_id()
     db = get_db()
@@ -4917,6 +5076,37 @@ def chat_global():
                 + "\n".join(f"- {o}" for o in observations)
             )
 
+    # Location-aware "nearby" suggestions -- only fires an external API call
+    # when the message actually looks like it's asking for one (intent
+    # regex OR a recognized category keyword alone, e.g. "good trek spots?"
+    # with no explicit "near me"), keeping this free for every other
+    # message. Still works without lat/lon (the LLM is told to ask for
+    # location instead of guessing), so a client that hasn't wired up
+    # geolocation yet degrades gracefully rather than erroring.
+    nearby_context = ""
+    category_filter = _detect_nearby_category(prompt_lower)
+    if category_filter or _NEARBY_INTENT_RE.search(prompt_lower):
+        if lat is None or lon is None:
+            nearby_context = (
+                "The user asked about nearby places, but no location was provided with this "
+                "message -- ask them to share their location (or name a specific place/area) "
+                "before suggesting anything, rather than guessing."
+            )
+        else:
+            tag_filter, element_types = category_filter or _DEFAULT_NEARBY_FILTER
+            places = _query_nearby_places(float(lat), float(lon), tag_filter, element_types)
+            if places:
+                lines = [f"Real nearby places found (OpenStreetMap data, sorted nearest first):"]
+                for p in places:
+                    label = f" ({p['category']})" if p["category"] else ""
+                    lines.append(f"- {p['name']}{label} -- {p['distance_km']} km away")
+                nearby_context = "\n".join(lines)
+            else:
+                nearby_context = (
+                    "The user asked about nearby places, but no matching results were found "
+                    "nearby -- say so plainly rather than inventing a place name."
+                )
+
     if matched:
         cur.execute(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
@@ -4932,7 +5122,7 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
-    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context:
+    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context and not nearby_context:
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -4953,11 +5143,27 @@ def chat_global():
     # follow-up-resolution role load_chat_context plays for /chat.
     history = load_global_chat_context(cur, user_id)
 
-    transcripts_section = "\n\n---\n\n".join(blocks) if blocks else "(No saved conversation transcripts available.)"
+    # Built up rather than defaulting to the "(No saved conversation
+    # transcripts available.)" placeholder up front -- that literal string,
+    # sitting right next to real data from personal_notes/direct_messages/
+    # nearby_context, was confusing the model into treating it as the
+    # authoritative "nothing here" signal and ignoring the real content
+    # above it (caught via a live test: real Overpass results came back,
+    # but the reply still claimed nothing was found). The placeholder now
+    # only appears if truly nothing at all is available.
+    transcripts_section = "\n\n---\n\n".join(blocks) if blocks else ""
+
+    def _prepend(section: str, block: str) -> str:
+        return f"{block}\n\n---\n\n{section}" if section else block
+
     if personal_notes_context:
-        transcripts_section = f"{personal_notes_context}\n\n---\n\n{transcripts_section}"
+        transcripts_section = _prepend(transcripts_section, personal_notes_context)
     if direct_messages_context:
-        transcripts_section = f"{direct_messages_context}\n\n---\n\n{transcripts_section}"
+        transcripts_section = _prepend(transcripts_section, direct_messages_context)
+    if nearby_context:
+        transcripts_section = _prepend(transcripts_section, nearby_context)
+    if not transcripts_section:
+        transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
     matched_name = matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
     global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched_name)
