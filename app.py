@@ -20,7 +20,7 @@ from email import encoders
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request, g, session, send_from_directory
+from flask import Flask, jsonify, render_template, request, g, session, send_from_directory, redirect
 from flask_cors import CORS
 from flask_sock import Sock
 import requests
@@ -5122,6 +5122,24 @@ def chat_global():
                     "nearby -- say so plainly rather than inventing a place name."
                 )
 
+    # Cognitive Commerce: Swiggy MCP (commerce/swiggy_adapter.py). Entirely
+    # gated behind SWIGGY_MCP_ENABLED in .env -- is_enabled() short-circuits
+    # everything below to zero cost (not even the intent regex runs) when
+    # the flag is off, same shape as every other optional subsystem this
+    # endpoint already touches (ei_context, nearby_context).
+    commerce_context = ""
+    action_card = None
+    try:
+        from commerce.swiggy_adapter import build_commerce_context, detect_intent, is_enabled as swiggy_enabled
+        if swiggy_enabled():
+            commerce_server = detect_intent(prompt_lower)
+            if commerce_server:
+                commerce_context, action_card = build_commerce_context(
+                    cur, db, user_id, prompt, commerce_server, ei_context
+                )
+    except Exception:
+        commerce_context, action_card = "", None  # optional and additive, never affects this endpoint otherwise
+
     if matched:
         cur.execute(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
@@ -5137,7 +5155,7 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
-    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context and not nearby_context:
+    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context and not nearby_context and not commerce_context:
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -5177,6 +5195,8 @@ def chat_global():
         transcripts_section = _prepend(transcripts_section, direct_messages_context)
     if nearby_context:
         transcripts_section = _prepend(transcripts_section, nearby_context)
+    if commerce_context:
+        transcripts_section = _prepend(transcripts_section, commerce_context)
     if not transcripts_section:
         transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
@@ -5222,7 +5242,158 @@ def chat_global():
         "reply": reply,
         "matched_speaker": matched["name"] if matched else None,
         "conversations_used": len(conversations),
+        "action_card": action_card,
     })
+
+
+# ---------------------------------------------------------------------------
+# Cognitive Commerce: Swiggy MCP integration routes. Thin Flask wrappers
+# (auth, request parsing, jsonify) over commerce/swiggy_adapter.py, which
+# holds all the actual OAuth/MCP logic -- same shape as every other route in
+# this file. Gated behind SWIGGY_MCP_ENABLED in .env: when the flag is off,
+# every route below 404s via _swiggy_feature_check() rather than pretending
+# to work, and /status (the one route with no gate of its own) just reports
+# enabled=false so both clients know to hide the feature entirely.
+# ---------------------------------------------------------------------------
+
+def _swiggy_feature_check():
+    from commerce.swiggy_adapter import is_enabled
+    if not is_enabled():
+        return jsonify({"error": "Swiggy integration is not enabled."}), 404
+    return None
+
+
+@app.route("/integrations/swiggy/status")
+@login_required
+def swiggy_status():
+    from commerce.swiggy_adapter import get_status
+    db = get_db()
+    cur = dict_cursor(db)
+    return jsonify(get_status(cur, current_user_id()))
+
+
+@app.route("/integrations/swiggy/connect")
+@login_required
+def swiggy_connect():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    server = request.args.get("server", "food")
+    from commerce.swiggy_adapter import CommerceError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), server)
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return redirect(url)
+
+
+@app.route("/integrations/swiggy/connect_url")
+@login_required
+def swiggy_connect_url():
+    # JSON variant of /connect, for Flutter: that client authenticates via a
+    # Bearer header (see ApiClient), which a system browser opened via
+    # url_launcher has no way to carry -- so Flutter calls this over an
+    # authenticated Dio request first, then opens the *returned* Swiggy URL
+    # (mcp.swiggy.com's own domain) directly, never navigating to our own
+    # /connect route at all. React's <a href="/integrations/swiggy/connect">
+    # doesn't need this: a same-origin browser navigation already carries
+    # the session cookie, so the plain redirect route above works for it.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    server = request.args.get("server", "food")
+    from commerce.swiggy_adapter import CommerceError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), server)
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"url": url})
+
+
+def _render_swiggy_callback_page(success: bool, error: str | None = None):
+    # Plain static HTML, not JSON -- this is loaded in a real browser
+    # tab/webview at the end of an OAuth redirect, not called via fetch/dio.
+    message = "Your Swiggy account is connected. You can close this window." if success \
+        else f"Couldn't connect your Swiggy account: {error}"
+    return f"<html><body style='font-family:sans-serif;padding:32px;text-align:center;'>{message}</body></html>"
+
+
+@app.route("/integrations/swiggy/callback")
+def swiggy_callback():
+    # No @login_required -- Swiggy's redirect back here carries no session
+    # cookie context of its own; the user_id is recovered from the
+    # server-side pending-state row created in swiggy_connect (see
+    # handle_callback), keyed by the opaque `state` value round-tripped
+    # through Swiggy's own auth screen.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    code, state, error = request.args.get("code"), request.args.get("state"), request.args.get("error")
+    from commerce.swiggy_adapter import CommerceError, handle_callback
+    if error or not code or not state:
+        return _render_swiggy_callback_page(False, error or "Missing authorization code.")
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        handle_callback(cur, db, code, state)
+    except CommerceError as e:
+        return _render_swiggy_callback_page(False, str(e))
+    except Exception:
+        return _render_swiggy_callback_page(False, "Something went wrong linking your Swiggy account.")
+    return _render_swiggy_callback_page(True)
+
+
+@app.route("/integrations/swiggy/disconnect", methods=["POST"])
+@login_required
+def swiggy_disconnect():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    server = (request.get_json(silent=True) or {}).get("server", "food")
+    from commerce.swiggy_adapter import disconnect
+    db = get_db()
+    cur = dict_cursor(db)
+    disconnect(cur, db, current_user_id(), server)
+    return jsonify({"ok": True})
+
+
+@app.route("/commerce/swiggy/confirm", methods=["POST"])
+@login_required
+def swiggy_confirm():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    action_id = (request.get_json(silent=True) or {}).get("action_id")
+    if not action_id:
+        return jsonify({"error": "action_id is required"}), 400
+    from commerce.swiggy_adapter import CommerceError, confirm_action
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        result = confirm_action(cur, db, current_user_id(), int(action_id))
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/commerce/swiggy/dismiss", methods=["POST"])
+@login_required
+def swiggy_dismiss():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    action_id = (request.get_json(silent=True) or {}).get("action_id")
+    if not action_id:
+        return jsonify({"error": "action_id is required"}), 400
+    from commerce.swiggy_adapter import dismiss_action
+    db = get_db()
+    cur = dict_cursor(db)
+    dismiss_action(cur, db, current_user_id(), int(action_id))
+    return jsonify({"ok": True})
 
 
 IMAGE_UPLOAD_PLACEHOLDER = "[Image uploaded]"

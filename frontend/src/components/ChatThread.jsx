@@ -9,7 +9,7 @@ export default function ChatThread({
   pendingSpeakerIndex = null, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
   tags, onTagClick, onDismissTag,
   messages, onSend, sending, onDelete, onListen, onStopListen, onBack,
-  subtitle, placeholder, emptyHint, onSendImage,
+  subtitle, placeholder, emptyHint, onSendImage, onActionResolved,
 }) {
   const scrollRef = useRef(null);
   // Only relevant when onSendImage is provided (global chat today) -- a
@@ -60,7 +60,14 @@ export default function ChatThread({
 
       <div className="messages" ref={scrollRef}>
         {messages.map((m, i) => (
-          <MessageBubble key={i} role={m.role} content={m.content} imageUrl={m.imageUrl} />
+          <MessageBubble
+            key={i}
+            role={m.role}
+            content={m.content}
+            imageUrl={m.imageUrl}
+            actionCard={m.actionCard}
+            onActionResolved={onActionResolved}
+          />
         ))}
         {!messages.length && (
           <div className="list-empty">{emptyHint || 'Ask a question about this conversation to get started.'}</div>

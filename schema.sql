@@ -441,3 +441,78 @@ CREATE INDEX IF NOT EXISTS idx_conversations_search_tsv ON conversations USING G
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS content_tsv tsvector
     GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
 CREATE INDEX IF NOT EXISTS idx_chat_messages_content_tsv ON chat_messages USING GIN (content_tsv);
+
+-- ============================================================================
+-- Cognitive Commerce: Swiggy MCP (commerce/swiggy_adapter.py). Entirely gated
+-- behind SWIGGY_MCP_ENABLED in .env -- these tables just sit empty and unused
+-- when the flag is off, same shape as EMOTIONAL_INTELLIGENCE_ENABLED/
+-- NUDGE_FEATURE_ENABLED. See SWIGGY_MCP_COGNITIVE_COMMERCE_PLAN.md.
+-- ============================================================================
+
+-- One-time Dynamic Client Registration result per MCP server (food/im/
+-- dineout), cached so the app registers itself with Swiggy's auth server at
+-- most once per server rather than on every user's connect attempt.
+CREATE TABLE IF NOT EXISTS swiggy_oauth_clients (
+    server TEXT PRIMARY KEY, -- 'food' | 'im' | 'dineout'
+    client_id TEXT NOT NULL,
+    client_secret_encrypted TEXT,
+    authorize_endpoint TEXT NOT NULL,
+    token_endpoint TEXT NOT NULL,
+    registration_endpoint TEXT,
+    registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Short-lived PKCE state for an in-flight connect attempt, read back exactly
+-- once by the OAuth callback then deleted. A DB table rather than an
+-- in-process dict so this survives across gunicorn workers/restarts, not
+-- just because the current deployment happens to run with one worker.
+CREATE TABLE IF NOT EXISTS swiggy_oauth_pending (
+    state TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    server TEXT NOT NULL,
+    code_verifier TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per (user, server) they've linked their real Swiggy account for --
+-- Food/Instamart/Dineout are independent MCP servers that don't share
+-- sessions, so a user may connect one, two, or all three separately. Tokens
+-- are encrypted at rest (commerce/crypto_utils.py, Fernet) -- this table
+-- never stores a Swiggy password, only OAuth 2.1 tokens obtained via PKCE.
+CREATE TABLE IF NOT EXISTS swiggy_accounts (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    server TEXT NOT NULL,
+    access_token_encrypted TEXT NOT NULL,
+    refresh_token_encrypted TEXT,
+    token_expires_at TIMESTAMPTZ,
+    default_address_id TEXT,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ,
+    UNIQUE (user_id, server)
+);
+
+-- Audit trail for every suggestion shown and every action actually taken --
+-- proves the "never auto-order" rule holds (a real order row only ever
+-- exists after a 'confirmed' row from an explicit button tap), and is what a
+-- user-facing "recent Swiggy activity" list would read from.
+CREATE TABLE IF NOT EXISTS commerce_actions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    provider TEXT NOT NULL DEFAULT 'swiggy',
+    server TEXT NOT NULL, -- 'food' | 'im' | 'dineout'
+    action TEXT NOT NULL, -- 'suggested' | 'confirmed' | 'order_placed' | 'order_failed' | 'dismissed'
+    inferred_need TEXT,
+    item_summary TEXT,     -- human-readable snapshot, for display/audit only
+    item_ref JSONB,        -- structured refs (restaurant_id/item_id/address_id/...)
+                            -- used to re-look-up the item at confirm time --
+                            -- never trusted as the final price/availability itself
+    external_order_id TEXT,
+    -- Set the moment a 'suggested' row is acted on (confirmed OR dismissed)
+    -- -- confirm_action() checks this is still NULL before placing a real
+    -- order, so double-tapping "Order this" (or replaying an old action_card
+    -- id) can never place two orders from the same suggestion.
+    resolved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_commerce_actions_user ON commerce_actions (user_id, created_at DESC);

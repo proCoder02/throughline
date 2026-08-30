@@ -24,3 +24,6 @@ export const AttachIcon = () => <svg {...base}><path d="M21.44 11.05l-9.19 9.19a
 // matching the Icons.psychology_outlined used for the same action on the
 // Flutter client.
 export const BrainIcon = () => <svg {...base}><path d="M9 4a3 3 0 00-3 3v.34A3.5 3.5 0 004 10.5 3.5 3.5 0 006 13.68V16a4 4 0 004 4M9 4a3 3 0 013 3v13M9 4c0-1.1.9-2 2-2M15 4a3 3 0 013 3v.34A3.5 3.5 0 0120 10.5 3.5 3.5 0 0118 13.68V16a4 4 0 01-4 4M15 4a3 3 0 00-3 3M15 4c0-1.1-.9-2-2-2"/></svg>;
+// Cognitive Commerce's "order via Swiggy" action card -- a simple
+// fork-and-plate glyph, no brand mark (no Swiggy trademark usage).
+export const FoodOrderIcon = () => <svg {...base}><path d="M6 3v7a2 2 0 002 2h0a2 2 0 002-2V3M7 3v6M9 3v6M15 3c-1.5 0-3 1.5-3 4s1.5 4 3 4M6 12v9M15 12v9"/></svg>;

@@ -107,7 +107,10 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
       const location = await maybeGetLocation(prompt);
       const data = await post('/chat/global', { prompt, ...(location || {}) });
       const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
+      // Cognitive Commerce (Swiggy MCP) -- present only when the backend
+      // actually found real, orderable results; absent (undefined/null) for
+      // every other message, which MessageBubble already treats as "no card".
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply, actionCard: data.action_card || null }]);
     } catch (e) {
       setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
     } finally {

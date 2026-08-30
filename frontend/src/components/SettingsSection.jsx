@@ -2,16 +2,31 @@ import { useEffect, useState } from 'react';
 import { TrashIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
 
+const SWIGGY_SERVER_LABELS = { food: 'Swiggy Food', im: 'Swiggy Instamart', dineout: 'Swiggy Dineout' };
+
 export default function SettingsSection({ user, onLogout }) {
   const [settings, setSettings] = useState(null);
   const [categories, setCategories] = useState({ builtin: [], custom: [] });
   const [newCategory, setNewCategory] = useState('');
   const [categoryError, setCategoryError] = useState('');
+  // Cognitive Commerce (Swiggy MCP) -- null while unknown, {enabled:false}
+  // when SWIGGY_MCP_ENABLED is off in the backend's .env, in which case
+  // this whole card renders as nothing (see below). Never assume enabled
+  // while this hasn't resolved yet, so a deployment with the flag off never
+  // flashes a connect button it can't actually do anything with.
+  const [swiggyStatus, setSwiggyStatus] = useState(null);
 
   const loadCategories = () => apiJson('/categories').then(setCategories).catch(() => {});
+  const loadSwiggyStatus = () => apiJson('/integrations/swiggy/status').then(setSwiggyStatus).catch(() => setSwiggyStatus({ enabled: false }));
 
   useEffect(() => { apiJson('/settings').then(setSettings).catch(() => {}); }, []);
   useEffect(() => { loadCategories(); }, []);
+  useEffect(() => { loadSwiggyStatus(); }, []);
+
+  const disconnectSwiggy = async (server) => {
+    await post('/integrations/swiggy/disconnect', { server });
+    loadSwiggyStatus();
+  };
 
   const changeMode = async (personalization) => {
     setSettings((s) => ({ ...s, personalization }));
@@ -73,6 +88,25 @@ export default function SettingsSection({ user, onLogout }) {
         <div className="detail-meta" style={{ fontSize: 18, fontFamily: 'monospace' }}>{settings?.friend_code || '...'}</div>
         <p className="hint">Share this so a friend can add you from the Friends tab.</p>
       </div>
+      {swiggyStatus?.enabled && (
+        <div className="detail-card">
+          <div className="detail-title">Swiggy</div>
+          <p className="hint">Connect your Swiggy account so the assistant can suggest real options and order for you when you ask -- nothing is ever ordered without you confirming it first.</p>
+          {Object.entries(SWIGGY_SERVER_LABELS).map(([server, label]) => {
+            const account = swiggyStatus.accounts?.[server];
+            return (
+              <div key={server} className="detail-meta-row" style={{ marginBottom: 6 }}>
+                <span>{label}</span>
+                {account?.connected ? (
+                  <button className="btn secondary" onClick={() => disconnectSwiggy(server)}>Disconnect</button>
+                ) : (
+                  <a className="btn" href={`/integrations/swiggy/connect?server=${server}`}>Connect</a>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       <button className="btn secondary" onClick={onLogout}>Log out</button>
     </div>
   );
