@@ -2,6 +2,7 @@
 import os
 import re
 import io
+import math
 import json
 import base64
 import hashlib
@@ -19,7 +20,7 @@ from email import encoders
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request, g, session, send_from_directory
+from flask import Flask, jsonify, render_template, request, g, session, send_from_directory, redirect
 from flask_cors import CORS
 from flask_sock import Sock
 import requests
@@ -75,6 +76,21 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 # the production build is served by Flask itself below, so it's same-origin
 # there and CORS never comes into play.
 CORS(app, supports_credentials=True, origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","))
+
+
+# The one touch point CostLens' per-endpoint attribution needs in this file
+# -- everything else (which feature a call belongs to, propagating this into
+# background threads) lives inside costlens_agent itself. Route PATTERN
+# (e.g. "/friends/<int:friend_id>/messages"), not the resolved path with
+# real IDs, to keep cardinality bounded. A no-op when COSTLENS_SDK isn't
+# enabled (set_current_route just writes a contextvar nothing reads).
+@app.before_request
+def _costlens_set_route():
+    try:
+        from costlens_agent import set_current_route
+        set_current_route(request.url_rule.rule if request.url_rule else request.path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +470,24 @@ def compute_compiled_mood(cur, user_id, bucket_start, bucket_end):
         return None
     label = row["mood_label"]
     return {"mood_label": label, "emoji": MOOD_EMOJI.get((label or "").lower(), DEFAULT_MOOD_EMOJI)}
+
+
+# Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) --
+# collapses the 8 raw mood_label values into the 4 coarse buckets the
+# Flutter client's MotionProfile table actually branches on. A label this
+# map doesn't recognize (future new label, typo) intentionally falls
+# through to None rather than guessing -- the home screen's default motion
+# is always a safe fallback, never a wrong guess dressed up as a real one.
+_MOOD_BUCKET_MAP = {
+    "happy": "positive", "excited": "positive", "calm": "positive",
+    "neutral": "neutral",
+    "sad": "low",
+    "stressed": "stressed", "anxious": "stressed", "frustrated": "stressed",
+}
+
+
+def mood_label_to_bucket(label):
+    return _MOOD_BUCKET_MAP.get((label or "").lower())
 
 
 def notify_friends_of_mood_update(user_id, mood_label, friend_ids):
@@ -965,7 +999,7 @@ def login():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT id, username, password_hash FROM users WHERE username = %s",
+        "SELECT id, username, password_hash, profile_picture_url FROM users WHERE username = %s",
         (username,),
     )
     row = cur.fetchone()
@@ -978,6 +1012,7 @@ def login():
     return jsonify({
         "id": row["id"],
         "username": row["username"],
+        "profile_picture_url": row["profile_picture_url"],
         "token": generate_token(row["id"], row["username"]),
     })
 
@@ -988,19 +1023,48 @@ def logout():
     return jsonify({"ok": True})
 
 
+CHAT_TONE_MAX_AGE = timedelta(hours=3)
+
+
+@app.route("/me/home-signals", methods=["GET"])
+@login_required
+def get_home_signals():
+    """Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) --
+    the only two server-derived signals the Flutter client's MotionProfile
+    table branches on. Deliberately just two plain strings (or null), never
+    an animation spec -- the client decides what "positive" or "resolved"
+    actually looks like on screen."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    bucket_start, bucket_end = mood_bucket_bounds()
+    compiled = compute_compiled_mood(cur, user_id, bucket_start, bucket_end)
+    mood_bucket = mood_label_to_bucket(compiled["mood_label"]) if compiled else None
+
+    cur.execute("SELECT last_chat_tone, last_chat_tone_at FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    chat_tone = None
+    if row and row["last_chat_tone"] and row["last_chat_tone_at"]:
+        if datetime.now(timezone.utc) - row["last_chat_tone_at"] <= CHAT_TONE_MAX_AGE:
+            chat_tone = row["last_chat_tone"]
+
+    return jsonify({"mood_bucket": mood_bucket, "chat_tone": chat_tone})
+
+
 @app.route("/me", methods=["GET"])
 def me():
     user_id = authenticated_user_id()
     if not user_id:
         return jsonify({"error": "Not authenticated"}), 401
     username = session.get("username")
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT username, profile_picture_url FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
     if not username:
-        db = get_db()
-        cur = dict_cursor(db)
-        cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
-        row = cur.fetchone()
         username = row["username"] if row else None
-    return jsonify({"id": user_id, "username": username})
+    return jsonify({"id": user_id, "username": username, "profile_picture_url": row["profile_picture_url"] if row else None})
 
 
 @app.route("/settings", methods=["GET"])
@@ -1009,10 +1073,15 @@ def get_settings():
     db = get_db()
     cur = dict_cursor(db)
     user_id = current_user_id()
-    cur.execute("SELECT personalization FROM users WHERE id = %s", (user_id,))
-    personalization = normalize_personalization(cur.fetchone()["personalization"])
+    cur.execute("SELECT personalization, profile_picture_url FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    personalization = normalize_personalization(row["personalization"])
     friend_code = get_or_create_friend_code(db, cur, user_id)
-    return jsonify({"personalization": personalization, "friend_code": friend_code})
+    return jsonify({
+        "personalization": personalization,
+        "friend_code": friend_code,
+        "profile_picture_url": row["profile_picture_url"],
+    })
 
 
 @app.route("/settings", methods=["POST"])
@@ -2005,20 +2074,20 @@ _REMINDER_INTENT_RE = re.compile(
 
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
 
-The user just said this in chat. Determine whether they're asking to be reminded of something (a task, event, or commitment) -- not just using the word "remind" in passing.
+The user just said this in chat. Determine whether they're asking to be reminded of one or more things (tasks, events, commitments, deadlines) -- not just using the word "remind" in passing. There can be MORE than one -- e.g. a list of exams/classes/bills where they asked for a reminder for each -- extract one entry per distinct thing to remind about, never one combined summary covering several of them.
 
-If yes, extract:
+For each one, extract:
 - description: short (<20 words) description of what to be reminded about, in your own words
 - due_date: short human phrase as said/implied (e.g. "Saturday", "tonight"), else null
 - reminder_at: resolve any date/time phrase against today's date above into exact ISO 8601 "YYYY-MM-DDTHH:MM:SS" (assume 09:00:00 if only a day is given, no time). Else null. Do not guess if nothing time-related was said.
 
-If this is not a genuine reminder request, reply with {{"is_reminder": false}}.
+If this is not a genuine reminder request, or you can't identify any specific things to remind about, reply with {{"reminders": []}}.
 
 The user's message:
 {message}
 
 Reply with ONLY this JSON, no preamble/fences:
-{{"is_reminder": true, "description": "", "due_date": null, "reminder_at": null}}"""
+{{"reminders": [{{"description": "", "due_date": null, "reminder_at": null}}]}}"""
 
 
 def trigger_reminder_extraction(user_id, message_content) -> None:
@@ -2029,6 +2098,12 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
     to the user-facing response. Once inserted, _check_overdue_tasks
     (nudges/nudge_engine.py) and email_reminder_worker (above) already pick
     it up automatically off reminder_at/status -- nothing else needed.
+
+    Extracts a LIST of reminders, not just one -- e.g. a photo of a class/exam
+    schedule with "remind me about each of these" needs one task per item, not
+    one task summarizing all of them. Ordinary single-reminder chat messages
+    just produce a one-item list, so this is a strict generalization, not a
+    behavior change for existing callers.
 
     Never raises and never blocks -- same reasoning as
     trigger_chat_feedback_extraction: this always runs after the chat
@@ -2049,21 +2124,24 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
         )
         content = call_llm([{"role": "user", "content": prompt}])
         parsed = extract_json(content)
-        if not parsed or not parsed.get("is_reminder"):
-            return
-        description = (parsed.get("description") or "").strip()
-        if not description:
+        reminders = (parsed or {}).get("reminders") or []
+        if not reminders:
             return
 
         conn = get_raw_connection()
+        created = []
         try:
             cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
-                "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
-                (user_id, description, parsed.get("due_date"), normalize_reminder_at(parsed.get("reminder_at"))),
-            )
-            task_id = cur.fetchone()[0]
+            for item in reminders:
+                description = (item.get("description") or "").strip()
+                if not description:
+                    continue
+                cur.execute(
+                    "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
+                    "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
+                    (user_id, description, item.get("due_date"), normalize_reminder_at(item.get("reminder_at"))),
+                )
+                created.append((cur.fetchone()[0], description))
             conn.commit()
         except Exception as e:
             print(f"[trigger_reminder_extraction] DB error: {e!r}")
@@ -2075,17 +2153,192 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
         # Identical event shape to run_background_analysis's task_created
         # push above -- existing client handling (notify_provider.dart's
         # case 'task_created', and the React equivalent) picks this up with
-        # no changes needed.
-        push_notification(user_id, {
-            "type": "task_created", "task_id": task_id, "description": description,
-            "conversation_id": None,
-        })
-        send_fcm_to_user(
-            user_id, title="New task", body=description,
-            data={"type": "task_created", "task_id": task_id, "conversation_id": ""},
-        )
+        # no changes needed. One push per task, same as if each had been
+        # typed as a separate reminder request.
+        for task_id, description in created:
+            push_notification(user_id, {
+                "type": "task_created", "task_id": task_id, "description": description,
+                "conversation_id": None,
+            })
+            send_fcm_to_user(
+                user_id, title="New task", body=description,
+                data={"type": "task_created", "task_id": task_id, "conversation_id": ""},
+            )
     except Exception as e:
         print(f"[trigger_reminder_extraction] failed: {e!r}")
+
+
+# ---------------------------------------------------------------------------
+# Location-aware "nearby" suggestions (/chat/global)
+#
+# The LLM has no live knowledge of actual nearby businesses/trails -- this
+# fetches real data from OpenStreetMap's free Overpass API (no key, no
+# billing account, chosen deliberately over Google Places for that reason)
+# and feeds it into the prompt as grounding context, same "real data in,
+# synthesized reply out" shape chat_global_image already uses for vision
+# extraction. Never lets the LLM invent a place name on its own.
+# ---------------------------------------------------------------------------
+
+_NEARBY_INTENT_RE = re.compile(
+    r"\bnear(?:by)?\s+me\b|\bnear\s+here\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\bin\s+my\s+area\b",
+    re.IGNORECASE,
+)
+
+# keyword -> Overpass tag filter. Deliberately a small, hand-picked lookup
+# rather than a full NLP category classifier -- covers the two categories
+# named in the original request (trek/shop) plus a handful of obviously
+# useful others, matched by simple substring search against the prompt.
+# Falls back to a broad "any named point of interest" filter (see
+# _DEFAULT_NEARBY_TAG_FILTER) when nothing here matches but nearby-intent
+# is still present, e.g. "what's around me?" with no specific category.
+# Each value is (tag_filter, element_types) -- element_types matters, not
+# just cosmetic: OSM tags a hiking trail's route=hiking on the RELATION (the
+# multi-way path as a whole), essentially never on individual nodes/ways.
+# Searching node/way for that tag anyway isn't just useless, it's expensive
+# enough to time out Overpass outright (confirmed live near Yosemite: 504
+# Gateway Timeout on the way-search, 0 results even when it didn't time
+# out) -- so hiking is relation-only, and everything else (shops,
+# restaurants, etc., which really are tagged on nodes/ways) stays node+way.
+_NEARBY_CATEGORY_TAGS = {
+    "trek": ('["route"="hiking"]', ("relation",)),
+    "hike": ('["route"="hiking"]', ("relation",)),
+    "hiking": ('["route"="hiking"]', ("relation",)),
+    "trail": ('["route"="hiking"]', ("relation",)),
+    "shop": ('["shop"]', ("node", "way")),
+    "shopping": ('["shop"]', ("node", "way")),
+    "store": ('["shop"]', ("node", "way")),
+    "mall": ('["shop"="mall"]', ("node", "way")),
+    "restaurant": ('["amenity"="restaurant"]', ("node", "way")),
+    # "food"/"eat" deliberately excluded -- both are too generic (any
+    # sentence mentioning food at all would false-positive) and, since
+    # Cognitive Commerce shipped, directly collide with its own "order
+    # food" trigger phrase: that message doesn't need GPS lat/lon at all
+    # (Swiggy resolves the user's own saved account address), so the two
+    # features were firing simultaneously with contradictory instructions
+    # -- confirmed live: real Swiggy menu items came back correctly, but
+    # this block ALSO told the LLM "no location provided, ask for it",
+    # and the reply blended both into a confused non-answer. "restaurant"
+    # above still covers the deliberate OSM-lookup case.
+    "cafe": ('["amenity"="cafe"]', ("node", "way")),
+    "coffee": ('["amenity"="cafe"]', ("node", "way")),
+    "park": ('["leisure"="park"]', ("node", "way")),
+    "pharmacy": ('["amenity"="pharmacy"]', ("node", "way")),
+    "hospital": ('["amenity"="hospital"]', ("node", "way")),
+    "atm": ('["amenity"="atm"]', ("node",)),
+    "gym": ('["leisure"="fitness_centre"]', ("node", "way")),
+    "hotel": ('["tourism"="hotel"]', ("node", "way")),
+}
+_DEFAULT_NEARBY_FILTER = ('["name"]["shop"]', ("node", "way"))
+_NEARBY_SEARCH_RADIUS_METERS = 3000  # uniform radius across all categories, per explicit request
+_NEARBY_RESULT_LIMIT = 8
+
+
+def _detect_nearby_category(prompt_lower: str) -> tuple[str, tuple[str, ...]] | None:
+    """First matching category keyword's (tag_filter, element_types), or
+    None if the message doesn't look like a nearby-places request at all
+    (checked by the caller via _NEARBY_INTENT_RE OR a category keyword
+    alone -- "good trek spots?" has no "near me" but is still clearly
+    asking for one)."""
+    for keyword, spec in _NEARBY_CATEGORY_TAGS.items():
+        if re.search(r"\b" + keyword + r"\b", prompt_lower):
+            return spec
+    return None
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _query_nearby_places(lat: float, lon: float, tag_filter: str, element_types: tuple[str, ...]) -> list[dict]:
+    """Real nearby results from OpenStreetMap via the free Overpass API --
+    never raises, returns [] on any failure (timeout, malformed response,
+    Overpass rate-limiting) so a flaky external API degrades to "nothing
+    found" rather than a broken chat response. Each result carries the
+    haversine distance in km, sorted nearest-first. element_types is
+    per-category (see _NEARBY_CATEGORY_TAGS) rather than always querying
+    node+way+relation -- searching an element type a tag is never actually
+    stored on isn't just wasted, it can time Overpass out outright."""
+    body = "".join(
+        f"{el}{tag_filter}(around:{_NEARBY_SEARCH_RADIUS_METERS},{lat},{lon});"
+        for el in element_types
+    )
+    # Relation queries (hiking routes) are inherently slower -- a
+    # long-distance trail relation (the John Muir/Pacific Crest Trail
+    # passing through Yosemite, confirmed live) can have thousands of
+    # member ways, making the "around" geometry computation genuinely
+    # expensive rather than stuck/broken. Giving that case more time
+    # outright, once, beats retrying a slow-but-legitimate query on the
+    # same short budget -- a second attempt wouldn't make a huge relation
+    # smaller. Node/way categories (shops, restaurants) stay fast with the
+    # short-timeout+retry shape, since a failure there is far more likely
+    # transient server load than genuine query complexity.
+    is_relation_query = "relation" in element_types
+    overpass_timeout = 25 if is_relation_query else 10
+    request_timeout = 28 if is_relation_query else 12
+    max_attempts = 1 if is_relation_query else 2
+    query = (
+        f"[out:json][timeout:{overpass_timeout}];"
+        f"({body});"  # the union group must be its own terminated statement --
+        f"out center {_NEARBY_RESULT_LIMIT * 3};"  # missing this ';' is what caused a live 400 earlier
+    )
+    # The public Overpass instance is a shared, free community resource --
+    # confirmed via live testing to occasionally return a transient 400/504
+    # under load even for a well-formed query, distinct from the (also
+    # confirmed live) 406 it always returns without a real User-Agent. One
+    # retry after a short pause is enough to ride out the transient case
+    # without making a genuinely-empty result wait noticeably longer.
+    elements = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+                headers={"User-Agent": "throughline-app/1.0"},
+                timeout=request_timeout,
+            )
+            response.raise_for_status()
+            elements = response.json().get("elements", [])
+            break
+        except Exception as e:
+            print(f"[nearby_places] Overpass query failed (attempt {attempt + 1}/{max_attempts}): {e!r}")
+            if attempt < max_attempts - 1:
+                time.sleep(1.5)
+    if elements is None:
+        return []
+
+    results = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name:
+            continue  # unnamed OSM elements (most ways/relations) aren't useful to suggest
+        el_lat = el.get("lat") or (el.get("center") or {}).get("lat")
+        el_lon = el.get("lon") or (el.get("center") or {}).get("lon")
+        if el_lat is None or el_lon is None:
+            continue
+        addr_parts = []
+        housenumber, street = tags.get("addr:housenumber"), tags.get("addr:street")
+        addr_parts.append(f"{housenumber} {street}" if housenumber and street else street)
+        addr_parts.append(tags.get("addr:city"))
+        address = ", ".join(p for p in addr_parts if p)
+
+        results.append({
+            "name": name,
+            "category": tags.get("shop") or tags.get("amenity") or tags.get("leisure")
+            or tags.get("tourism") or tags.get("route") or "",
+            "distance_km": round(_haversine_km(lat, lon, el_lat, el_lon), 1),
+            "address": address,
+            "lat": el_lat,
+            "lon": el_lon,
+        })
+
+    results.sort(key=lambda r: r["distance_km"])
+    return results[:_NEARBY_RESULT_LIMIT]
 
 
 # ---------------------------------------------------------------------------
@@ -3223,7 +3476,7 @@ def list_friends():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT users.id, users.username, friendships.nickname FROM friendships "
+        "SELECT users.id, users.username, users.profile_picture_url, friendships.nickname, friendships.created_at AS friends_since FROM friendships "
         "JOIN users ON users.id = friendships.friend_id "
         "WHERE friendships.user_id = %s ORDER BY COALESCE(friendships.nickname, users.username)",
         (user_id,),
@@ -3267,6 +3520,8 @@ def list_friends():
         f["last_call_at"] = last["last_call_at"].isoformat() if last else None
         f["last_call_outgoing"] = last["outgoing"] if last else None
         f["call_count"] = call_counts.get(f["id"], 0)
+        if f.get("friends_since"):
+            f["friends_since"] = f["friends_since"].isoformat()
 
     return jsonify(friends)
 
@@ -3441,6 +3696,163 @@ def set_cognitive_sharing(friend_id):
     return jsonify({"ok": True, "my_level": level})
 
 
+COGNITIVE_SUGGESTION_DM_LIMIT = 30
+
+
+def _cognitive_sharing_levels(cur, user_id, friend_id):
+    """Both directions' levels for a pair -- shared by the on-demand
+    suggestion endpoint below and get_cognitive_sharing above (kept as a
+    separate small helper rather than refactoring get_cognitive_sharing
+    itself, so that already-shipped/verified endpoint's behavior can't
+    regress from a change made for this new one)."""
+    cur.execute(
+        "SELECT user_id, level FROM cognitive_sharing_settings "
+        "WHERE (user_id = %s AND friend_id = %s) OR (user_id = %s AND friend_id = %s)",
+        (user_id, friend_id, friend_id, user_id),
+    )
+    levels_by_user = {row["user_id"]: row["level"] for row in cur.fetchall()}
+    return levels_by_user.get(user_id, "off"), levels_by_user.get(friend_id, "off")
+
+
+def _serialize_cognitive_suggestion(row, viewer_id):
+    """Never includes user_a/user_b's raw memory -- only the already-
+    synthesized suggestion_text -- and reports dismissed/shown from the
+    viewer's own side only, mirroring get_cognitive_sharing's own
+    never-leak-the-other-side's-state discipline."""
+    is_a = row["user_a"] == viewer_id
+    return {
+        "id": row["id"],
+        "suggestion_text": row["suggestion_text"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "dismissed": row["dismissed_by_a"] if is_a else row["dismissed_by_b"],
+    }
+
+
+@app.route("/friends/<int:friend_id>/cognitive-suggestion", methods=["POST"])
+@login_required
+def request_cognitive_suggestion(friend_id):
+    """On-demand 'find common ground' trigger -- v1 per
+    COGNITIVE_SHARING_INTERVENTION_PLAN.md is deliberately on-demand only,
+    not automatic background triggering, to avoid unwanted LLM spend/spam
+    until there's real usage data. Bilateral gate is checked here, before
+    any subject resolution or LLM call touches either person's data -- not
+    an afterthought filter on the output."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s", (user_id, friend_id))
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    my_level, their_level = _cognitive_sharing_levels(cur, user_id, friend_id)
+    if _COGNITIVE_SHARING_RANK[my_level] < _COGNITIVE_SHARING_RANK["limited"]:
+        return jsonify({"error": "Turn on Cognitive Sharing for this friend first."}), 403
+    if _COGNITIVE_SHARING_RANK[their_level] < _COGNITIVE_SHARING_RANK["limited"]:
+        return jsonify({"error": "Ask them to turn on Cognitive Sharing too -- both sides need it on."}), 403
+
+    cur.execute(
+        "SELECT id, sender_id, content FROM direct_messages "
+        "WHERE (sender_id = %(me)s AND recipient_id = %(friend)s) "
+        "OR (sender_id = %(friend)s AND recipient_id = %(me)s) "
+        "ORDER BY id DESC LIMIT %(limit)s",
+        {"me": user_id, "friend": friend_id, "limit": COGNITIVE_SUGGESTION_DM_LIMIT},
+    )
+    dm_rows = list(reversed(cur.fetchall()))
+    last_message_id = dm_rows[-1]["id"] if dm_rows else None
+    recent_dm_context = "\n".join(
+        f"- {'Them' if r['sender_id'] == friend_id else 'Me'}: {r['content']}" for r in dm_rows
+    )
+
+    try:
+        from emotional_intelligence.cognitive_sharing import generate_common_ground_suggestion
+        suggestion_text = generate_common_ground_suggestion(cur, user_id, friend_id, recent_dm_context)
+    except Exception as exc:
+        print(f"[cognitive_sharing] request_cognitive_suggestion failed: {exc!r}")
+        suggestion_text = None
+
+    if not suggestion_text:
+        return jsonify({"suggestion": None, "message": "Nothing to suggest right now."})
+
+    user_a, user_b = (user_id, friend_id) if user_id < friend_id else (friend_id, user_id)
+    shown_column = "shown_to_a_at" if user_id == user_a else "shown_to_b_at"
+    cur.execute(
+        f"INSERT INTO cognitive_suggestions (user_a, user_b, suggestion_text, source_message_id, {shown_column}) "
+        f"VALUES (%s, %s, %s, %s, now()) "
+        f"RETURNING id, user_a, user_b, suggestion_text, created_at, dismissed_by_a, dismissed_by_b",
+        (user_a, user_b, suggestion_text, last_message_id),
+    )
+    row = cur.fetchone()
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    requester_name = cur.fetchone()["username"]
+    push_notification(friend_id, {
+        "type": "cognitive_suggestion", "suggestion_id": row["id"], "friend_id": user_id,
+    })
+    send_fcm_to_user(
+        friend_id, title="Cognitive Sharing", body=f"A suggestion for you and {requester_name}",
+        data={"type": "cognitive_suggestion", "suggestion_id": str(row["id"]), "friend_id": str(user_id)},
+    )
+
+    return jsonify({"suggestion": _serialize_cognitive_suggestion(row, user_id)})
+
+
+@app.route("/friends/<int:friend_id>/cognitive-suggestion", methods=["GET"])
+@login_required
+def get_latest_cognitive_suggestion(friend_id):
+    """Latest suggestion for this pair not yet dismissed by me -- used for
+    initial screen load and by whichever side didn't request it, after
+    they've been notified via push_notification/FCM (the notification
+    payload only carries an id; this is what actually loads the text).
+    Marks shown_to_<me>_at on first fetch."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT 1 FROM friendships WHERE user_id = %s AND friend_id = %s", (user_id, friend_id))
+    if not cur.fetchone():
+        return jsonify({"error": "Not friends with that user"}), 403
+
+    user_a, user_b = (user_id, friend_id) if user_id < friend_id else (friend_id, user_id)
+    dismissed_column = "dismissed_by_a" if user_id == user_a else "dismissed_by_b"
+    shown_column = "shown_to_a_at" if user_id == user_a else "shown_to_b_at"
+    cur.execute(
+        f"SELECT id, user_a, user_b, suggestion_text, created_at, dismissed_by_a, dismissed_by_b "
+        f"FROM cognitive_suggestions WHERE user_a = %s AND user_b = %s AND {dismissed_column} = false "
+        f"ORDER BY id DESC LIMIT 1",
+        (user_a, user_b),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"suggestion": None})
+
+    cur.execute(f"UPDATE cognitive_suggestions SET {shown_column} = COALESCE({shown_column}, now()) WHERE id = %s", (row["id"],))
+    db.commit()
+    return jsonify({"suggestion": _serialize_cognitive_suggestion(row, user_id)})
+
+
+@app.route("/friends/<int:friend_id>/cognitive-suggestion/<int:suggestion_id>/dismiss", methods=["POST"])
+@login_required
+def dismiss_cognitive_suggestion(friend_id, suggestion_id):
+    """Each side dismisses independently -- dismissing on my device must
+    never affect what the other participant still sees (guardrail #3 in
+    COGNITIVE_SHARING_INTERVENTION_PLAN.md)."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    user_a, user_b = (user_id, friend_id) if user_id < friend_id else (friend_id, user_id)
+    dismissed_column = "dismissed_by_a" if user_id == user_a else "dismissed_by_b"
+    cur.execute(
+        f"UPDATE cognitive_suggestions SET {dismissed_column} = true "
+        f"WHERE id = %s AND user_a = %s AND user_b = %s RETURNING id",
+        (suggestion_id, user_a, user_b),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "Suggestion not found"}), 404
+    return jsonify({"ok": True})
+
+
 @app.route("/friends/<int:friend_id>/mood", methods=["GET"])
 @login_required
 def friend_mood(friend_id):
@@ -3512,6 +3924,74 @@ def latest_digest():
     return jsonify({"digest": digest})
 
 
+ATTACHMENT_SUMMARY_MAX_CHARS = 6000
+ATTACHMENT_SUMMARY_MAX_WORDS = 30
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _extract_document_text(file_bytes, attachment_type):
+    """Best-effort text extraction for the Cognitive Sharing attachment-
+    summary feature below -- supports the document types worth summarizing
+    (PDF, Word, plain text); anything else (old binary .doc, zip, images,
+    unknown) returns None rather than raising, since a missing summary is a
+    fine degraded outcome but a broken message send is not."""
+    try:
+        if attachment_type == "application/pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            return "\n".join((page.extract_text() or "") for page in reader.pages[:20])
+        if attachment_type == _DOCX_MIME:
+            import docx
+            document = docx.Document(io.BytesIO(file_bytes))
+            return "\n".join(p.text for p in document.paragraphs)
+        if attachment_type.startswith("text/"):
+            return file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    return None
+
+
+def _generate_attachment_summary(attachment_url, attachment_type):
+    """Cognitive Sharing add-on (see
+    emotional_intelligence/COGNITIVE_SHARING_INTERVENTION_PLAN.md): when
+    both people in a DM pair have sharing turned on, a shared document gets
+    a short 20-30 word summary so the recipient knows what it is without
+    opening it. The caller (send_direct_message) already checked the
+    bilateral gate and already committed the message row -- this is
+    deliberately best-effort end to end (download failure, unsupported
+    file type, or LLM error all just mean no summary, never a failed send)."""
+    import storage
+    key = storage.key_from_public_url(attachment_url)
+    if not key:
+        return None
+    file_bytes = storage.download_object(key)
+    if not file_bytes:
+        return None
+    text = _extract_document_text(file_bytes, attachment_type or "")
+    if not text or not text.strip():
+        return None
+
+    try:
+        reply = call_llm([
+            {"role": "system", "content": (
+                "Reply with ONLY a short summary of the document text below -- "
+                "20 to 30 words maximum, a single snippet of plain prose, no "
+                "quotes, no markdown, no preamble like 'This document is about'."
+            )},
+            {"role": "user", "content": text[:ATTACHMENT_SUMMARY_MAX_CHARS]},
+        ])
+    except Exception:
+        return None
+
+    summary = (reply or "").strip().strip('"').strip("'")
+    if not summary:
+        return None
+    words = summary.split()
+    if len(words) > ATTACHMENT_SUMMARY_MAX_WORDS:
+        summary = " ".join(words[:ATTACHMENT_SUMMARY_MAX_WORDS]).rstrip(",.;:") + "…"
+    return summary
+
+
 @app.route("/friends/<int:friend_id>/messages", methods=["GET"])
 @login_required
 def list_direct_messages(friend_id):
@@ -3535,7 +4015,8 @@ def list_direct_messages(friend_id):
         extra = "AND direct_messages.id < %(before_id)s"
         params["before_id"] = before_id
     cur.execute(
-        f"SELECT id, sender_id, recipient_id, content, created_at, delivered_at, read_at FROM direct_messages "
+        f"SELECT id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
+        f"attachment_url, attachment_type, thumbnail_data_url, attachment_summary FROM direct_messages "
         f"WHERE ((sender_id = %(me)s AND recipient_id = %(friend)s) "
         f"OR (sender_id = %(friend)s AND recipient_id = %(me)s)) {extra} "
         f"ORDER BY id DESC LIMIT %(limit)s",
@@ -3551,8 +4032,21 @@ def list_direct_messages(friend_id):
 def send_direct_message(friend_id):
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
-    if not content:
+    # Object storage (Cloudflare R2) attachment fields -- all optional and
+    # independent of R2_STORAGE_ENABLED itself (a plain text message must
+    # keep working even on a deployment that's never configured R2; this
+    # route just stores whatever URL it's handed, it never talks to R2
+    # directly -- see /uploads/confirm for where that actually happens).
+    # An attachment lets `content` be empty (an image/file with no
+    # caption), matching WhatsApp/Telegram -- but a message needs at least
+    # one of the two.
+    attachment_url = (data.get("attachment_url") or "").strip() or None
+    attachment_type = (data.get("attachment_type") or "").strip() or None
+    thumbnail_data_url = data.get("thumbnail_data_url") or None
+    if not content and not attachment_url:
         return jsonify({"error": "content is required"}), 400
+    if thumbnail_data_url and len(thumbnail_data_url) > 60_000:
+        return jsonify({"error": "thumbnail_data_url is too large"}), 400
 
     user_id = current_user_id()
     db = get_db()
@@ -3562,12 +4056,35 @@ def send_direct_message(friend_id):
         return jsonify({"error": "Not friends with that user"}), 403
 
     cur.execute(
-        "INSERT INTO direct_messages (sender_id, recipient_id, content) VALUES (%s, %s, %s) "
-        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at",
-        (user_id, friend_id, content),
+        "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, thumbnail_data_url) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
+        "attachment_url, attachment_type, thumbnail_data_url",
+        (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url),
     )
     message = serialize_row(cur.fetchone())
     db.commit()
+
+    # Cognitive Sharing attachment summary -- only for a real document (not
+    # a photo/video, which already render inline) and only when both sides
+    # of this DM pair have sharing turned on (>= 'limited'). Runs after the
+    # message is already committed so a slow/failed summary never delays or
+    # breaks the send itself.
+    if attachment_url and attachment_type and not attachment_type.startswith(("image/", "video/")):
+        my_level, their_level = _cognitive_sharing_levels(cur, user_id, friend_id)
+        if (_COGNITIVE_SHARING_RANK[my_level] >= _COGNITIVE_SHARING_RANK["limited"]
+                and _COGNITIVE_SHARING_RANK[their_level] >= _COGNITIVE_SHARING_RANK["limited"]):
+            try:
+                summary = _generate_attachment_summary(attachment_url, attachment_type)
+            except Exception:
+                summary = None
+            if summary:
+                cur.execute(
+                    "UPDATE direct_messages SET attachment_summary = %s WHERE id = %s",
+                    (summary, message["id"]),
+                )
+                db.commit()
+                message["attachment_summary"] = summary
 
     cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
     sender_name = cur.fetchone()["username"]
@@ -3578,21 +4095,27 @@ def send_direct_message(friend_id):
     # the client can show a real name in a foreground local notification
     # without a separate lookup (mirrors the FCM title below).
     push_notification(friend_id, {"type": "direct_message", "message": message, "sender_username": sender_name})
+    fcm_body = content or {"image": "📷 Photo", "video": "🎥 Video"}.get(attachment_type, "📎 Attachment")
     send_fcm_to_user(
-        friend_id, title=sender_name, body=content,
+        friend_id, title=sender_name, body=fcm_body,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message["id"])},
     )
 
-    try:
-        # Feeds the same cognitive-intelligence pipeline /chat and
-        # /chat/global already trigger after every message -- a correction
-        # or new fact stated to a friend ("actually I start the new job
-        # Monday, not next week") is exactly the kind of thing that pipeline
-        # already looks for, regardless of which surface it was said on.
-        from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
-        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, content), daemon=True).start()
-    except Exception:
-        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+    if content:
+        # An attachment sent with no caption has nothing for the extraction
+        # LLM to work with -- skip the call entirely rather than spend one
+        # on an empty prompt, same reasoning /chat/global/image already
+        # applies to its own description field.
+        try:
+            # Feeds the same cognitive-intelligence pipeline /chat and
+            # /chat/global already trigger after every message -- a correction
+            # or new fact stated to a friend ("actually I start the new job
+            # Monday, not next week") is exactly the kind of thing that pipeline
+            # already looks for, regardless of which surface it was said on.
+            from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, content), daemon=True).start()
+        except Exception:
+            pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
 
     return jsonify(message)
 
@@ -4236,7 +4759,36 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
+    base += _commerce_safety_guardrail()
     return base + (f" {persona_context}" if persona_context else "")
+
+
+def _commerce_safety_guardrail() -> str:
+    """Always-on instruction, not conditional on whether THIS message
+    matched the food-order intent regex -- confirmed live that leaving this
+    guidance only inside the per-message commerce_context block (which is
+    absent on any follow-up turn, e.g. "yes place it") let the model
+    hallucinate a full fake "Order placed!" confirmation, complete with an
+    invented item/price/ETA, with no real /commerce/swiggy/confirm call
+    ever happening. This must survive every turn of the conversation, not
+    just the one where real Swiggy results were fetched."""
+    try:
+        from commerce.swiggy_adapter import is_enabled
+        if not is_enabled():
+            return ""
+    except Exception:
+        return ""
+    return (
+        " You have NO ability to place, confirm, cancel, or check the status of any real "
+        "order, reservation, or payment yourself -- that only ever happens through the app's "
+        "own action-card buttons, which the user taps directly. NEVER say or imply that an "
+        "order was placed, confirmed, paid for, or is being delivered/tracked -- not even if "
+        "the user asks you to \"place it\", says \"yes\", or seems to expect confirmation. If "
+        "asked to order something, respond only by describing real options already given to "
+        "you (if any) and telling the user to use the action card's button, or that you can "
+        "look up options if they specify what they want -- never fabricate an order number, "
+        "price, ETA, or delivery/confirmation message of any kind."
+    )
 
 
 # Chat history lives permanently in the chat_messages table -- nothing here
@@ -4634,6 +5186,8 @@ def chat_global():
     prompt = (data.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
+    lat = data.get("lat")
+    lon = data.get("lon")
 
     user_id = current_user_id()
     db = get_db()
@@ -4734,6 +5288,84 @@ def chat_global():
                 + "\n".join(f"- {o}" for o in observations)
             )
 
+    # Cognitive Commerce takes priority over the OSM nearby-places lookup
+    # whenever both could plausibly apply to the same message (e.g. "order
+    # food from a good restaurant" matches both this section's "restaurant"
+    # category AND commerce's own food-order intent) -- confirmed live that
+    # firing both at once produces genuinely contradictory LLM guidance
+    # (Swiggy found real menu items using the account's saved address,
+    # while this block ALSO said "no GPS location provided, ask for one",
+    # and the reply blended both into a confused non-answer). Swiggy never
+    # needs lat/lon at all, so there is nothing for this section to usefully
+    # add on top of a message commerce is already handling.
+    commerce_intent_present = False
+    try:
+        from commerce.swiggy_adapter import detect_intent as _detect_commerce_intent, is_enabled as _swiggy_enabled
+        commerce_intent_present = _swiggy_enabled() and _detect_commerce_intent(prompt_lower) is not None
+    except Exception:
+        commerce_intent_present = False
+
+    # Location-aware "nearby" suggestions -- only fires an external API call
+    # when the message actually looks like it's asking for one (intent
+    # regex OR a recognized category keyword alone, e.g. "good trek spots?"
+    # with no explicit "near me"), keeping this free for every other
+    # message. Still works without lat/lon (the LLM is told to ask for
+    # location instead of guessing), so a client that hasn't wired up
+    # geolocation yet degrades gracefully rather than erroring.
+    nearby_context = ""
+    category_filter = _detect_nearby_category(prompt_lower)
+    if not commerce_intent_present and (category_filter or _NEARBY_INTENT_RE.search(prompt_lower)):
+        if lat is None or lon is None:
+            nearby_context = (
+                "The user asked about nearby places, but no location was provided with this "
+                "message -- ask them to share their location (or name a specific place/area) "
+                "before suggesting anything, rather than guessing."
+            )
+        else:
+            tag_filter, element_types = category_filter or _DEFAULT_NEARBY_FILTER
+            places = _query_nearby_places(float(lat), float(lon), tag_filter, element_types)
+            if places:
+                lines = [
+                    "Real nearby places found (OpenStreetMap data, sorted nearest first). "
+                    "Each includes its address (when known) and a Google Maps link -- pass these "
+                    "along if the user asks where something is or how to get there:"
+                ]
+                for p in places:
+                    label = f" ({p['category']})" if p["category"] else ""
+                    where = p["address"] or f"{p['lat']:.5f}, {p['lon']:.5f}"
+                    maps_link = f"https://www.google.com/maps?q={p['lat']},{p['lon']}"
+                    lines.append(f"- {p['name']}{label} -- {p['distance_km']} km away, at {where} ({maps_link})")
+                nearby_context = "\n".join(lines)
+            else:
+                nearby_context = (
+                    "The user asked about nearby places, but no matching results were found "
+                    "nearby -- say so plainly rather than inventing a place name."
+                )
+
+    # Cognitive Commerce: Swiggy MCP (commerce/swiggy_adapter.py). Entirely
+    # gated behind SWIGGY_MCP_ENABLED in .env -- is_enabled() short-circuits
+    # everything below to zero cost (not even the intent regex runs) when
+    # the flag is off, same shape as every other optional subsystem this
+    # endpoint already touches (ei_context, nearby_context).
+    commerce_context = ""
+    action_card = None
+    try:
+        from commerce.swiggy_adapter import (
+            build_commerce_context, build_tracking_context, detect_intent,
+            is_enabled as swiggy_enabled, is_track_order_intent,
+        )
+        if swiggy_enabled():
+            if is_track_order_intent(prompt_lower):
+                commerce_context, action_card = build_tracking_context(cur, db, user_id)
+            else:
+                commerce_server = detect_intent(prompt_lower)
+                if commerce_server:
+                    commerce_context, action_card = build_commerce_context(
+                        cur, db, user_id, prompt, commerce_server, ei_context
+                    )
+    except Exception:
+        commerce_context, action_card = "", None  # optional and additive, never affects this endpoint otherwise
+
     if matched:
         cur.execute(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
@@ -4749,7 +5381,7 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
-    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context:
+    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context and not nearby_context and not commerce_context:
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -4770,11 +5402,29 @@ def chat_global():
     # follow-up-resolution role load_chat_context plays for /chat.
     history = load_global_chat_context(cur, user_id)
 
-    transcripts_section = "\n\n---\n\n".join(blocks) if blocks else "(No saved conversation transcripts available.)"
+    # Built up rather than defaulting to the "(No saved conversation
+    # transcripts available.)" placeholder up front -- that literal string,
+    # sitting right next to real data from personal_notes/direct_messages/
+    # nearby_context, was confusing the model into treating it as the
+    # authoritative "nothing here" signal and ignoring the real content
+    # above it (caught via a live test: real Overpass results came back,
+    # but the reply still claimed nothing was found). The placeholder now
+    # only appears if truly nothing at all is available.
+    transcripts_section = "\n\n---\n\n".join(blocks) if blocks else ""
+
+    def _prepend(section: str, block: str) -> str:
+        return f"{block}\n\n---\n\n{section}" if section else block
+
     if personal_notes_context:
-        transcripts_section = f"{personal_notes_context}\n\n---\n\n{transcripts_section}"
+        transcripts_section = _prepend(transcripts_section, personal_notes_context)
     if direct_messages_context:
-        transcripts_section = f"{direct_messages_context}\n\n---\n\n{transcripts_section}"
+        transcripts_section = _prepend(transcripts_section, direct_messages_context)
+    if nearby_context:
+        transcripts_section = _prepend(transcripts_section, nearby_context)
+    if commerce_context:
+        transcripts_section = _prepend(transcripts_section, commerce_context)
+    if not transcripts_section:
+        transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
     matched_name = matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
     global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched_name)
@@ -4818,7 +5468,263 @@ def chat_global():
         "reply": reply,
         "matched_speaker": matched["name"] if matched else None,
         "conversations_used": len(conversations),
+        "action_card": action_card,
     })
+
+
+CHAT_TONE_VALUES = ("resolved", "celebratory", "heavy", "routine")
+CHAT_TONE_WRAPUP_MESSAGES = 8
+
+
+@app.route("/chat/global/wrap-up", methods=["POST"])
+@login_required
+def chat_global_wrap_up():
+    """Adaptive home-screen motion's `chat_tone` signal (see
+    ADAPTIVE_HOME_ANIMATION_PLAN.md) -- the client calls this once, best-
+    effort, when the global assistant chat screen closes after an exchange
+    actually happened this visit. Classifies the tail of the thread into
+    exactly one of CHAT_TONE_VALUES; anything else the model produces
+    (malformed JSON, an invented value, empty) is discarded rather than
+    stored, same discipline as every other LLM-output validation in this
+    file -- a missing classification is a fine degraded outcome, a garbled
+    one stored and later shown on the home screen would not be."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT role, content FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id IS NULL "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, CHAT_TONE_WRAPUP_MESSAGES),
+    )
+    rows = list(reversed(cur.fetchall()))
+    # Fewer than 2 rows means at most a single unanswered message -- nothing
+    # resembling a finished exchange to classify yet.
+    if len(rows) < 2:
+        return jsonify({"ok": True, "tone": None})
+
+    transcript = "\n".join(f"{'You' if r['role'] == 'user' else 'Assistant'}: {r['content']}" for r in rows)
+    tone = None
+    try:
+        reply = call_llm([
+            {"role": "system", "content": (
+                "Classify the overall tone of the just-finished chat exchange below. "
+                "Reply with ONLY one of these four words, nothing else, no punctuation: "
+                "resolved, celebratory, heavy, routine."
+            )},
+            {"role": "user", "content": transcript},
+        ])
+        candidate = (reply or "").strip().lower().strip(".")
+        if candidate in CHAT_TONE_VALUES:
+            tone = candidate
+    except Exception:
+        tone = None
+
+    if not tone:
+        return jsonify({"ok": True, "tone": None})
+
+    cur.execute(
+        "UPDATE users SET last_chat_tone = %s, last_chat_tone_at = now() WHERE id = %s",
+        (tone, user_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "tone": tone})
+
+
+# ---------------------------------------------------------------------------
+# Cognitive Commerce: Swiggy MCP integration routes. Thin Flask wrappers
+# (auth, request parsing, jsonify) over commerce/swiggy_adapter.py, which
+# holds all the actual OAuth/MCP logic -- same shape as every other route in
+# this file. Gated behind SWIGGY_MCP_ENABLED in .env: when the flag is off,
+# every route below 404s via _swiggy_feature_check() rather than pretending
+# to work, and /status (the one route with no gate of its own) just reports
+# enabled=false so both clients know to hide the feature entirely.
+# ---------------------------------------------------------------------------
+
+def _swiggy_feature_check():
+    from commerce.swiggy_adapter import is_enabled
+    if not is_enabled():
+        return jsonify({"error": "Swiggy integration is not enabled."}), 404
+    return None
+
+
+@app.route("/integrations/swiggy/status")
+@login_required
+def swiggy_status():
+    from commerce.swiggy_adapter import get_status
+    db = get_db()
+    cur = dict_cursor(db)
+    return jsonify(get_status(cur, current_user_id()))
+
+
+@app.route("/integrations/swiggy/connect")
+@login_required
+def swiggy_connect():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    server = request.args.get("server", "food")
+    from commerce.swiggy_adapter import CommerceError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), server)
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return redirect(url)
+
+
+@app.route("/integrations/swiggy/connect_url")
+@login_required
+def swiggy_connect_url():
+    # JSON variant of /connect, for Flutter: that client authenticates via a
+    # Bearer header (see ApiClient), which a system browser opened via
+    # url_launcher has no way to carry -- so Flutter calls this over an
+    # authenticated Dio request first, then opens the *returned* Swiggy URL
+    # (mcp.swiggy.com's own domain) directly, never navigating to our own
+    # /connect route at all. React's <a href="/integrations/swiggy/connect">
+    # doesn't need this: a same-origin browser navigation already carries
+    # the session cookie, so the plain redirect route above works for it.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    server = request.args.get("server", "food")
+    from commerce.swiggy_adapter import CommerceError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), server)
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"url": url})
+
+
+def _render_swiggy_callback_page(success: bool, error: str | None = None):
+    # Plain static HTML, not JSON -- this is loaded in a real browser
+    # tab/webview at the end of an OAuth redirect, not called via fetch/dio.
+    message = "Your Swiggy account is connected. You can close this window." if success \
+        else f"Couldn't connect your Swiggy account: {error}"
+    return f"<html><body style='font-family:sans-serif;padding:32px;text-align:center;'>{message}</body></html>"
+
+
+@app.route("/integrations/swiggy/callback")
+def swiggy_callback():
+    # No @login_required -- Swiggy's redirect back here carries no session
+    # cookie context of its own; the user_id is recovered from the
+    # server-side pending-state row created in swiggy_connect (see
+    # handle_callback), keyed by the opaque `state` value round-tripped
+    # through Swiggy's own auth screen.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    code, state, error = request.args.get("code"), request.args.get("state"), request.args.get("error")
+    from commerce.swiggy_adapter import CommerceError, handle_callback
+    if error or not code or not state:
+        return _render_swiggy_callback_page(False, error or "Missing authorization code.")
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        handle_callback(cur, db, code, state)
+    except CommerceError as e:
+        return _render_swiggy_callback_page(False, str(e))
+    except Exception:
+        return _render_swiggy_callback_page(False, "Something went wrong linking your Swiggy account.")
+    return _render_swiggy_callback_page(True)
+
+
+@app.route("/integrations/swiggy/disconnect", methods=["POST"])
+@login_required
+def swiggy_disconnect():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    server = (request.get_json(silent=True) or {}).get("server", "food")
+    from commerce.swiggy_adapter import disconnect
+    db = get_db()
+    cur = dict_cursor(db)
+    disconnect(cur, db, current_user_id(), server)
+    return jsonify({"ok": True})
+
+
+@app.route("/commerce/swiggy/confirm", methods=["POST"])
+@login_required
+def swiggy_confirm():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    action_id = body.get("action_id")
+    if not action_id:
+        return jsonify({"error": "action_id is required"}), 400
+    from commerce.swiggy_adapter import CommerceError, confirm_action
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        result = confirm_action(cur, db, current_user_id(), int(action_id), body.get("menu_item_id"))
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/commerce/swiggy/dismiss", methods=["POST"])
+@login_required
+def swiggy_dismiss():
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    action_id = (request.get_json(silent=True) or {}).get("action_id")
+    if not action_id:
+        return jsonify({"error": "action_id is required"}), 400
+    from commerce.swiggy_adapter import dismiss_action
+    db = get_db()
+    cur = dict_cursor(db)
+    dismiss_action(cur, db, current_user_id(), int(action_id))
+    return jsonify({"ok": True})
+
+
+@app.route("/commerce/swiggy/payment-status")
+@login_required
+def swiggy_payment_status():
+    # Polled by the client every ~10s+ while a UPI QR/payment-link is
+    # shown (Cash is confirmed unavailable on this account -- see
+    # commerce/swiggy_adapter.py's _place_food_order). Finalizes the real
+    # order via confirm_order the moment Swiggy reports the payment
+    # succeeded.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    payment_action_id = request.args.get("payment_action_id")
+    if not payment_action_id:
+        return jsonify({"error": "payment_action_id is required"}), 400
+    from commerce.swiggy_adapter import CommerceError, check_payment_status
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        result = check_payment_status(cur, db, current_user_id(), int(payment_action_id))
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/commerce/swiggy/track-order")
+@login_required
+def swiggy_track_order():
+    # Live delivery status for an already-placed order -- polled by the
+    # client at whatever pollingDuration Swiggy's own response suggests.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    action_id = request.args.get("action_id")
+    if not action_id:
+        return jsonify({"error": "action_id is required"}), 400
+    from commerce.swiggy_adapter import CommerceError, track_order
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        result = track_order(cur, db, current_user_id(), int(action_id))
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
 
 
 IMAGE_UPLOAD_PLACEHOLDER = "[Image uploaded]"
@@ -4906,10 +5812,20 @@ def chat_global_image():
     if description:
         try:
             from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+            # description only, not extracted_text -- real_user_extraction.py's
+            # nightly batch already turns the conversations row inserted above
+            # into facts for free, so there's no gap here to fix.
             threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, description), daemon=True).start()
         except Exception:
             pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
-        threading.Thread(target=trigger_reminder_extraction, args=(user_id, description), daemon=True).start()
+        # Unlike trigger_chat_feedback_extraction above, this one has no
+        # nightly-batch fallback -- reminders need to exist right away, so it
+        # needs the actual image content, not just the instruction. Passing
+        # description alone (the original version of this code) meant "create
+        # a reminder for each exam and class" had no exams/classes to work
+        # from -- it could only ever produce one vague catch-all task.
+        reminder_content = f"{description}\n\nContent extracted from the image:\n{extracted_text}"
+        threading.Thread(target=trigger_reminder_extraction, args=(user_id, reminder_content), daemon=True).start()
 
     return jsonify({
         "reply": reply,
@@ -4917,6 +5833,122 @@ def chat_global_image():
         "title": title,
         "category": category,
     })
+
+
+# ---------------------------------------------------------------------------
+# Object storage (Cloudflare R2) -- profile pictures + chat/DM attachments.
+# See MEDIA_STORAGE_PLAN.md and storage.py. Gated behind R2_STORAGE_ENABLED,
+# same convention as the Swiggy section above: when the flag is off (the
+# default), every route below 404s via storage.storage_feature_check(), and
+# /uploads/status (no gate of its own) just reports enabled=false so both
+# clients know to hide upload affordances entirely rather than offering a
+# button that 404s.
+# ---------------------------------------------------------------------------
+
+@app.route("/uploads/status")
+@login_required
+def uploads_status():
+    import storage
+    return jsonify({"enabled": storage.is_enabled()})
+
+
+@app.route("/uploads/presign", methods=["POST"])
+@login_required
+def uploads_presign():
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    purpose = data.get("purpose")
+    content_type = data.get("content_type")
+    if not purpose or not content_type:
+        return jsonify({"error": "purpose and content_type are required"}), 400
+    try:
+        object_key, upload_url = storage.presign_upload(purpose, content_type, current_user_id())
+    except storage.StorageError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"upload_url": upload_url, "object_key": object_key})
+
+
+@app.route("/uploads/confirm", methods=["POST"])
+@login_required
+def uploads_confirm():
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    object_key = data.get("object_key")
+    purpose = data.get("purpose")
+    if not object_key or not purpose:
+        return jsonify({"error": "object_key and purpose are required"}), 400
+    # An object_key not under this user's own prefix (profile-pictures/<id>/
+    # or chat-media/*/<id>/) can't be confirmed -- prevents confirming (and
+    # thus exposing the public URL of) an object presigned for someone else.
+    if f"/{current_user_id()}/" not in object_key:
+        return jsonify({"error": "object_key does not belong to this user"}), 403
+    try:
+        url = storage.confirm_upload(object_key, purpose)
+    except storage.StorageError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not confirm upload: {e}"}), 400
+    return jsonify({"ok": True, "public_url": url})
+
+
+@app.route("/profile/picture", methods=["POST"])
+@login_required
+def update_profile_picture():
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    object_key = data.get("object_key")
+    if not object_key:
+        return jsonify({"error": "object_key is required"}), 400
+    user_id = current_user_id()
+    if f"/{user_id}/" not in object_key:
+        return jsonify({"error": "object_key does not belong to this user"}), 403
+    try:
+        url = storage.confirm_upload(object_key, "profile_picture")
+    except storage.StorageError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not confirm upload: {e}"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT profile_picture_url FROM users WHERE id = %s", (user_id,))
+    old_url = cur.fetchone()["profile_picture_url"]
+    cur.execute("UPDATE users SET profile_picture_url = %s WHERE id = %s", (url, user_id))
+    db.commit()
+    old_key = storage.key_from_public_url(old_url)
+    if old_key and old_key != object_key:
+        storage.delete_object(old_key)
+    return jsonify({"ok": True, "profile_picture_url": url})
+
+
+@app.route("/<path:_any>")
+def spa_fallback(_any):
+    """React Router client-side paths (e.g. /insights, /calls, once those
+    routes exist) have no Flask route of their own -- without this, a deep
+    link, bookmark, or hard refresh on one of those 404s instead of loading
+    the SPA shell and letting React Router resolve the path client-side.
+
+    Registered last, after every real route in this file, so it never
+    shadows one -- Werkzeug's own rule matching also naturally prefers a
+    more specific route (a literal path segment, or Flask's built-in
+    /static/<path:filename> handler) over this single root-level wildcard
+    regardless of registration order, but placement is kept correct anyway
+    rather than relying on that alone. Mirrors index() above exactly --
+    same file, same fallback to render_template if the built bundle isn't
+    present."""
+    react_index = os.path.join(app.static_folder, "app", "index.html")
+    if os.path.exists(react_index):
+        return send_from_directory(os.path.join(app.static_folder, "app"), "index.html")
+    return render_template("index.html")
 
 
 verify_db_connection()

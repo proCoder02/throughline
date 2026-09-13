@@ -1,7 +1,10 @@
 import { useRef, useState } from 'react';
 import { AttachIcon, SendIcon } from '../icons.jsx';
 
-export default function Composer({ onSend, disabled, placeholder, extraButton, onTyping, onImageSelected }) {
+export default function Composer({
+  onSend, disabled, placeholder, extraButton, onTyping, onImageSelected,
+  attachAccept = 'image/*', attachLabel = 'Attach an image',
+}) {
   const [value, setValue] = useState('');
   const fileInputRef = useRef(null);
 
@@ -24,6 +27,7 @@ export default function Composer({ onSend, disabled, placeholder, extraButton, o
       <textarea
         rows={1}
         placeholder={placeholder || 'Type a message'}
+        aria-label={placeholder || 'Type a message'}
         value={value}
         onChange={(e) => {
           setValue(e.target.value);
@@ -36,14 +40,15 @@ export default function Composer({ onSend, disabled, placeholder, extraButton, o
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept={attachAccept}
             style={{ display: 'none' }}
             onChange={handleFileChange}
           />
           <button
             type="button"
             className="send-btn"
-            title="Attach an image"
+            title={attachLabel}
+            aria-label={attachLabel}
             onClick={() => fileInputRef.current.click()}
           >
             <AttachIcon />

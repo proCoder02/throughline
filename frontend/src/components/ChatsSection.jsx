@@ -1,12 +1,41 @@
 import { useEffect, useState } from 'react';
+import UseAnimations from 'react-useanimations';
+import mail from 'react-useanimations/lib/mail';
 import ListPane from './ListPane.jsx';
 import ChatThread from './ChatThread.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
+import ContextMenu from './ContextMenu.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
+import { useLongPress } from '../hooks/useLongPress.js';
 import { apiJson, post, postForm } from '../api.js';
 import { backfillConversationContent } from '../db.js';
-import { MicIcon, ChatIcon } from '../icons.jsx';
+import { showToast, confirmDialog } from '../lib/notify.js';
+import { onEnterOrSpace } from '../lib/a11y.js';
+import { MicIcon, ChatIcon, TrashIcon } from '../icons.jsx';
+
+// Best-effort, silent, and fast on purpose -- must never turn a normal text
+// message into a permission-prompt interruption or a multi-second stall.
+// Only actually asks the browser for location when the message looks like
+// it wants one at all; every other message skips this with zero delay or
+// prompt. A denied/unavailable/slow fix just means the backend gets no
+// lat/lon and asks the user to share location or name a place instead --
+// mirrors the Flutter client's _maybeGetLocation exactly.
+const LOCATION_KEYWORD_RE = /\bnear(?:by)?\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\btrek\b|\bhik(?:e|ing)\b|\btrail\b|\bshop(?:ping)?\b|\brestaurant\b|\bcafe\b|\bcoffee\b|\bpark\b/i;
+
+function maybeGetLocation(text) {
+  return new Promise((resolve) => {
+    if (!LOCATION_KEYWORD_RE.test(text) || !navigator.geolocation) {
+      resolve(null);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+      () => resolve(null), // denied, unavailable, or timed out -- send proceeds without location
+      { enableHighAccuracy: false, timeout: 4000, maximumAge: 60000 },
+    );
+  });
+}
 
 export default function ChatsSection({ notify, openConversationId, onConsumeOpenConversationId }) {
   const conv = useConversations();
@@ -15,6 +44,8 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   const [messages, setMessages] = useState([]);
   const [sending, setSending] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState('all');
+  const [rowMenu, setRowMenu] = useState(null); // {x, y, chat} for the long-press quick-action menu
+  const bindLongPress = useLongPress();
   // Cross-session Q&A ("What did I discuss with Rahul last week?") -- not
   // tied to one conversation_id, so it's kept entirely separate from the
   // per-conversation selectedId/messages state above.
@@ -81,9 +112,13 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     setGlobalMessages((m) => [...m, { role: 'user', content: prompt }]);
     setGlobalSending(true);
     try {
-      const data = await post('/chat/global', { prompt });
+      const location = await maybeGetLocation(prompt);
+      const data = await post('/chat/global', { prompt, ...(location || {}) });
       const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
+      // Cognitive Commerce (Swiggy MCP) -- present only when the backend
+      // actually found real, orderable results; absent (undefined/null) for
+      // every other message, which MessageRow already treats as "no card".
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply, actionCard: data.action_card || null }]);
     } catch (e) {
       setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
     } finally {
@@ -111,14 +146,14 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
 
   // Global "Listen" button: always visible, starts a brand-new conversation.
   const startNewChat = async () => {
-    try { setSelectedTranscript(''); await live.start(); } catch (e) { alert('Could not access microphone: ' + e.message); }
+    try { setSelectedTranscript(''); await live.start(); } catch (e) { showToast('Could not access microphone: ' + e.message, 'error'); }
   };
 
   // Per-conversation "Listen" button: resumes THIS conversation if it ended
   // mid-way -- new transcript lines get appended server-side rather than
   // starting an unrelated new chat.
   const resumeListening = async (id) => {
-    try { await live.start(id); } catch (e) { alert('Could not access microphone: ' + e.message); }
+    try { await live.start(id); } catch (e) { showToast('Could not access microphone: ' + e.message, 'error'); }
   };
 
   const liveTranscript = selectedTranscript
@@ -149,7 +184,13 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   };
 
   const deleteConversation = async (id) => {
-    if (!confirm('Delete this conversation permanently? This cannot be undone.')) return;
+    const ok = await confirmDialog({
+      title: 'Delete conversation?',
+      message: 'This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     await conv.removeConv(id);
     if (selectedId === id) { setSelectedId(null); setMessages([]); }
   };
@@ -181,7 +222,12 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
         )}
       >
         {visibleChats.map((c) => (
-          <div key={c.id} className={'row' + (c.id === selectedId ? ' active' : '')} onClick={() => openRow(c.id)}>
+          <div
+            key={c.id} className={'row' + (c.id === selectedId ? ' active' : '')}
+            role="button" tabIndex={0} aria-label={`Conversation: ${c.title || 'Untitled conversation'}`}
+            onClick={() => openRow(c.id)} onKeyDown={onEnterOrSpace(() => openRow(c.id))}
+            {...bindLongPress((x, y) => setRowMenu({ x, y, chat: c }))}
+          >
             <span className="avatar">{(c.title || 'U')[0]}</span>
             <div className="row-main">
               <div className="row-top">
@@ -190,10 +236,20 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
               </div>
               <div className="row-sub">{new Date(c.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
             </div>
-            {notify?.unreadChatIds.has(c.id) && <span className="status-dot" style={{ background: '#EA0038' }} />}
+            {notify?.unreadChatIds.has(c.id) && <span className="status-dot" style={{ background: 'var(--wa-danger)' }} aria-hidden="true" />}
           </div>
         ))}
       </ListPane>
+
+      {rowMenu && (
+        <ContextMenu
+          x={rowMenu.x} y={rowMenu.y} onClose={() => setRowMenu(null)}
+          items={[
+            { label: 'Open', icon: <ChatIcon />, onSelect: () => openRow(rowMenu.chat.id) },
+            { label: 'Delete conversation', icon: <TrashIcon />, danger: true, onSelect: () => deleteConversation(rowMenu.chat.id) },
+          ]}
+        />
+      )}
 
       {selectedId ? (
         <ChatThread
@@ -231,7 +287,12 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           onBack={() => setGlobalChatOpen(false)}
         />
       ) : (
-        <div className="chat-panel empty">Select a conversation, or click Listen to start one.</div>
+        <div className="chat-panel empty">
+          <div className="empty-state">
+            <UseAnimations animation={mail} size={110} autoplay loop strokeColor="#1FC8B4" />
+            <div className="empty-state-text">Select a conversation, or click Listen to start one.</div>
+          </div>
+        </div>
       )}
     </>
   );

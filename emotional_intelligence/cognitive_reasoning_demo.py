@@ -24,6 +24,22 @@ from ei_adapter import NOT_EXPIRED, _count_table, _search_table
 
 load_dotenv()
 
+# CostLens usage tracking -- see the matching comment in extraction_pipeline.py.
+# This module is imported directly by cognitive_sharing.py (which doesn't
+# import extraction_pipeline.py), and indirectly by personality_batch.py/
+# relationship_batch.py (which import both) -- covering it here too closes
+# the one gap extraction_pipeline.py's install() call alone would leave.
+import sys as _sys
+from pathlib import Path as _Path
+_repo_root = str(_Path(__file__).resolve().parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+try:
+    import costlens_agent as _costlens_agent
+    _costlens_agent.install()
+except Exception:
+    pass  # optional and additive -- never blocks this script's real work
+
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
     raise SystemExit("DATABASE_URL is required")

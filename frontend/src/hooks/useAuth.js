@@ -33,5 +33,12 @@ export function useAuth() {
     setUser(null);
   }, []);
 
-  return { user, loading, login, register, logout };
+  // Patches the in-memory user (e.g. a freshly-uploaded profile picture)
+  // without a round-trip back to /me -- the upload's own response already
+  // has the new URL.
+  const updateUser = useCallback((patch) => {
+    setUser((u) => (u ? { ...u, ...patch } : u));
+  }, []);
+
+  return { user, loading, login, register, logout, updateUser };
 }

@@ -20,3 +20,21 @@ export const MailIcon = () => <svg {...base}><rect x="3" y="5" width="18" height
 export const CloseIcon = () => <svg {...base}><path d="M6 6l12 12M18 6L6 18"/></svg>;
 export const PhoneIcon = () => <svg {...base}><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>;
 export const AttachIcon = () => <svg {...base}><path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a3.5 3.5 0 014.95 4.95l-9.2 9.19a1.5 1.5 0 01-2.12-2.12l8.49-8.48"/></svg>;
+// Cognitive Sharing's "find common ground" action -- a simple brain glyph,
+// matching the Icons.psychology_outlined used for the same action on the
+// Flutter client.
+export const BrainIcon = () => <svg {...base}><path d="M9 4a3 3 0 00-3 3v.34A3.5 3.5 0 004 10.5 3.5 3.5 0 006 13.68V16a4 4 0 004 4M9 4a3 3 0 013 3v13M9 4c0-1.1.9-2 2-2M15 4a3 3 0 013 3v.34A3.5 3.5 0 0120 10.5 3.5 3.5 0 0118 13.68V16a4 4 0 01-4 4M15 4a3 3 0 00-3 3M15 4c0-1.1-.9-2-2-2"/></svg>;
+// Cognitive Commerce's "order via Swiggy" action card -- a simple
+// fork-and-plate glyph, no brand mark (no Swiggy trademark usage).
+export const FoodOrderIcon = () => <svg {...base}><path d="M6 3v7a2 2 0 002 2h0a2 2 0 002-2V3M7 3v6M9 3v6M15 3c-1.5 0-3 1.5-3 4s1.5 4 3 4M6 12v9M15 12v9"/></svg>;
+export const SunIcon = () => <svg {...base}><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2.5M12 19v2.5M4.6 4.6l1.8 1.8M17.6 17.6l1.8 1.8M2.5 12h2.5M19 12h2.5M4.6 19.4l1.8-1.8M17.6 6.4l1.8-1.8"/></svg>;
+// The Settings avatar's "change photo" badge -- matches Icons.camera_alt
+// used for the same action on the Flutter client.
+export const CameraIcon = () => <svg {...base}><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 011 1v10a1 1 0 01-1 1H4a1 1 0 01-1-1V9a1 1 0 011-1z"/><circle cx="12" cy="13" r="3.5"/></svg>;
+export const CopyIcon = () => <svg {...base}><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1"/></svg>;
+export const ClockIcon = () => <svg {...base}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>;
+export const AlertIcon = () => <svg {...base}><path d="M12 3l10 18H2L12 3z"/><path d="M12 10v4M12 17h.01"/></svg>;
+export const MoonIcon = () => <svg {...base}><path d="M20 14.5A8.5 8.5 0 019.5 4a8.5 8.5 0 1010.5 10.5z"/></svg>;
+export const FileIcon = () => <svg {...base}><path d="M6 2h9l5 5v13a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z"/><path d="M15 2v5h5"/></svg>;
+export const DownloadIcon = () => <svg {...base}><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>;
+export const PlayIcon = () => <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>;

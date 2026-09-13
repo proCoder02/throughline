@@ -1,29 +1,31 @@
 import { useEffect, useState } from 'react';
+import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from './hooks/useAuth.js';
 import { useNotifications } from './hooks/useNotifications.js';
 import { useCall } from './hooks/useCall.js';
+import { useTheme } from './hooks/useTheme.js';
 import { apiJson } from './api.js';
+import { showToast } from './lib/notify.js';
 import AuthScreen from './components/AuthScreen.jsx';
 import PersonaOnboarding from './components/PersonaOnboarding.jsx';
 import CallOverlay from './components/CallOverlay.jsx';
+import NotificationHost from './components/NotificationHost.jsx';
 import { startRingtone, stopRingtone, unlockAudio } from './ringtone.js';
 import IconRail from './components/IconRail.jsx';
-import ChatsSection from './components/ChatsSection.jsx';
-import TasksSection from './components/TasksSection.jsx';
-import ProfilesSection from './components/ProfilesSection.jsx';
-import FriendsSection from './components/FriendsSection.jsx';
-import SettingsSection from './components/SettingsSection.jsx';
 
-const SECTIONS = {
-  chats: ChatsSection,
-  tasks: TasksSection,
-  profiles: ProfilesSection,
-  friends: FriendsSection,
-};
-
+/// Root layout route (see router.jsx) -- rendered once and never unmounted
+/// by navigation between sections, which is exactly what auth/notify/call
+/// need: notify (the /ws/notify socket) and call (an active LiveKit call)
+/// must both survive switching tabs, same guarantee this component gave
+/// when section-switching was a plain useState instead of a route change.
+/// Section components themselves are unchanged (see router.jsx's per-route
+/// wrappers) -- only how "which section is active" is derived changed, from
+/// local state to the URL.
 export default function App() {
   const auth = useAuth();
-  const [section, setSection] = useState('chats');
+  const { theme, toggleTheme } = useTheme();
+  const location = useLocation();
+  const navigate = useNavigate();
   // Owned here (not per-section) so the socket survives switching tabs --
   // a badge from a section you're not currently viewing should still count.
   const notify = useNotifications(!!auth.user);
@@ -31,7 +33,7 @@ export default function App() {
   // must stay visible (and connected) across tab switches.
   const call = useCall();
   // Set by Tasks/Profiles "view source conversation" links, consumed once
-  // by ChatsSection then cleared -- see its openConversationId effect.
+  // by ChatsSection then cleared -- see openConversationInChats below.
   const [pendingConversationId, setPendingConversationId] = useState(null);
   // null = not checked yet, true/false once checked. Gates the app shell
   // behind a one-time persona form for any account that hasn't submitted
@@ -83,18 +85,16 @@ export default function App() {
   if (personaCompleted === null) return null;
   if (!personaCompleted) return <PersonaOnboarding onComplete={() => setPersonaCompleted(true)} />;
 
-  const Section = SECTIONS[section];
-
   const openConversationInChats = (conversationId) => {
     if (!conversationId) return;
     setPendingConversationId(conversationId);
-    setSection('chats');
+    navigate('/app/chats');
   };
 
   const acceptIncomingCall = async () => {
     const incoming = notify.incomingCall;
     notify.clearIncomingCall();
-    try { await call.joinCall(incoming.callId); } catch (e) { alert('Could not join call: ' + e.message); }
+    try { await call.joinCall(incoming.callId); } catch (e) { showToast('Could not join call: ' + e.message, 'error'); }
   };
 
   const declineIncomingCall = () => {
@@ -103,25 +103,33 @@ export default function App() {
     call.declineCall(incoming.callId).catch(() => {});
   };
 
+  // Derived from the URL instead of local state -- IconRail's own props
+  // (active/onSelect) are otherwise completely unchanged. Strips the /app
+  // prefix (see router.jsx for why every client route lives under it).
+  const section = location.pathname.replace(/^\/app\/?/, '').split('/')[0] || 'os';
+
   return (
     <div className="app-shell">
-      <IconRail
-        active={section}
-        onSelect={setSection}
-        username={auth.user.username}
-        badges={{ tasks: notify.taskCount, chats: notify.unreadChatIds.size }}
-      />
-      {section === 'settings' && <SettingsSection user={auth.user} onLogout={auth.logout} />}
-      {section === 'chats' && (
-        <ChatsSection
-          notify={notify}
-          openConversationId={pendingConversationId}
-          onConsumeOpenConversationId={() => setPendingConversationId(null)}
+      {/* The "os" screen renders its own full sidebar (see os/OsApp.jsx) --
+          showing IconRail alongside it would double up navigation. */}
+      {section !== 'os' && (
+        <IconRail
+          active={section}
+          onSelect={(s) => navigate('/app/' + s)}
+          username={auth.user.username}
+          profilePictureUrl={auth.user.profile_picture_url}
+          badges={{ tasks: notify.taskCount, chats: notify.unreadChatIds.size }}
+          online={notify.connected}
         />
       )}
-      {section === 'tasks' && <TasksSection notify={notify} onOpenConversation={openConversationInChats} />}
-      {section === 'profiles' && <ProfilesSection onOpenConversation={openConversationInChats} />}
-      {section === 'friends' && <FriendsSection onStartCall={call.startCall} notify={notify} myUserId={auth.user.id} />}
+      <Outlet
+        context={{
+          auth, notify, call, theme, toggleTheme,
+          pendingConversationId,
+          openConversationInChats,
+          consumePendingConversationId: () => setPendingConversationId(null),
+        }}
+      />
       <CallOverlay
         incomingCall={call.activeCall ? null : notify.incomingCall}
         activeCall={call.activeCall}
@@ -131,6 +139,7 @@ export default function App() {
         onToggleMute={call.toggleMute}
         onEnableAudio={call.enableAudio}
       />
+      <NotificationHost />
     </div>
   );
 }

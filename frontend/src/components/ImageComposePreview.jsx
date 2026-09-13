@@ -20,6 +20,7 @@ export default function ImageComposePreview({ file, sending, onSend, onCancel })
           rows={1}
           autoFocus
           placeholder="Add a description..."
+          aria-label="Image description"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           onKeyDown={(e) => {
@@ -29,7 +30,7 @@ export default function ImageComposePreview({ file, sending, onSend, onCancel })
             }
           }}
         />
-        <button type="button" className="send-btn" title="Cancel" onClick={onCancel}>
+        <button type="button" className="send-btn" title="Cancel" aria-label="Cancel" onClick={onCancel}>
           <CloseIcon />
         </button>
         <button
@@ -37,6 +38,7 @@ export default function ImageComposePreview({ file, sending, onSend, onCancel })
           className="send-btn"
           disabled={!canSend}
           title="Send"
+          aria-label="Send image"
           onClick={() => onSend(description.trim())}
         >
           <SendIcon />

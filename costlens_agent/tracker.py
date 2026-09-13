@@ -21,6 +21,7 @@ class UsageRecord:
     endpoint: str
     method: str = "POST"
     feature_tag: str = "untagged"
+    source_route: str = ""
     request_count: int = 1
     model: str = ""
     input_tokens: int = 0
@@ -57,6 +58,7 @@ class CostLensTracker:
         endpoint: str,
         method: str = "POST",
         feature_tag: str = "untagged",
+        source_route: str = "",
         request_count: int = 1,
         model: str = "",
         input_tokens: int = 0,
@@ -71,6 +73,7 @@ class CostLensTracker:
             endpoint=endpoint,
             method=method,
             feature_tag=feature_tag,
+            source_route=source_route,
             request_count=request_count,
             model=model,
             input_tokens=input_tokens,

@@ -6,6 +6,7 @@ import { getToken } from '../api.js';
 // pending queue per user, so an event that arrived while this was
 // disconnected still shows up the moment it reconnects.
 export function useNotifications(enabled) {
+  const [connected, setConnected] = useState(false); // this socket's live/dropped state -- drives the Discord-style presence dot on your own avatar
   const [taskCount, setTaskCount] = useState(0);
   const [unreadChatIds, setUnreadChatIds] = useState(() => new Set());
   const [incomingCall, setIncomingCall] = useState(null); // {callId, roomName, callerId, callerName}
@@ -51,11 +52,15 @@ export function useNotifications(enabled) {
       socketRef.current = socket;
       socket.onopen = () => {
         reconnectAttemptRef.current = 0;
+        setConnected(true);
         const pending = outboxRef.current;
         outboxRef.current = [];
         for (const obj of pending) sendNow(obj);
       };
-      socket.onclose = scheduleReconnect;
+      socket.onclose = () => {
+        setConnected(false);
+        scheduleReconnect();
+      };
       socket.onerror = () => socket.close();
       socket.onmessage = handleMessage;
     };
@@ -118,6 +123,12 @@ export function useNotifications(enabled) {
       } else if (msg.type === 'direct_messages_read' || msg.type === 'direct_messages_delivered') {
         const handler = dmListenersRef.current.get(msg.friend_id);
         if (handler) handler(msg);
+      } else if (msg.type === 'cognitive_suggestion') {
+        // Only relevant while that friend's thread is open (matches the
+        // mobile client's NotifyProvider) -- the on-demand feature has no
+        // Friends-list badge, unlike direct_message above.
+        const handler = dmListenersRef.current.get(msg.friend_id);
+        if (handler) handler(msg);
       } else if (msg.type === 'friend_typing') {
         const friendId = msg.friend_id;
         clearTimeout(typingTimersRef.current.get(friendId));
@@ -141,6 +152,7 @@ export function useNotifications(enabled) {
       clearTimeout(reconnectTimerRef.current);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       socketRef.current?.close();
+      setConnected(false);
     };
   }, [enabled]);
 
@@ -202,6 +214,7 @@ export function useNotifications(enabled) {
   const sendTyping = (friendId) => sendMessage({ type: 'typing', friend_id: friendId });
 
   return {
+    connected,
     taskCount, unreadChatIds, clearTasks, clearChat, incomingCall, clearIncomingCall, declinedCallId, clearDeclinedCall,
     dmUnreadCounts, registerDmListener, sendDmAck: sendMessage, clearDmUnread, seedDmUnreadCounts,
     typingFriends, sendTyping,
