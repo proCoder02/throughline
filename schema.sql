@@ -501,13 +501,19 @@ CREATE TABLE IF NOT EXISTS commerce_actions (
     user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     provider TEXT NOT NULL DEFAULT 'swiggy',
     server TEXT NOT NULL, -- 'food' | 'im' | 'dineout'
-    action TEXT NOT NULL, -- 'suggested' | 'confirmed' | 'order_placed' | 'order_failed' | 'dismissed'
+    action TEXT NOT NULL, -- 'suggested' | 'awaiting_payment' | 'order_placed' | 'order_failed' | 'dismissed'
     inferred_need TEXT,
     item_summary TEXT,     -- human-readable snapshot, for display/audit only
     item_ref JSONB,        -- structured refs (restaurant_id/item_id/address_id/...)
                             -- used to re-look-up the item at confirm time --
                             -- never trusted as the final price/availability itself
     external_order_id TEXT,
+    -- Swiggy's own payment reference (their docs call it paasId) for a
+    -- 'awaiting_payment' row -- the payment-status polling endpoint uses
+    -- this to ask Swiggy whether the user has completed the UPI payment
+    -- yet, then calls confirm_order once it has. NULL for the Cash path,
+    -- which resolves synchronously with no separate payment step.
+    payment_ref TEXT,
     -- Set the moment a 'suggested' row is acted on (confirmed OR dismissed)
     -- -- confirm_action() checks this is still NULL before placing a real
     -- order, so double-tapping "Order this" (or replaying an old action_card
@@ -516,3 +522,45 @@ CREATE TABLE IF NOT EXISTS commerce_actions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_commerce_actions_user ON commerce_actions (user_id, created_at DESC);
+-- Added after commerce_actions already existed in deployed databases --
+-- CREATE TABLE IF NOT EXISTS above is a no-op there, so the column needs
+-- its own explicit, idempotent migration statement.
+ALTER TABLE commerce_actions ADD COLUMN IF NOT EXISTS payment_ref TEXT;
+
+-- ============================================================================
+-- Object storage (Cloudflare R2) -- profile pictures + chat/DM attachments.
+-- See MEDIA_STORAGE_PLAN.md and storage.py. Gated behind R2_STORAGE_ENABLED
+-- in .env, same as the Swiggy feature above -- these columns are always
+-- present but simply stay NULL on any deployment that hasn't configured R2.
+-- ============================================================================
+ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture_url TEXT;
+
+ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT;
+ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS attachment_type TEXT;
+-- Inline base64 data: URL (a few KB -- a small downscaled JPEG), NOT an R2
+-- reference -- lives in Postgres specifically so it keeps rendering even
+-- after the full-resolution R2 object expires via an Object Lifecycle Rule.
+ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS thumbnail_data_url TEXT;
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT;
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment_type TEXT;
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS thumbnail_data_url TEXT;
+
+-- Cognitive Sharing attachment summaries (see
+-- emotional_intelligence/COGNITIVE_SHARING_INTERVENTION_PLAN.md): a 20-30
+-- word LLM summary of a shared document's content, generated only when both
+-- people in a DM pair have Cognitive Sharing turned on (>= 'limited') -- see
+-- app.py's _generate_attachment_summary. NULL whenever the gate isn't open,
+-- the attachment isn't a summarizable document type, or summarization fails.
+-- DM-only: cognitive_sharing_settings is inherently pairwise, so this has no
+-- meaningful equivalent on chat_messages (the solo AI Q&A thread).
+ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS attachment_summary TEXT;
+
+-- Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) -- the
+-- `chat_tone` signal: a single classification word for the most recently
+-- finished /chat/global exchange, set by POST /chat/global/wrap-up.
+-- Deliberately just the latest value, not a history table -- only "what's
+-- true right now" matters for the home screen, gated by recency at read
+-- time in GET /me/home-signals.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_tone TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_tone_at TIMESTAMPTZ;

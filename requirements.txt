@@ -18,3 +18,6 @@ numpy
 sarvamai
 Pillow
 httpx
+boto3
+pypdf
+python-docx

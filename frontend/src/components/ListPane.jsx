@@ -2,7 +2,7 @@ import { SearchIcon } from '../icons.jsx';
 
 export default function ListPane({ title, headerAction, search, emptyText, fab, children }) {
   return (
-    <div className="list-pane">
+    <div className="list-pane" role="region" aria-label={title}>
       <div className="list-header">
         <h1>{title}</h1>
         {headerAction}
@@ -10,8 +10,11 @@ export default function ListPane({ title, headerAction, search, emptyText, fab, 
       {search && (
         <div className="search-box">
           <div className="search-box-wrap">
-            <SearchIcon />
-            <input placeholder={search.placeholder || 'Search'} value={search.value} onChange={(e) => search.onChange(e.target.value)} />
+            <SearchIcon aria-hidden="true" />
+            <input
+              placeholder={search.placeholder || 'Search'} aria-label={search.placeholder || 'Search'}
+              value={search.value} onChange={(e) => search.onChange(e.target.value)}
+            />
           </div>
         </div>
       )}

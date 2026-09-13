@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import secrets
 from urllib.parse import urlencode
 
@@ -52,9 +53,19 @@ def generate_pkce_pair() -> tuple[str, str]:
 
 
 def discover_metadata(server: str) -> dict:
-    """RFC 8414 authorization server metadata. Explicit env overrides
+    """Real-world MCP servers (confirmed live against mcp.swiggy.com) don't
+    publish RFC 8414 metadata at a fixed guessable path on their own base
+    URL -- they follow the MCP Authorization spec's actual flow: an
+    unauthenticated request to the resource server returns 401 with a
+    `WWW-Authenticate: Bearer ... resource_metadata="<url>"` header, which
+    points to an RFC 9728 Protected Resource Metadata document; THAT
+    document's `authorization_servers` list names the real authorization
+    server(s), each of which then publishes RFC 8414 metadata at ITS OWN
+    `.well-known/oauth-authorization-server`. Explicit env overrides
     (SWIGGY_<SERVER>_AUTHORIZE_URL / _TOKEN_URL / _REGISTRATION_URL) win
-    outright, in case a deployment needs to skip discovery entirely."""
+    outright and skip all of this, for when discovery itself is unreliable
+    (confirmed live: Swiggy's advertised resource_metadata URL currently
+    404s -- see SWIGGY_MCP_COGNITIVE_COMMERCE_PLAN.md)."""
     prefix = f"SWIGGY_{server.upper()}"
     authorize, token = os.getenv(f"{prefix}_AUTHORIZE_URL"), os.getenv(f"{prefix}_TOKEN_URL")
     if authorize and token:
@@ -63,9 +74,27 @@ def discover_metadata(server: str) -> dict:
             "token_endpoint": token,
             "registration_endpoint": os.getenv(f"{prefix}_REGISTRATION_URL"),
         }
-    resp = requests.get(f"{base_url(server)}/.well-known/oauth-authorization-server", timeout=10)
-    resp.raise_for_status()
-    meta = resp.json()
+
+    probe = requests.get(base_url(server), timeout=10)
+    if probe.status_code != 401 or "WWW-Authenticate" not in probe.headers:
+        raise RuntimeError(
+            f"Expected a 401 with a WWW-Authenticate challenge from {base_url(server)}, "
+            f"got {probe.status_code}. Set {prefix}_AUTHORIZE_URL/{prefix}_TOKEN_URL "
+            f"explicitly instead of relying on discovery."
+        )
+    match = re.search(r'resource_metadata="([^"]+)"', probe.headers["WWW-Authenticate"])
+    if not match:
+        raise RuntimeError(f"No resource_metadata in WWW-Authenticate header from {base_url(server)}.")
+
+    resource_resp = requests.get(match.group(1), timeout=10)
+    resource_resp.raise_for_status()
+    auth_servers = resource_resp.json().get("authorization_servers") or []
+    if not auth_servers:
+        raise RuntimeError(f"No authorization_servers listed at {match.group(1)}.")
+
+    as_resp = requests.get(f"{auth_servers[0].rstrip('/')}/.well-known/oauth-authorization-server", timeout=10)
+    as_resp.raise_for_status()
+    meta = as_resp.json()
     return {
         "authorization_endpoint": meta["authorization_endpoint"],
         "token_endpoint": meta["token_endpoint"],
@@ -106,6 +135,16 @@ def get_or_register_client(cur, server: str) -> dict:
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
                 "client_name": "Throughline",
+                # RFC 7591 marks these optional, but a real MCP-client bug
+                # report (github.com/anthropics/claude-code/issues/52565)
+                # shows consent flows breaking when they're absent/null --
+                # the consent screen likely renders the requesting app's
+                # name/version and silently fails without them, which would
+                # surface as exactly the vague "Invalid consent session"
+                # error seen live against Swiggy. Cheap to always send.
+                "client_uri": "https://throughline.app",
+                "software_id": "throughline-swiggy-mcp",
+                "software_version": "1.0.0",
             },
             timeout=10,
         )
@@ -145,7 +184,14 @@ def _decrypt_or_none(value):
     return crypto_utils.decrypt(value)
 
 
-def build_authorize_url(client_id: str, authorize_endpoint: str, state: str, code_challenge: str) -> str:
+def build_authorize_url(client_id: str, authorize_endpoint: str, state: str, code_challenge: str, resource: str = None) -> str:
+    # Matches Swiggy's own documented example (mcp.swiggy.com/builders/docs/
+    # start/authenticate/) exactly -- response_type, client_id, redirect_uri,
+    # code_challenge(+method), state, scope. No `resource` param in their
+    # docs (the earlier RFC 8707 addition was speculative, based on the
+    # general MCP Authorization spec, not Swiggy's actual contract -- kept
+    # as an accepted-but-unused arg in case it turns out to matter later,
+    # never sent unless explicitly passed).
     params = {
         "response_type": "code",
         "client_id": client_id,
@@ -153,29 +199,40 @@ def build_authorize_url(client_id: str, authorize_endpoint: str, state: str, cod
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "scope": "mcp:tools",
     }
+    if resource:
+        params["resource"] = resource
     return f"{authorize_endpoint}?{urlencode(params)}"
 
 
-def exchange_code(token_endpoint: str, client_id: str, client_secret, code: str, code_verifier: str) -> dict:
+def exchange_code(token_endpoint: str, client_id: str, client_secret, code: str, code_verifier: str, resource: str = None) -> dict:
+    # Body shape matches Swiggy's documented curl example exactly:
+    # {grant_type, code, code_verifier, redirect_uri} -- no client_id/
+    # resource in their example. client_secret still included when present
+    # (confidential clients) since the doc's example is for a public client.
     data = {
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": redirect_uri(),
-        "client_id": client_id,
         "code_verifier": code_verifier,
     }
     if client_secret:
+        data["client_id"] = client_id
         data["client_secret"] = client_secret
-    resp = requests.post(token_endpoint, data=data, timeout=10)
+    resp = requests.post(token_endpoint, json=data, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 
-def refresh_access_token(token_endpoint: str, client_id: str, client_secret, refresh_token: str) -> dict:
+def refresh_access_token(token_endpoint: str, client_id: str, client_secret, refresh_token: str, resource: str = None) -> dict:
+    # NOTE: Swiggy's docs explicitly say refresh_token issuance/exchange is
+    # NOT wired in v1.0 despite being advertised in their metadata -- this
+    # will currently fail server-side. _ensure_fresh_token treats an absent
+    # refresh capability as "re-run full authorization", not a hard error.
     data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
     if client_secret:
         data["client_secret"] = client_secret
-    resp = requests.post(token_endpoint, data=data, timeout=10)
+    resp = requests.post(token_endpoint, json=data, timeout=10)
     resp.raise_for_status()
     return resp.json()

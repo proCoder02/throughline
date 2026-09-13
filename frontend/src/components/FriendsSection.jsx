@@ -1,7 +1,16 @@
 import { useEffect, useState } from 'react';
+import UseAnimations from 'react-useanimations';
+import userPlus from 'react-useanimations/lib/userPlus';
 import ListPane from './ListPane.jsx';
+import LoadingSpinner from './LoadingSpinner.jsx';
+import ContextMenu from './ContextMenu.jsx';
+import Avatar from './Avatar.jsx';
+import PhotoViewer from './PhotoViewer.jsx';
 import { BackIcon, TrashIcon, PencilIcon, PhoneIcon, ChatIcon, CheckIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
+import { showToast, confirmDialog } from '../lib/notify.js';
+import { onEnterOrSpace } from '../lib/a11y.js';
+import { useLongPress } from '../hooks/useLongPress.js';
 import DirectMessageThread from './DirectMessageThread.jsx';
 
 // WhatsApp/Telegram-style: today's time, "Yesterday", or a short date for
@@ -39,6 +48,8 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
   // (opened via the message button) -- mirrors the Flutter client's
   // DirectMessageScreen for the latter.
   const [view, setView] = useState('profile');
+  const [rowMenu, setRowMenu] = useState(null); // {x, y, friend} for the long-press quick-action menu
+  const bindLongPress = useLongPress();
   const [callHistory, setCallHistory] = useState(null);
   const [mood, setMood] = useState(null);
   const [sharing, setSharing] = useState(null); // {my_level, both_enabled}
@@ -47,6 +58,9 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
   const [status, setStatus] = useState('');
   const [renaming, setRenaming] = useState(false);
   const [nicknameDraft, setNicknameDraft] = useState('');
+  // WhatsApp-style full-screen profile-picture viewer for the big avatar
+  // below -- see DirectMessageThread's identical use of PhotoViewer.
+  const [viewingPhoto, setViewingPhoto] = useState(false);
   // Group-call picker: toggled from the header, turns each row into a
   // checkbox instead of opening their mood detail.
   const [pickingCall, setPickingCall] = useState(false);
@@ -114,7 +128,13 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
   };
 
   const removeFriend = async (f) => {
-    if (!confirm(`Remove ${f.username} from your friends? This cannot be undone.`)) return;
+    const ok = await confirmDialog({
+      title: `Remove ${f.username}?`,
+      message: 'This cannot be undone.',
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
     await del(`/friends/${f.id}`);
     if (selected?.id === f.id) setSelected(null);
     load();
@@ -134,7 +154,7 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
 
   const callFriend = (e, friendId) => {
     e.stopPropagation();
-    onStartCall?.([friendId]).catch((err) => alert('Could not start call: ' + err.message));
+    onStartCall?.([friendId]).catch((err) => showToast('Could not start call: ' + err.message, 'error'));
   };
 
   const toggleCallSelection = (friendId) => {
@@ -146,7 +166,7 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
     const ids = callSelection;
     setPickingCall(false);
     setCallSelection([]);
-    onStartCall?.(ids).catch((err) => alert('Could not start call: ' + err.message));
+    onStartCall?.(ids).catch((err) => showToast('Could not start call: ' + err.message, 'error'));
   };
 
   return (
@@ -177,9 +197,15 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
           <div
             key={f.id}
             className={'row' + (!pickingCall && selected?.id === f.id ? ' active' : '')}
+            role="button" tabIndex={0}
+            aria-label={pickingCall
+              ? `${callSelection.includes(f.id) ? 'Deselect' : 'Select'} ${f.nickname || f.username} for group call`
+              : `Friend: ${f.nickname || f.username}`}
             onClick={() => (pickingCall ? toggleCallSelection(f.id) : openFriend(f))}
+            onKeyDown={onEnterOrSpace(() => (pickingCall ? toggleCallSelection(f.id) : openFriend(f)))}
+            {...(pickingCall ? {} : bindLongPress((x, y) => setRowMenu({ x, y, friend: f })))}
           >
-            <span className="avatar">{(f.nickname || f.username)[0]}</span>
+            <Avatar url={f.profile_picture_url} name={f.nickname || f.username} />
             <div className="row-main">
               <div className="row-top"><span className="row-title">{f.nickname || f.username}</span></div>
               <div className="row-sub">{formatLastCallSubtitle(f)}</div>
@@ -188,11 +214,17 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
               callSelection.includes(f.id) && <CheckIcon />
             ) : (
               <>
-                <button className="conv-link-btn dm-chat-btn" title={`Message ${f.nickname || f.username}`} onClick={(e) => openChat(e, f)}>
+                <button
+                  className="conv-link-btn dm-chat-btn" title={`Message ${f.nickname || f.username}`}
+                  aria-label={`Message ${f.nickname || f.username}`} onClick={(e) => openChat(e, f)}
+                >
                   <ChatIcon />
                   {notify.dmUnreadCounts[f.id] > 0 && <span className="dm-badge">{notify.dmUnreadCounts[f.id]}</span>}
                 </button>
-                <button className="conv-link-btn" title={`Call ${f.nickname || f.username}`} onClick={(e) => callFriend(e, f.id)}>
+                <button
+                  className="conv-link-btn" title={`Call ${f.nickname || f.username}`}
+                  aria-label={`Call ${f.nickname || f.username}`} onClick={(e) => callFriend(e, f.id)}
+                >
                   <PhoneIcon />
                 </button>
               </>
@@ -207,19 +239,60 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
           </div>
         )}
       </ListPane>
+      {rowMenu && (
+        <ContextMenu
+          x={rowMenu.x} y={rowMenu.y} onClose={() => setRowMenu(null)}
+          items={[
+            {
+              label: `Message ${rowMenu.friend.nickname || rowMenu.friend.username}`, icon: <ChatIcon />,
+              onSelect: () => { setSelected(rowMenu.friend); setView('chat'); },
+            },
+            {
+              label: `Call ${rowMenu.friend.nickname || rowMenu.friend.username}`, icon: <PhoneIcon />,
+              onSelect: () => onStartCall?.([rowMenu.friend.id]).catch((err) => showToast('Could not start call: ' + err.message, 'error')),
+            },
+            { label: 'Remove friend', icon: <TrashIcon />, danger: true, onSelect: () => removeFriend(rowMenu.friend) },
+          ]}
+        />
+      )}
       {view === 'chat' && selected ? (
-        <DirectMessageThread friend={selected} myUserId={myUserId} notify={notify} onBack={() => setSelected(null)} />
+        <DirectMessageThread
+          friend={selected}
+          myUserId={myUserId}
+          notify={notify}
+          onBack={() => setSelected(null)}
+          onViewProfile={() => setView('profile')}
+        />
+      ) : !selected ? (
+        <div className="chat-panel empty">
+          <div className="empty-state">
+            <UseAnimations animation={userPlus} size={110} autoplay loop strokeColor="#1FC8B4" />
+            <div className="empty-state-text">Select a friend to see their profile.</div>
+          </div>
+        </div>
       ) : (
       <div className="detail-pane detail-view" style={{ flex: 1 }}>
-        {selected ? (
           <div className="detail-card">
             <button className="back-btn" title="Back" onClick={() => setSelected(null)}><BackIcon /></button>
 
             {/* Header: big centered avatar + name, WhatsApp-contact-screen style */}
             <div style={{ textAlign: 'center', margin: '4px 0 16px' }}>
-              <span className="avatar lg" style={{ fontSize: 24, margin: '0 auto 10px' }}>
-                {(selected.nickname || selected.username)[0]}
-              </span>
+              {selected.profile_picture_url ? (
+                <button
+                  className="avatar-view-btn" title="View profile picture" aria-label="View profile picture"
+                  style={{ display: 'block', margin: '0 auto 10px' }} onClick={() => setViewingPhoto(true)}
+                >
+                  <Avatar
+                    url={selected.profile_picture_url} name={selected.nickname || selected.username}
+                    size="lg" style={{ fontSize: 24, margin: 0 }}
+                  />
+                </button>
+              ) : (
+                <Avatar
+                  url={selected.profile_picture_url} name={selected.nickname || selected.username}
+                  size="lg" style={{ fontSize: 24, margin: '0 auto 10px' }}
+                />
+              )}
               {renaming ? (
                 <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
                   <input
@@ -300,14 +373,14 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
                   ))}
                 </>
               ) : (
-                <div className="hint" style={{ marginTop: 0 }}>Loading…</div>
+                <LoadingSpinner />
               )}
             </div>
 
             <div className="profile-section">
               <div className="profile-section-title">Mood</div>
               {mood === null ? (
-                <div className="hint" style={{ marginTop: 0 }}>Loading…</div>
+                <LoadingSpinner />
               ) : mood?.emoji ? (
                 <div className="mood-compiled">
                   <div className="mood-compiled-emoji">{mood.emoji}</div>
@@ -323,7 +396,7 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
             <div className="profile-section">
               <div className="profile-section-title">Calls</div>
               {callHistory === null ? (
-                <div className="hint" style={{ marginTop: 0 }}>Loading…</div>
+                <LoadingSpinner />
               ) : callHistory.length ? (
                 callHistory.map((c) => (
                   <div key={c.call_id} className="detail-meta-row">
@@ -337,10 +410,13 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
               ) : <div className="hint" style={{ marginTop: 0 }}>No calls yet.</div>}
             </div>
           </div>
-        ) : (
-          <div className="hint">Select a friend to see their profile.</div>
-        )}
       </div>
+      )}
+      {viewingPhoto && selected && (
+        <PhotoViewer
+          url={selected.profile_picture_url} name={selected.nickname || selected.username}
+          onClose={() => setViewingPhoto(false)}
+        />
       )}
     </>
   );

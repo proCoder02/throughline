@@ -1,0 +1,118 @@
+/* ============================================================
+   TAILWIND / SHADCN TOKEN BRIDGE
+
+   Every value here is a pure alias to an existing token already defined in
+   theme.css -- never a new literal. theme.css stays the single source of
+   truth (including its WCAG-corrected contrast values); this file only
+   gives Tailwind utility classes and shadcn/ui's generated component
+   source a name to read those same values through.
+
+   Two layers, matching shadcn's own v4 convention exactly (so `npx shadcn
+   add <component>` output works unmodified):
+   1. Plain CSS variables (--background, --foreground, ...) aliased to the
+      matching token in theme.css's --wa, --space, --radius, --shadow, and
+      --duration families. Some shadcn/Radix component source reads these
+      directly.
+   2. `@theme inline` maps Tailwind's own design tokens (--color-*,
+      --spacing-*, --radius-*, ...) to those same plain variables, which is
+      what makes `bg-background`, `text-foreground`, `rounded-lg` etc.
+      resolve to the real palette instead of Tailwind's Zinc/Slate default.
+
+   Because every aliased color already changes value when useTheme.js flips
+   `data-theme` on <html>, no separate Tailwind `dark:` variant handling is
+   needed for color utilities at all -- light/dark is still governed
+   entirely by theme.css, exactly as before this bridge existed.
+   ============================================================ */
+
+:root {
+  --background: var(--wa-bg-app);
+  --foreground: var(--wa-text);
+  --card: var(--wa-panel);
+  --card-foreground: var(--wa-text);
+  --popover: var(--wa-panel);
+  --popover-foreground: var(--wa-text);
+  --primary: var(--wa-accent-solid);
+  --primary-foreground: #ffffff;
+  --secondary: var(--wa-hover);
+  --secondary-foreground: var(--wa-text);
+  --muted: var(--wa-hover);
+  --muted-foreground: var(--wa-text-soft);
+  --accent: var(--wa-hover);
+  --accent-foreground: var(--wa-text);
+  --destructive: var(--wa-danger);
+  --destructive-foreground: #ffffff;
+  --border: var(--wa-border);
+  --input: var(--wa-border);
+  --ring: var(--wa-accent);
+  --radius: var(--radius-lg);
+}
+
+@theme inline {
+  /* Colors -- every shadcn-expected name, aliased above, surfaced as a
+     Tailwind color so bg-background/text-foreground/border-border/etc.
+     all work. */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Direct app-token aliases too (bg-panel, text-soft, etc.) -- for our
+     OWN new code to use the app's real names instead of shadcn's generic
+     ones where that reads more clearly. */
+  --color-panel: var(--wa-panel);
+  --color-bg-app: var(--wa-bg-app);
+  --color-hover: var(--wa-hover);
+  --color-text: var(--wa-text);
+  --color-text-soft: var(--wa-text-soft);
+  --color-wa-accent: var(--wa-accent);
+  --color-wa-accent-dark: var(--wa-accent-dark);
+  --color-danger: var(--wa-danger);
+  --color-online: var(--wa-online);
+
+  /* Radius -- shadcn primitives use calc(var(--radius) - Npx) expressions,
+     so --radius above must resolve to a real length. */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: var(--radius-2xl);
+
+  /* Spacing -- passthrough to the existing 4px-grid scale. */
+  --spacing-1: var(--space-1);
+  --spacing-2: var(--space-2);
+  --spacing-3: var(--space-3);
+  --spacing-4: var(--space-4);
+  --spacing-5: var(--space-5);
+  --spacing-6: var(--space-6);
+  --spacing-7: var(--space-7);
+  --spacing-8: var(--space-8);
+  --spacing-10: var(--space-10);
+
+  /* Motion -- passthrough so transition-* utilities match the app's own
+     three-speed system instead of Tailwind's defaults. */
+  --default-transition-duration: var(--duration-base);
+  --ease-standard: var(--ease-standard);
+  --ease-out: var(--ease-out);
+
+  /* Typography -- keep the same font already loaded in index.html. */
+  --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+}
+
+/* Rare shadcn/Radix primitive with a literal dark: class -- matches the
+   app's REAL mechanism (data-theme attribute), not Tailwind's default
+   .dark-class strategy, which this app never adds. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));

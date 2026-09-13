@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
 import { BackIcon, ChatIcon, TrashIcon, PencilIcon } from '../icons.jsx';
 import { apiJson, del, post } from '../api.js';
+import { confirmDialog } from '../lib/notify.js';
+import { onEnterOrSpace } from '../lib/a11y.js';
 
 export default function ProfilesSection({ onOpenConversation }) {
   const [profiles, setProfiles] = useState({});
@@ -23,7 +25,13 @@ export default function ProfilesSection({ onOpenConversation }) {
   const deleteProfile = async (label) => {
     const profileId = profiles[label]?.profile_id;
     if (!profileId) return;
-    if (!confirm(`Delete ${label}'s profile permanently? This removes every observation about them. This cannot be undone.`)) return;
+    const ok = await confirmDialog({
+      title: `Delete ${label}'s profile?`,
+      message: 'This removes every observation about them. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     await del(`/profiles/${profileId}`);
     if (selected === label) setSelected(null);
     load();
@@ -71,7 +79,11 @@ export default function ProfilesSection({ onOpenConversation }) {
         {labels.map((label) => {
           const p = profiles[label];
           return (
-            <div key={label} className={'row' + (label === selected ? ' active' : '')} onClick={() => setSelected(label)}>
+            <div
+              key={label} className={'row' + (label === selected ? ' active' : '')}
+              role="button" tabIndex={0} aria-label={`Profile: ${label}`}
+              onClick={() => setSelected(label)} onKeyDown={onEnterOrSpace(() => setSelected(label))}
+            >
               <span className="avatar">{label[0]}</span>
               <div className="row-main">
                 <div className="row-top"><span className="row-title">{label}</span></div>
@@ -106,10 +118,10 @@ export default function ProfilesSection({ onOpenConversation }) {
                 </div>
               ) : (
                 <div style={{ display: 'flex' }}>
-                  <button className="conv-link-btn" title="Rename profile" onClick={startRename}>
+                  <button className="conv-link-btn" title="Rename profile" aria-label="Rename profile" onClick={startRename}>
                     <PencilIcon />
                   </button>
-                  <button className="conv-link-btn" title="Delete profile" onClick={() => deleteProfile(selected)}>
+                  <button className="conv-link-btn" title="Delete profile" aria-label="Delete profile" onClick={() => deleteProfile(selected)}>
                     <TrashIcon />
                   </button>
                 </div>
@@ -123,6 +135,7 @@ export default function ProfilesSection({ onOpenConversation }) {
                   <button
                     className="conv-link-btn"
                     title="View source conversation"
+                    aria-label="View source conversation"
                     onClick={() => onOpenConversation?.(n.conversation_id)}
                   >
                     <ChatIcon />

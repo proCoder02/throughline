@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import MessageBubble from './MessageBubble.jsx';
+import MessageRow from './MessageRow.jsx';
 import Composer from './Composer.jsx';
 import ImageComposePreview from './ImageComposePreview.jsx';
-import { BackIcon, TrashIcon, MicIcon, CloseIcon } from '../icons.jsx';
+import InfoPanel from './InfoPanel.jsx';
+import { BackIcon, TrashIcon, MicIcon, CloseIcon, InfoIcon } from '../icons.jsx';
 
 export default function ChatThread({
   title, isLive, liveStatus, seenIndices = [], speakerNames,
@@ -18,6 +19,7 @@ export default function ChatThread({
   // Composer already owns its own in-progress text without the parent
   // knowing about every keystroke.
   const [pendingImage, setPendingImage] = useState(null);
+  const [infoOpen, setInfoOpen] = useState(false);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages.length]);
@@ -25,7 +27,7 @@ export default function ChatThread({
   return (
     <div className="chat-panel">
       <div className="chat-header">
-        <button className="back-btn" title="Back" onClick={onBack}><BackIcon /></button>
+        <button className="back-btn" title="Back" aria-label="Back to chat list" onClick={onBack}><BackIcon /></button>
         <span className="avatar">{(title || '?')[0]}</span>
         <div className="chat-header-info">
           <div className="chat-header-name">{title}</div>
@@ -34,7 +36,13 @@ export default function ChatThread({
           </div>
         </div>
         <div className="chat-header-actions">
-          {onDelete && <button title="Delete conversation" onClick={onDelete}><TrashIcon /></button>}
+          <button
+            title="Conversation info" aria-label="Conversation info" aria-pressed={infoOpen}
+            className={infoOpen ? 'active' : ''} onClick={() => setInfoOpen((v) => !v)}
+          >
+            <InfoIcon />
+          </button>
+          {onDelete && <button title="Delete conversation" aria-label="Delete conversation" onClick={onDelete}><TrashIcon /></button>}
         </div>
       </div>
 
@@ -60,10 +68,11 @@ export default function ChatThread({
 
       <div className="messages" ref={scrollRef}>
         {messages.map((m, i) => (
-          <MessageBubble
+          <MessageRow
             key={i}
-            role={m.role}
+            mine={m.role === 'user'}
             content={m.content}
+            formatted={m.role !== 'user'}
             imageUrl={m.imageUrl}
             actionCard={m.actionCard}
             onActionResolved={onActionResolved}
@@ -77,16 +86,14 @@ export default function ChatThread({
       {tags?.length > 0 && (
         <div className="topic-tags">
           {tags.map((tag) => (
-            <button key={tag} className="topic-tag" title={`Ask about "${tag}"`} onClick={() => onTagClick?.(tag)}>
-              <span>{tag}</span>
-              <span
-                className="topic-tag-x"
-                title="Dismiss"
-                onClick={(e) => { e.stopPropagation(); onDismissTag?.(tag); }}
-              >
+            <div key={tag} className="topic-tag">
+              <button className="topic-tag-label" title={`Ask about "${tag}"`} aria-label={`Ask about ${tag}`} onClick={() => onTagClick?.(tag)}>
+                {tag}
+              </button>
+              <button className="topic-tag-x" title="Dismiss" aria-label={`Dismiss "${tag}"`} onClick={() => onDismissTag?.(tag)}>
                 <CloseIcon />
-              </span>
-            </button>
+              </button>
+            </div>
           ))}
         </div>
       )}
@@ -110,8 +117,9 @@ export default function ChatThread({
           extraButton={onListen && (
             <button
               className="send-btn"
-              style={isLive ? { background: '#EA0038' } : undefined}
+              style={isLive ? { background: 'var(--wa-danger)' } : undefined}
               title={isLive ? 'Stop listening' : 'Resume listening on this conversation'}
+              aria-label={isLive ? 'Stop listening' : 'Resume listening on this conversation'}
               onClick={isLive ? onStopListen : onListen}
             >
               <MicIcon />
@@ -119,6 +127,19 @@ export default function ChatThread({
           )}
         />
       )}
+
+      <InfoPanel open={infoOpen} onClose={() => setInfoOpen(false)} title="Conversation info">
+        <div className="detail-title" style={{ fontSize: 15 }}>{title}</div>
+        {subtitle && <div className="hint" style={{ marginTop: 4 }}>{subtitle}</div>}
+        {tags?.length > 0 && (
+          <div className="profile-section" style={{ borderTop: 'none', marginTop: 16, paddingTop: 0 }}>
+            <div className="profile-section-title">Topics</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {tags.map((tag) => <span key={tag} className="topic-tag" style={{ cursor: 'default' }}>{tag}</span>)}
+            </div>
+          </div>
+        )}
+      </InfoPanel>
     </div>
   );
 }

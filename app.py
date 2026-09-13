@@ -472,6 +472,24 @@ def compute_compiled_mood(cur, user_id, bucket_start, bucket_end):
     return {"mood_label": label, "emoji": MOOD_EMOJI.get((label or "").lower(), DEFAULT_MOOD_EMOJI)}
 
 
+# Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) --
+# collapses the 8 raw mood_label values into the 4 coarse buckets the
+# Flutter client's MotionProfile table actually branches on. A label this
+# map doesn't recognize (future new label, typo) intentionally falls
+# through to None rather than guessing -- the home screen's default motion
+# is always a safe fallback, never a wrong guess dressed up as a real one.
+_MOOD_BUCKET_MAP = {
+    "happy": "positive", "excited": "positive", "calm": "positive",
+    "neutral": "neutral",
+    "sad": "low",
+    "stressed": "stressed", "anxious": "stressed", "frustrated": "stressed",
+}
+
+
+def mood_label_to_bucket(label):
+    return _MOOD_BUCKET_MAP.get((label or "").lower())
+
+
 def notify_friends_of_mood_update(user_id, mood_label, friend_ids):
     """Pushed once per 2-hour compiled window per friend (see the
     is-first-in-bucket check at each call site), not on every single
@@ -981,7 +999,7 @@ def login():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT id, username, password_hash FROM users WHERE username = %s",
+        "SELECT id, username, password_hash, profile_picture_url FROM users WHERE username = %s",
         (username,),
     )
     row = cur.fetchone()
@@ -994,6 +1012,7 @@ def login():
     return jsonify({
         "id": row["id"],
         "username": row["username"],
+        "profile_picture_url": row["profile_picture_url"],
         "token": generate_token(row["id"], row["username"]),
     })
 
@@ -1004,19 +1023,48 @@ def logout():
     return jsonify({"ok": True})
 
 
+CHAT_TONE_MAX_AGE = timedelta(hours=3)
+
+
+@app.route("/me/home-signals", methods=["GET"])
+@login_required
+def get_home_signals():
+    """Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) --
+    the only two server-derived signals the Flutter client's MotionProfile
+    table branches on. Deliberately just two plain strings (or null), never
+    an animation spec -- the client decides what "positive" or "resolved"
+    actually looks like on screen."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    bucket_start, bucket_end = mood_bucket_bounds()
+    compiled = compute_compiled_mood(cur, user_id, bucket_start, bucket_end)
+    mood_bucket = mood_label_to_bucket(compiled["mood_label"]) if compiled else None
+
+    cur.execute("SELECT last_chat_tone, last_chat_tone_at FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    chat_tone = None
+    if row and row["last_chat_tone"] and row["last_chat_tone_at"]:
+        if datetime.now(timezone.utc) - row["last_chat_tone_at"] <= CHAT_TONE_MAX_AGE:
+            chat_tone = row["last_chat_tone"]
+
+    return jsonify({"mood_bucket": mood_bucket, "chat_tone": chat_tone})
+
+
 @app.route("/me", methods=["GET"])
 def me():
     user_id = authenticated_user_id()
     if not user_id:
         return jsonify({"error": "Not authenticated"}), 401
     username = session.get("username")
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT username, profile_picture_url FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
     if not username:
-        db = get_db()
-        cur = dict_cursor(db)
-        cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
-        row = cur.fetchone()
         username = row["username"] if row else None
-    return jsonify({"id": user_id, "username": username})
+    return jsonify({"id": user_id, "username": username, "profile_picture_url": row["profile_picture_url"] if row else None})
 
 
 @app.route("/settings", methods=["GET"])
@@ -1025,10 +1073,15 @@ def get_settings():
     db = get_db()
     cur = dict_cursor(db)
     user_id = current_user_id()
-    cur.execute("SELECT personalization FROM users WHERE id = %s", (user_id,))
-    personalization = normalize_personalization(cur.fetchone()["personalization"])
+    cur.execute("SELECT personalization, profile_picture_url FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    personalization = normalize_personalization(row["personalization"])
     friend_code = get_or_create_friend_code(db, cur, user_id)
-    return jsonify({"personalization": personalization, "friend_code": friend_code})
+    return jsonify({
+        "personalization": personalization,
+        "friend_code": friend_code,
+        "profile_picture_url": row["profile_picture_url"],
+    })
 
 
 @app.route("/settings", methods=["POST"])
@@ -2156,8 +2209,16 @@ _NEARBY_CATEGORY_TAGS = {
     "store": ('["shop"]', ("node", "way")),
     "mall": ('["shop"="mall"]', ("node", "way")),
     "restaurant": ('["amenity"="restaurant"]', ("node", "way")),
-    "food": ('["amenity"="restaurant"]', ("node", "way")),
-    "eat": ('["amenity"="restaurant"]', ("node", "way")),
+    # "food"/"eat" deliberately excluded -- both are too generic (any
+    # sentence mentioning food at all would false-positive) and, since
+    # Cognitive Commerce shipped, directly collide with its own "order
+    # food" trigger phrase: that message doesn't need GPS lat/lon at all
+    # (Swiggy resolves the user's own saved account address), so the two
+    # features were firing simultaneously with contradictory instructions
+    # -- confirmed live: real Swiggy menu items came back correctly, but
+    # this block ALSO told the LLM "no location provided, ask for it",
+    # and the reply blended both into a confused non-answer. "restaurant"
+    # above still covers the deliberate OSM-lookup case.
     "cafe": ('["amenity"="cafe"]', ("node", "way")),
     "coffee": ('["amenity"="cafe"]', ("node", "way")),
     "park": ('["leisure"="park"]', ("node", "way")),
@@ -3415,7 +3476,7 @@ def list_friends():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT users.id, users.username, friendships.nickname FROM friendships "
+        "SELECT users.id, users.username, users.profile_picture_url, friendships.nickname, friendships.created_at AS friends_since FROM friendships "
         "JOIN users ON users.id = friendships.friend_id "
         "WHERE friendships.user_id = %s ORDER BY COALESCE(friendships.nickname, users.username)",
         (user_id,),
@@ -3459,6 +3520,8 @@ def list_friends():
         f["last_call_at"] = last["last_call_at"].isoformat() if last else None
         f["last_call_outgoing"] = last["outgoing"] if last else None
         f["call_count"] = call_counts.get(f["id"], 0)
+        if f.get("friends_since"):
+            f["friends_since"] = f["friends_since"].isoformat()
 
     return jsonify(friends)
 
@@ -3861,6 +3924,74 @@ def latest_digest():
     return jsonify({"digest": digest})
 
 
+ATTACHMENT_SUMMARY_MAX_CHARS = 6000
+ATTACHMENT_SUMMARY_MAX_WORDS = 30
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _extract_document_text(file_bytes, attachment_type):
+    """Best-effort text extraction for the Cognitive Sharing attachment-
+    summary feature below -- supports the document types worth summarizing
+    (PDF, Word, plain text); anything else (old binary .doc, zip, images,
+    unknown) returns None rather than raising, since a missing summary is a
+    fine degraded outcome but a broken message send is not."""
+    try:
+        if attachment_type == "application/pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            return "\n".join((page.extract_text() or "") for page in reader.pages[:20])
+        if attachment_type == _DOCX_MIME:
+            import docx
+            document = docx.Document(io.BytesIO(file_bytes))
+            return "\n".join(p.text for p in document.paragraphs)
+        if attachment_type.startswith("text/"):
+            return file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    return None
+
+
+def _generate_attachment_summary(attachment_url, attachment_type):
+    """Cognitive Sharing add-on (see
+    emotional_intelligence/COGNITIVE_SHARING_INTERVENTION_PLAN.md): when
+    both people in a DM pair have sharing turned on, a shared document gets
+    a short 20-30 word summary so the recipient knows what it is without
+    opening it. The caller (send_direct_message) already checked the
+    bilateral gate and already committed the message row -- this is
+    deliberately best-effort end to end (download failure, unsupported
+    file type, or LLM error all just mean no summary, never a failed send)."""
+    import storage
+    key = storage.key_from_public_url(attachment_url)
+    if not key:
+        return None
+    file_bytes = storage.download_object(key)
+    if not file_bytes:
+        return None
+    text = _extract_document_text(file_bytes, attachment_type or "")
+    if not text or not text.strip():
+        return None
+
+    try:
+        reply = call_llm([
+            {"role": "system", "content": (
+                "Reply with ONLY a short summary of the document text below -- "
+                "20 to 30 words maximum, a single snippet of plain prose, no "
+                "quotes, no markdown, no preamble like 'This document is about'."
+            )},
+            {"role": "user", "content": text[:ATTACHMENT_SUMMARY_MAX_CHARS]},
+        ])
+    except Exception:
+        return None
+
+    summary = (reply or "").strip().strip('"').strip("'")
+    if not summary:
+        return None
+    words = summary.split()
+    if len(words) > ATTACHMENT_SUMMARY_MAX_WORDS:
+        summary = " ".join(words[:ATTACHMENT_SUMMARY_MAX_WORDS]).rstrip(",.;:") + "…"
+    return summary
+
+
 @app.route("/friends/<int:friend_id>/messages", methods=["GET"])
 @login_required
 def list_direct_messages(friend_id):
@@ -3884,7 +4015,8 @@ def list_direct_messages(friend_id):
         extra = "AND direct_messages.id < %(before_id)s"
         params["before_id"] = before_id
     cur.execute(
-        f"SELECT id, sender_id, recipient_id, content, created_at, delivered_at, read_at FROM direct_messages "
+        f"SELECT id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
+        f"attachment_url, attachment_type, thumbnail_data_url, attachment_summary FROM direct_messages "
         f"WHERE ((sender_id = %(me)s AND recipient_id = %(friend)s) "
         f"OR (sender_id = %(friend)s AND recipient_id = %(me)s)) {extra} "
         f"ORDER BY id DESC LIMIT %(limit)s",
@@ -3900,8 +4032,21 @@ def list_direct_messages(friend_id):
 def send_direct_message(friend_id):
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
-    if not content:
+    # Object storage (Cloudflare R2) attachment fields -- all optional and
+    # independent of R2_STORAGE_ENABLED itself (a plain text message must
+    # keep working even on a deployment that's never configured R2; this
+    # route just stores whatever URL it's handed, it never talks to R2
+    # directly -- see /uploads/confirm for where that actually happens).
+    # An attachment lets `content` be empty (an image/file with no
+    # caption), matching WhatsApp/Telegram -- but a message needs at least
+    # one of the two.
+    attachment_url = (data.get("attachment_url") or "").strip() or None
+    attachment_type = (data.get("attachment_type") or "").strip() or None
+    thumbnail_data_url = data.get("thumbnail_data_url") or None
+    if not content and not attachment_url:
         return jsonify({"error": "content is required"}), 400
+    if thumbnail_data_url and len(thumbnail_data_url) > 60_000:
+        return jsonify({"error": "thumbnail_data_url is too large"}), 400
 
     user_id = current_user_id()
     db = get_db()
@@ -3911,12 +4056,35 @@ def send_direct_message(friend_id):
         return jsonify({"error": "Not friends with that user"}), 403
 
     cur.execute(
-        "INSERT INTO direct_messages (sender_id, recipient_id, content) VALUES (%s, %s, %s) "
-        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at",
-        (user_id, friend_id, content),
+        "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, thumbnail_data_url) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
+        "attachment_url, attachment_type, thumbnail_data_url",
+        (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url),
     )
     message = serialize_row(cur.fetchone())
     db.commit()
+
+    # Cognitive Sharing attachment summary -- only for a real document (not
+    # a photo/video, which already render inline) and only when both sides
+    # of this DM pair have sharing turned on (>= 'limited'). Runs after the
+    # message is already committed so a slow/failed summary never delays or
+    # breaks the send itself.
+    if attachment_url and attachment_type and not attachment_type.startswith(("image/", "video/")):
+        my_level, their_level = _cognitive_sharing_levels(cur, user_id, friend_id)
+        if (_COGNITIVE_SHARING_RANK[my_level] >= _COGNITIVE_SHARING_RANK["limited"]
+                and _COGNITIVE_SHARING_RANK[their_level] >= _COGNITIVE_SHARING_RANK["limited"]):
+            try:
+                summary = _generate_attachment_summary(attachment_url, attachment_type)
+            except Exception:
+                summary = None
+            if summary:
+                cur.execute(
+                    "UPDATE direct_messages SET attachment_summary = %s WHERE id = %s",
+                    (summary, message["id"]),
+                )
+                db.commit()
+                message["attachment_summary"] = summary
 
     cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
     sender_name = cur.fetchone()["username"]
@@ -3927,21 +4095,27 @@ def send_direct_message(friend_id):
     # the client can show a real name in a foreground local notification
     # without a separate lookup (mirrors the FCM title below).
     push_notification(friend_id, {"type": "direct_message", "message": message, "sender_username": sender_name})
+    fcm_body = content or {"image": "📷 Photo", "video": "🎥 Video"}.get(attachment_type, "📎 Attachment")
     send_fcm_to_user(
-        friend_id, title=sender_name, body=content,
+        friend_id, title=sender_name, body=fcm_body,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message["id"])},
     )
 
-    try:
-        # Feeds the same cognitive-intelligence pipeline /chat and
-        # /chat/global already trigger after every message -- a correction
-        # or new fact stated to a friend ("actually I start the new job
-        # Monday, not next week") is exactly the kind of thing that pipeline
-        # already looks for, regardless of which surface it was said on.
-        from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
-        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, content), daemon=True).start()
-    except Exception:
-        pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
+    if content:
+        # An attachment sent with no caption has nothing for the extraction
+        # LLM to work with -- skip the call entirely rather than spend one
+        # on an empty prompt, same reasoning /chat/global/image already
+        # applies to its own description field.
+        try:
+            # Feeds the same cognitive-intelligence pipeline /chat and
+            # /chat/global already trigger after every message -- a correction
+            # or new fact stated to a friend ("actually I start the new job
+            # Monday, not next week") is exactly the kind of thing that pipeline
+            # already looks for, regardless of which surface it was said on.
+            from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
+            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, content), daemon=True).start()
+        except Exception:
+            pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
 
     return jsonify(message)
 
@@ -4585,7 +4759,36 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
+    base += _commerce_safety_guardrail()
     return base + (f" {persona_context}" if persona_context else "")
+
+
+def _commerce_safety_guardrail() -> str:
+    """Always-on instruction, not conditional on whether THIS message
+    matched the food-order intent regex -- confirmed live that leaving this
+    guidance only inside the per-message commerce_context block (which is
+    absent on any follow-up turn, e.g. "yes place it") let the model
+    hallucinate a full fake "Order placed!" confirmation, complete with an
+    invented item/price/ETA, with no real /commerce/swiggy/confirm call
+    ever happening. This must survive every turn of the conversation, not
+    just the one where real Swiggy results were fetched."""
+    try:
+        from commerce.swiggy_adapter import is_enabled
+        if not is_enabled():
+            return ""
+    except Exception:
+        return ""
+    return (
+        " You have NO ability to place, confirm, cancel, or check the status of any real "
+        "order, reservation, or payment yourself -- that only ever happens through the app's "
+        "own action-card buttons, which the user taps directly. NEVER say or imply that an "
+        "order was placed, confirmed, paid for, or is being delivered/tracked -- not even if "
+        "the user asks you to \"place it\", says \"yes\", or seems to expect confirmation. If "
+        "asked to order something, respond only by describing real options already given to "
+        "you (if any) and telling the user to use the action card's button, or that you can "
+        "look up options if they specify what they want -- never fabricate an order number, "
+        "price, ETA, or delivery/confirmation message of any kind."
+    )
 
 
 # Chat history lives permanently in the chat_messages table -- nothing here
@@ -5085,6 +5288,23 @@ def chat_global():
                 + "\n".join(f"- {o}" for o in observations)
             )
 
+    # Cognitive Commerce takes priority over the OSM nearby-places lookup
+    # whenever both could plausibly apply to the same message (e.g. "order
+    # food from a good restaurant" matches both this section's "restaurant"
+    # category AND commerce's own food-order intent) -- confirmed live that
+    # firing both at once produces genuinely contradictory LLM guidance
+    # (Swiggy found real menu items using the account's saved address,
+    # while this block ALSO said "no GPS location provided, ask for one",
+    # and the reply blended both into a confused non-answer). Swiggy never
+    # needs lat/lon at all, so there is nothing for this section to usefully
+    # add on top of a message commerce is already handling.
+    commerce_intent_present = False
+    try:
+        from commerce.swiggy_adapter import detect_intent as _detect_commerce_intent, is_enabled as _swiggy_enabled
+        commerce_intent_present = _swiggy_enabled() and _detect_commerce_intent(prompt_lower) is not None
+    except Exception:
+        commerce_intent_present = False
+
     # Location-aware "nearby" suggestions -- only fires an external API call
     # when the message actually looks like it's asking for one (intent
     # regex OR a recognized category keyword alone, e.g. "good trek spots?"
@@ -5094,7 +5314,7 @@ def chat_global():
     # geolocation yet degrades gracefully rather than erroring.
     nearby_context = ""
     category_filter = _detect_nearby_category(prompt_lower)
-    if category_filter or _NEARBY_INTENT_RE.search(prompt_lower):
+    if not commerce_intent_present and (category_filter or _NEARBY_INTENT_RE.search(prompt_lower)):
         if lat is None or lon is None:
             nearby_context = (
                 "The user asked about nearby places, but no location was provided with this "
@@ -5130,13 +5350,19 @@ def chat_global():
     commerce_context = ""
     action_card = None
     try:
-        from commerce.swiggy_adapter import build_commerce_context, detect_intent, is_enabled as swiggy_enabled
+        from commerce.swiggy_adapter import (
+            build_commerce_context, build_tracking_context, detect_intent,
+            is_enabled as swiggy_enabled, is_track_order_intent,
+        )
         if swiggy_enabled():
-            commerce_server = detect_intent(prompt_lower)
-            if commerce_server:
-                commerce_context, action_card = build_commerce_context(
-                    cur, db, user_id, prompt, commerce_server, ei_context
-                )
+            if is_track_order_intent(prompt_lower):
+                commerce_context, action_card = build_tracking_context(cur, db, user_id)
+            else:
+                commerce_server = detect_intent(prompt_lower)
+                if commerce_server:
+                    commerce_context, action_card = build_commerce_context(
+                        cur, db, user_id, prompt, commerce_server, ei_context
+                    )
     except Exception:
         commerce_context, action_card = "", None  # optional and additive, never affects this endpoint otherwise
 
@@ -5244,6 +5470,65 @@ def chat_global():
         "conversations_used": len(conversations),
         "action_card": action_card,
     })
+
+
+CHAT_TONE_VALUES = ("resolved", "celebratory", "heavy", "routine")
+CHAT_TONE_WRAPUP_MESSAGES = 8
+
+
+@app.route("/chat/global/wrap-up", methods=["POST"])
+@login_required
+def chat_global_wrap_up():
+    """Adaptive home-screen motion's `chat_tone` signal (see
+    ADAPTIVE_HOME_ANIMATION_PLAN.md) -- the client calls this once, best-
+    effort, when the global assistant chat screen closes after an exchange
+    actually happened this visit. Classifies the tail of the thread into
+    exactly one of CHAT_TONE_VALUES; anything else the model produces
+    (malformed JSON, an invented value, empty) is discarded rather than
+    stored, same discipline as every other LLM-output validation in this
+    file -- a missing classification is a fine degraded outcome, a garbled
+    one stored and later shown on the home screen would not be."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT role, content FROM chat_messages "
+        "WHERE user_id = %s AND conversation_id IS NULL "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, CHAT_TONE_WRAPUP_MESSAGES),
+    )
+    rows = list(reversed(cur.fetchall()))
+    # Fewer than 2 rows means at most a single unanswered message -- nothing
+    # resembling a finished exchange to classify yet.
+    if len(rows) < 2:
+        return jsonify({"ok": True, "tone": None})
+
+    transcript = "\n".join(f"{'You' if r['role'] == 'user' else 'Assistant'}: {r['content']}" for r in rows)
+    tone = None
+    try:
+        reply = call_llm([
+            {"role": "system", "content": (
+                "Classify the overall tone of the just-finished chat exchange below. "
+                "Reply with ONLY one of these four words, nothing else, no punctuation: "
+                "resolved, celebratory, heavy, routine."
+            )},
+            {"role": "user", "content": transcript},
+        ])
+        candidate = (reply or "").strip().lower().strip(".")
+        if candidate in CHAT_TONE_VALUES:
+            tone = candidate
+    except Exception:
+        tone = None
+
+    if not tone:
+        return jsonify({"ok": True, "tone": None})
+
+    cur.execute(
+        "UPDATE users SET last_chat_tone = %s, last_chat_tone_at = now() WHERE id = %s",
+        (tone, user_id),
+    )
+    db.commit()
+    return jsonify({"ok": True, "tone": tone})
 
 
 # ---------------------------------------------------------------------------
@@ -5367,14 +5652,15 @@ def swiggy_confirm():
     blocked = _swiggy_feature_check()
     if blocked:
         return blocked
-    action_id = (request.get_json(silent=True) or {}).get("action_id")
+    body = request.get_json(silent=True) or {}
+    action_id = body.get("action_id")
     if not action_id:
         return jsonify({"error": "action_id is required"}), 400
     from commerce.swiggy_adapter import CommerceError, confirm_action
     db = get_db()
     cur = dict_cursor(db)
     try:
-        result = confirm_action(cur, db, current_user_id(), int(action_id))
+        result = confirm_action(cur, db, current_user_id(), int(action_id), body.get("menu_item_id"))
     except CommerceError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(result)
@@ -5394,6 +5680,51 @@ def swiggy_dismiss():
     cur = dict_cursor(db)
     dismiss_action(cur, db, current_user_id(), int(action_id))
     return jsonify({"ok": True})
+
+
+@app.route("/commerce/swiggy/payment-status")
+@login_required
+def swiggy_payment_status():
+    # Polled by the client every ~10s+ while a UPI QR/payment-link is
+    # shown (Cash is confirmed unavailable on this account -- see
+    # commerce/swiggy_adapter.py's _place_food_order). Finalizes the real
+    # order via confirm_order the moment Swiggy reports the payment
+    # succeeded.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    payment_action_id = request.args.get("payment_action_id")
+    if not payment_action_id:
+        return jsonify({"error": "payment_action_id is required"}), 400
+    from commerce.swiggy_adapter import CommerceError, check_payment_status
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        result = check_payment_status(cur, db, current_user_id(), int(payment_action_id))
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route("/commerce/swiggy/track-order")
+@login_required
+def swiggy_track_order():
+    # Live delivery status for an already-placed order -- polled by the
+    # client at whatever pollingDuration Swiggy's own response suggests.
+    blocked = _swiggy_feature_check()
+    if blocked:
+        return blocked
+    action_id = request.args.get("action_id")
+    if not action_id:
+        return jsonify({"error": "action_id is required"}), 400
+    from commerce.swiggy_adapter import CommerceError, track_order
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        result = track_order(cur, db, current_user_id(), int(action_id))
+    except CommerceError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
 
 
 IMAGE_UPLOAD_PLACEHOLDER = "[Image uploaded]"
@@ -5502,6 +5833,122 @@ def chat_global_image():
         "title": title,
         "category": category,
     })
+
+
+# ---------------------------------------------------------------------------
+# Object storage (Cloudflare R2) -- profile pictures + chat/DM attachments.
+# See MEDIA_STORAGE_PLAN.md and storage.py. Gated behind R2_STORAGE_ENABLED,
+# same convention as the Swiggy section above: when the flag is off (the
+# default), every route below 404s via storage.storage_feature_check(), and
+# /uploads/status (no gate of its own) just reports enabled=false so both
+# clients know to hide upload affordances entirely rather than offering a
+# button that 404s.
+# ---------------------------------------------------------------------------
+
+@app.route("/uploads/status")
+@login_required
+def uploads_status():
+    import storage
+    return jsonify({"enabled": storage.is_enabled()})
+
+
+@app.route("/uploads/presign", methods=["POST"])
+@login_required
+def uploads_presign():
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    purpose = data.get("purpose")
+    content_type = data.get("content_type")
+    if not purpose or not content_type:
+        return jsonify({"error": "purpose and content_type are required"}), 400
+    try:
+        object_key, upload_url = storage.presign_upload(purpose, content_type, current_user_id())
+    except storage.StorageError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"upload_url": upload_url, "object_key": object_key})
+
+
+@app.route("/uploads/confirm", methods=["POST"])
+@login_required
+def uploads_confirm():
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    object_key = data.get("object_key")
+    purpose = data.get("purpose")
+    if not object_key or not purpose:
+        return jsonify({"error": "object_key and purpose are required"}), 400
+    # An object_key not under this user's own prefix (profile-pictures/<id>/
+    # or chat-media/*/<id>/) can't be confirmed -- prevents confirming (and
+    # thus exposing the public URL of) an object presigned for someone else.
+    if f"/{current_user_id()}/" not in object_key:
+        return jsonify({"error": "object_key does not belong to this user"}), 403
+    try:
+        url = storage.confirm_upload(object_key, purpose)
+    except storage.StorageError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not confirm upload: {e}"}), 400
+    return jsonify({"ok": True, "public_url": url})
+
+
+@app.route("/profile/picture", methods=["POST"])
+@login_required
+def update_profile_picture():
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    object_key = data.get("object_key")
+    if not object_key:
+        return jsonify({"error": "object_key is required"}), 400
+    user_id = current_user_id()
+    if f"/{user_id}/" not in object_key:
+        return jsonify({"error": "object_key does not belong to this user"}), 403
+    try:
+        url = storage.confirm_upload(object_key, "profile_picture")
+    except storage.StorageError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not confirm upload: {e}"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT profile_picture_url FROM users WHERE id = %s", (user_id,))
+    old_url = cur.fetchone()["profile_picture_url"]
+    cur.execute("UPDATE users SET profile_picture_url = %s WHERE id = %s", (url, user_id))
+    db.commit()
+    old_key = storage.key_from_public_url(old_url)
+    if old_key and old_key != object_key:
+        storage.delete_object(old_key)
+    return jsonify({"ok": True, "profile_picture_url": url})
+
+
+@app.route("/<path:_any>")
+def spa_fallback(_any):
+    """React Router client-side paths (e.g. /insights, /calls, once those
+    routes exist) have no Flask route of their own -- without this, a deep
+    link, bookmark, or hard refresh on one of those 404s instead of loading
+    the SPA shell and letting React Router resolve the path client-side.
+
+    Registered last, after every real route in this file, so it never
+    shadows one -- Werkzeug's own rule matching also naturally prefers a
+    more specific route (a literal path segment, or Flask's built-in
+    /static/<path:filename> handler) over this single root-level wildcard
+    regardless of registration order, but placement is kept correct anyway
+    rather than relying on that alone. Mirrors index() above exactly --
+    same file, same fallback to render_template if the built bundle isn't
+    present."""
+    react_index = os.path.join(app.static_folder, "app", "index.html")
+    if os.path.exists(react_index):
+        return send_from_directory(os.path.join(app.static_folder, "app"), "index.html")
+    return render_template("index.html")
 
 
 verify_db_connection()

@@ -31,18 +31,23 @@ export default function CategoryMenu({ value, onChange }) {
 
   return (
     <div className="category-menu" ref={ref}>
-      <button title="Filter chats" onClick={() => setOpen((v) => !v)}><MoreIcon /></button>
+      <button
+        title="Filter chats" aria-label="Filter by category" aria-haspopup="true" aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <MoreIcon />
+      </button>
       {open && (
-        <div className="category-menu-dropdown">
+        <div className="category-menu-dropdown" role="menu">
           {options.map((opt) => (
-            <div
+            <button
               key={opt.key}
-              className="category-menu-item"
+              className="category-menu-item" role="menuitemradio" aria-checked={value === opt.key}
               onClick={() => { onChange(opt.key); setOpen(false); }}
             >
               <span>{opt.label}</span>
-              {value === opt.key && <CheckIcon />}
-            </div>
+              {value === opt.key && <CheckIcon aria-hidden="true" />}
+            </button>
           ))}
         </div>
       )}
