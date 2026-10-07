@@ -1,0 +1,382 @@
+<title>Hidden Ledger Research Map</title>
+<style>
+/* layout: top infra diagram, then a 6-phase pipeline rail, then per-task-pair
+   status cards, then a single "where we are now" ledger-style summary strip */
+:root {
+  --bg: #f6f3ec;
+  --panel: #ffffff;
+  --ink: #1d2420;
+  --ink-soft: #52605a;
+  --line: #d9d2c2;
+  --accent: #3d6b5c;
+  --accent-soft: #e4ede9;
+  --amber: #a9772f;
+  --amber-soft: #f3e8d6;
+  --done: #3d6b5c;
+  --done-bg: #e1ebe6;
+  --partial: #a9772f;
+  --partial-bg: #f3e8d6;
+  --todo: #8b8478;
+  --todo-bg: #ece7db;
+  --shadow: 0 1px 2px rgba(29,36,32,0.06), 0 6px 20px rgba(29,36,32,0.05);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14181a;
+    --panel: #1b2124;
+    --ink: #eae6da;
+    --ink-soft: #9aa39c;
+    --line: #333c3a;
+    --accent: #7fb8a4;
+    --accent-soft: #223029;
+    --amber: #d8a85f;
+    --amber-soft: #2e2719;
+    --done: #7fb8a4;
+    --done-bg: #1f2e27;
+    --partial: #d8a85f;
+    --partial-bg: #2e2719;
+    --todo: #7c8580;
+    --todo-bg: #23282a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 6px 20px rgba(0,0,0,0.35);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14181a; --panel: #1b2124; --ink: #eae6da; --ink-soft: #9aa39c;
+  --line: #333c3a; --accent: #7fb8a4; --accent-soft: #223029; --amber: #d8a85f;
+  --amber-soft: #2e2719; --done: #7fb8a4; --done-bg: #1f2e27; --partial: #d8a85f;
+  --partial-bg: #2e2719; --todo: #7c8580; --todo-bg: #23282a;
+  --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 6px 20px rgba(0,0,0,0.35);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", -apple-system, sans-serif;
+  margin: 0;
+  padding: 28px 16px 48px;
+}
+.wrap { max-width: 980px; margin: 0 auto; }
+
+h1.title {
+  font-family: "Fraunces", Georgia, serif;
+  font-size: clamp(26px, 4vw, 38px);
+  font-weight: 600;
+  margin: 0 0 4px;
+  text-wrap: balance;
+  letter-spacing: -0.01em;
+}
+.subtitle {
+  color: var(--ink-soft);
+  font-size: 14.5px;
+  margin: 0 0 6px;
+  max-width: 62ch;
+}
+.asof {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+section { margin-top: 36px; }
+h2.section-head {
+  font-family: "Fraunces", Georgia, serif;
+  font-size: 19px;
+  font-weight: 600;
+  margin: 0 0 4px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.section-num {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--amber);
+  font-weight: 600;
+}
+.section-note {
+  color: var(--ink-soft);
+  font-size: 13px;
+  margin: 0 0 16px;
+  max-width: 64ch;
+}
+
+/* ---- infra diagram panel ---- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+.mermaid { display: flex; justify-content: center; }
+
+/* ---- phase rail ---- */
+.rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.phase {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 14px 12px;
+  box-shadow: var(--shadow);
+  position: relative;
+  min-width: 0;
+}
+.phase-num {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--ink-soft);
+  letter-spacing: 0.05em;
+}
+.phase-name {
+  font-weight: 600;
+  font-size: 14px;
+  margin: 3px 0 10px;
+  line-height: 1.3;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+.badge.done { color: var(--done); background: var(--done-bg); }
+.badge.partial { color: var(--partial); background: var(--partial-bg); }
+.badge.todo { color: var(--todo); background: var(--todo-bg); }
+.badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+
+/* ---- task pair cards ---- */
+.pairs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: 14px;
+}
+.pair-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.pair-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.pair-name { font-weight: 600; font-size: 15px; }
+.pair-def { font-size: 12.5px; color: var(--ink-soft); line-height: 1.5; margin: 0; }
+.tier-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.tier {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 56px;
+}
+.tier .n { color: var(--ink-soft); font-size: 10px; }
+.tier .v { font-weight: 600; }
+.tier.ok { border-color: var(--done); background: var(--done-bg); color: var(--done); }
+.tier.part { border-color: var(--partial); background: var(--partial-bg); color: var(--partial); }
+.tier.none { color: var(--todo); }
+.pair-finding {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  padding: 8px 10px;
+  border-radius: 0 6px 6px 0;
+}
+.pair-finding b { color: var(--accent); }
+
+/* ---- now strip ---- */
+.now-strip {
+  background: var(--ink);
+  color: var(--bg);
+  border-radius: 10px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow);
+}
+:root[data-theme="dark"] .now-strip, @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]) .now-strip { background: var(--panel); color: var(--ink); border: 1px solid var(--accent); } }
+.now-label {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.65;
+  margin-bottom: 8px;
+}
+.now-list { margin: 0; padding-left: 18px; font-size: 13.5px; line-height: 1.7; }
+.now-list li { margin-bottom: 4px; }
+.now-list b { font-weight: 600; }
+
+.spend {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  margin-top: 28px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 480px) {
+  .rail { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<div class="wrap">
+  <h1 class="title">The Hidden Ledger — Research Map</h1>
+  <p class="subtitle">ASMC / MCO study of AI-adoption shortcuts in a real deployed app — infrastructure, pipeline, and current standing across all three task pairs.</p>
+  <div class="asof">as of 2026-10-03</div>
+
+  <section>
+    <h2 class="section-head"><span class="section-num">01</span> Infrastructure</h2>
+    <p class="section-note">Where the data lives, where experiments run, and what's being measured by what. The split between production and local is deliberate, not incidental — see the task-pair notes below for why each one runs where it does.</p>
+    <div class="panel">
+<pre class="mermaid">
+flowchart LR
+    subgraph PROD["Production — Oracle Cloud (Always Free A1 Flex, 2 OCPU/12GB)"]
+      APP["throughline app + Postgres<br/>110 seeded friends (10 rich + 100 bulk)"]
+      EXP1["Retrieval experiments<br/>(real message content)"]
+    end
+    subgraph LOCAL["Local dev machine"]
+      EXP2["Classification experiments<br/>(synthetic test messages)"]
+      EXP3["Aggregation experiments<br/>(not yet run)"]
+    end
+    OLLAMA["Ollama Cloud<br/>gpt-oss:120b"]
+    GRAFANA["Grafana Cloud<br/>node_exporter + postgres_exporter"]
+    COSTLENS["CostLens<br/>(feature-tag allowlist)"]
+
+    APP --> EXP1
+    EXP1 -- "LLM calls" --> OLLAMA
+    EXP2 -- "LLM calls" --> OLLAMA
+    GRAFANA -. "monitors" .-> PROD
+    APP -- "tracks LLM calls" --> COSTLENS
+    COSTLENS ~~~ GRAFANA
+</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-head"><span class="section-num">02</span> Research pipeline</h2>
+    <p class="section-note">Six phases, Phase 0 through Phase 5. Status reflects actual runs and locked decisions, not intentions.</p>
+    <div class="rail">
+      <div class="phase">
+        <div class="phase-num">PHASE 0</div>
+        <div class="phase-name">Scoping &amp; instrumentation</div>
+        <span class="badge done"><span class="badge-dot"></span>done</span>
+      </div>
+      <div class="phase">
+        <div class="phase-num">PHASE 1</div>
+        <div class="phase-name">ASMC experiments</div>
+        <span class="badge partial"><span class="badge-dot"></span>in progress</span>
+      </div>
+      <div class="phase">
+        <div class="phase-num">PHASE 2</div>
+        <div class="phase-name">MCO opacity study</div>
+        <span class="badge partial"><span class="badge-dot"></span>mostly done</span>
+      </div>
+      <div class="phase">
+        <div class="phase-num">PHASE 3</div>
+        <div class="phase-name">Validity controls</div>
+        <span class="badge partial"><span class="badge-dot"></span>in progress</span>
+      </div>
+      <div class="phase">
+        <div class="phase-num">PHASE 4</div>
+        <div class="phase-name">Analysis &amp; synthesis</div>
+        <span class="badge todo"><span class="badge-dot"></span>not started</span>
+      </div>
+      <div class="phase">
+        <div class="phase-num">PHASE 5</div>
+        <div class="phase-name">Writing &amp; submission</div>
+        <span class="badge todo"><span class="badge-dot"></span>not started</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-head"><span class="section-num">03</span> Phase 1 — three task pairs</h2>
+    <p class="section-note">Each real volume tier (10 / 100 / 1,000) needs ≥5 trials per Phase 3. Projected tiers (10K / 100K / 1M) come later, from the fitted cost curve, never executed directly.</p>
+    <div class="pairs">
+
+      <div class="pair-card">
+        <div class="pair-head">
+          <div class="pair-name">Data Retrieval</div>
+          <span class="badge partial"><span class="badge-dot"></span>partial</span>
+        </div>
+        <p class="pair-def">Indexed SQL query vs. dumping the thread to an LLM and asking in English. Runs on production — real message content, so the LLM side never leaves that trust boundary unnecessarily.</p>
+        <div class="tier-row">
+          <div class="tier ok"><span class="n">N=10</span><span class="v">10 trials</span></div>
+          <div class="tier none"><span class="n">N=100</span><span class="v">—</span></div>
+          <div class="tier none"><span class="n">N=1,000</span><span class="v">—</span></div>
+        </div>
+        <div class="pair-finding"><b>Grader rebuilt twice.</b> Exact-substring match swung 80–100% on identical behavior. LLM-as-judge was tried next and failed too — tripped on a worked example it was just shown. Word-overlap matching is the fix that held: 100/100 post-fix vs. 94/100 before.</div>
+      </div>
+
+      <div class="pair-card">
+        <div class="pair-head">
+          <div class="pair-name">Classification</div>
+          <span class="badge done"><span class="badge-dot"></span>done (local)</span>
+        </div>
+        <p class="pair-def">app.py's real nearby-places keyword classifier vs. an LLM given the same category list. Synthetic test messages only — runs locally, no production trust boundary involved.</p>
+        <div class="tier-row">
+          <div class="tier ok"><span class="n">N=10</span><span class="v">5 trials</span></div>
+          <div class="tier ok"><span class="n">N=100</span><span class="v">5 trials</span></div>
+          <div class="tier ok"><span class="n">N=1,000</span><span class="v">5 trials</span></div>
+        </div>
+        <div class="pair-finding"><b>Found a real production bug.</b> 25 of 32 mismatches at N=1,000 were one message — the LLM was right, app.py's own regex matches "close to me" but not "close by". 96.8% raw / 99.3% corrected accuracy.</div>
+      </div>
+
+      <div class="pair-card">
+        <div class="pair-head">
+          <div class="pair-name">Aggregation</div>
+          <span class="badge todo"><span class="badge-dot"></span>not run</span>
+        </div>
+        <p class="pair-def">weekly_digest.py's real LLM digest vs. a new deterministic summarizer (one templated line per EI category). Harness built, reuses the production digest function directly.</p>
+        <div class="tier-row">
+          <div class="tier none"><span class="n">N=10</span><span class="v">—</span></div>
+          <div class="tier none"><span class="n">N=100</span><span class="v">—</span></div>
+          <div class="tier none"><span class="n">N=1,000</span><span class="v">—</span></div>
+        </div>
+        <div class="pair-finding"><b>Structural ceiling, not a bug.</b> Only one real test case exists — no seeded user besides Amit has EI facts/beliefs/memories. Volume scaling needs seed_demo_data.py extended first.</div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-head"><span class="section-num">04</span> Where we are now</h2>
+    <div class="now-strip">
+      <div class="now-label">Standing — 2026-10-03</div>
+      <ul class="now-list">
+        <li><b>Phase 0</b> is fully locked — all three task pairs defined against real code, rate card fixed, accuracy floors set.</li>
+        <li><b>Phase 2</b>'s case study is effectively done: CostLens's feature-tag allowlist shows Aggregation would be correctly attributed, Classification and Retrieval would not — a real, code-verified opacity finding, not a hypothetical.</li>
+        <li><b>Retrieval's accuracy grader</b> just got fixed and re-validated on production (100/100), after a first attempt (LLM-as-judge) was tested and found unreliable.</li>
+        <li><b>Classification</b> is fully measured — all three tiers, five trials each, $0.32 total spend — and surfaced a genuine bug in production's own regex.</li>
+        <li><b>Immediate next steps:</b> Retrieval's N=100/1,000 on production; Aggregation's first run; pulling Grafana's real "untagged" cost totals as Phase 2 corroboration.</li>
+      </ul>
+    </div>
+  </section>
+
+  <div class="spend">total experiment spend to date ≈ $0.35</div>
+</div>

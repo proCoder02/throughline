@@ -21,17 +21,26 @@ for must have >=1 LLM card whose headline+body text references that same
 item (checked via keyword/substring overlap against the item's own raw
 text -- same known-fragile methodology as data_retrieval.py's grader).
 
-IMPORTANT volume-tier limitation (see mco_asmc/README.md Progress Log):
-unlike retrieval/classification, this task has only ONE real test case
-today -- the single real user (Amit) with seeded EI data. There is no
-seeded multi-user EI dataset to give a genuine N=10/100/1,000 volume axis.
-This script's --trials runs REPEATED calls against that one real case
-(legitimate for measuring LLM-call variance per Phase 3's "run every
-configuration multiple times," and volume_n is logged as 1, honestly, not
-faked as a larger number).
+LLM-side cost (fixed 2026-10-03): weekly_digest.py's generate_weekly_digest()
+now accepts an additive, opt-in return_usage=True parameter (every other
+caller is unaffected -- see that function's own docstring) that returns
+real token counts alongside the cards, priced against the same locked rate
+card as the other two task pairs. No longer a blank placeholder.
+
+Volume axis (fixed 2026-10-03, see mco_asmc/README.md's "Fixes Required"
+list): originally this task had exactly ONE real test case (Amit's own
+seeded EI data) -- none of the 110 seeded friends had their own facts/
+beliefs/memories, so there was no genuine N=10/100/1,000 axis, only
+repeated trials against that single case. seed_demo_data.py now gives every
+one of the 110 friends their own lightweight, templated EI data
+(seed_friend_own_ei_data()), so each friend is a real, independent test
+case -- generate_weekly_digest(friend_user_id) summarizes that specific
+friend's own data, not Amit's. --n selects N of Amit's friends (cycling if
+N exceeds 110) as test cases, matching data_retrieval.py/classification.py's
+own --n/--trial convention.
 
 Usage:
-    python mco_asmc/experiments/aggregation.py --trials 5 --username Amit
+    python mco_asmc/experiments/aggregation.py --n 10 --trial 1 --username Amit
 
 Where this runs: like data_retrieval.py, the LLM call here reads real
 production EI data (facts/beliefs/memories about a real user) and sends it
@@ -50,6 +59,7 @@ from datetime import datetime
 from pathlib import Path
 
 import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -78,6 +88,8 @@ CSV_COLUMNS = ["date", "task_pair", "side", "volume_n", "trial", "tokens", "late
                "cost_usd", "cost_usd_paid_tier_sensitivity", "accuracy_pass", "notes"]
 
 OCI_A1_FLEX_OCPU_HOUR_USD = 0.01
+PRICE_PER_1M_INPUT_TOKENS = 0.15   # same locked rate card as data_retrieval.py/classification.py
+PRICE_PER_1M_OUTPUT_TOKENS = 0.60
 
 
 def log(msg: str) -> None:
@@ -106,7 +118,15 @@ def build_deterministic_digest(data: dict, relationships: list[dict]) -> list[di
         s = data["personality_snapshots"][0]
         text = (f"Personality: openness={s['openness']}, conscientiousness={s['conscientiousness']}, "
                 f"extraversion={s['extraversion']}, agreeableness={s['agreeableness']}, neuroticism={s['neuroticism']}")
-        items.append({"category": "personality", "text": text, "source_text": text})
+        # source_text deliberately differs from the display text (fixed
+        # 2026-10-03, see README "Fixes Required" -- found via a real N=10
+        # run where EVERY case marked personality "missed"): "openness=0.58,"
+        # is not a word an LLM card would ever write verbatim, so matching
+        # against the raw key=value string guaranteed a miss regardless of
+        # what the LLM actually said. Match on the trait NAMES instead --
+        # real words a card discussing personality would plausibly use.
+        items.append({"category": "personality", "text": text,
+                       "source_text": "openness conscientiousness extraversion agreeableness neuroticism"})
     for r in relationships:
         text = f"{r['friend_name']}: trust={r['trust_score']}, support={r['emotional_support']} -- {r['relationship_summary']}"
         items.append({"category": "relationship", "text": text, "source_text": r["relationship_summary"]})
@@ -144,88 +164,109 @@ def write_rows(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def run(trials: int, username: str) -> None:
+def load_test_users(cur, amit_id: int, n: int) -> list[tuple]:
+    """N of Amit's friends (cycling if N exceeds the friend count), each now
+    a real, independent test case since seed_demo_data.py gives every friend
+    their own EI data. Ordered by friend_id so repeated runs are
+    reproducible, same convention as data_retrieval.py's load_test_cases."""
+    cur.execute(
+        "SELECT f.friend_id, COALESCE(f.nickname, u.username) AS name "
+        "FROM friendships f JOIN users u ON u.id = f.friend_id "
+        "WHERE f.user_id = %s ORDER BY f.friend_id",
+        (amit_id,),
+    )
+    friends = cur.fetchall()
+    if not friends:
+        raise SystemExit(f"No friends found for user_id {amit_id} -- run seed_demo_data.py first.")
+    return [friends[i % len(friends)] for i in range(n)]
+
+
+def run(n: int, trial: int, username: str) -> None:
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
     cur.execute("SELECT id FROM users WHERE username = %s", (username,))
     row = cur.fetchone()
     if not row:
         raise SystemExit(f"No user named '{username}' found.")
-    user_id = row[0]
+    amit_id = row[0]
 
-    subject_id = _resolve_subject_id(cur, user_id)
-    if subject_id is None:
-        raise SystemExit(f"No emotional_intelligence subject for user_id {user_id} -- nothing to summarize.")
+    cases = load_test_users(cur, amit_id, n)
 
-    import psycopg2.extras
     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    data = _fetch_recent_ei_data(dict_cur, subject_id)
-    relationships = _fetch_recent_relationship_insights(dict_cur, user_id, subject_id)
-    conn.close()
-
-    t0 = time.perf_counter()
-    deterministic_items = build_deterministic_digest(data, relationships)
-    eng_latency = (time.perf_counter() - t0) * 1000
-    log(f"Deterministic digest: {len(deterministic_items)} items "
-        f"({', '.join(i['category'] for i in deterministic_items)})")
 
     today = datetime.now().astimezone().date().isoformat()
-    rows = [{
-        "date": today, "task_pair": "aggregation", "side": "engineered",
-        "volume_n": 1, "trial": 0, "tokens": "", "latency_ms": round(eng_latency, 6),
-        "cost_usd": 0.0, "cost_usd_paid_tier_sensitivity": round(paid_tier_sensitivity_cost(eng_latency), 12),
-        "accuracy_pass": True,
-        "notes": f"volume_n=1 is real, not a placeholder -- only one seeded EI test case exists today, "
-                 f"see README Progress Log. {len(deterministic_items)} deterministic items built.",
-    }]
+    rows = []
 
-    log(f"Running {trials} LLM trial(s) against the same real digest request...")
-    for trial in range(1, trials + 1):
+    log(f"Running {n} aggregation cases (trial {trial})...")
+    for i, (user_id, name) in enumerate(cases):
+        subject_id = _resolve_subject_id(cur, user_id)
+        if subject_id is None:
+            log(f"  [{i+1}/{n}] {name}: no EI subject, skipping")
+            continue
+
+        data = _fetch_recent_ei_data(dict_cur, subject_id)
+        relationships = _fetch_recent_relationship_insights(dict_cur, user_id, subject_id)
+
         t0 = time.perf_counter()
+        deterministic_items = build_deterministic_digest(data, relationships)
+        eng_latency = (time.perf_counter() - t0) * 1000
+        rows.append({
+            "date": today, "task_pair": "aggregation", "side": "engineered",
+            "volume_n": n, "trial": trial, "tokens": "", "latency_ms": round(eng_latency, 6),
+            "cost_usd": 0.0, "cost_usd_paid_tier_sensitivity": round(paid_tier_sensitivity_cost(eng_latency), 12),
+            "accuracy_pass": True,
+            "notes": f"{len(deterministic_items)} deterministic items for {name}" if i == 0 else "",
+        })
+
         try:
-            cards = generate_weekly_digest(user_id) or []
+            # return_usage=True (added 2026-10-03 to weekly_digest.py itself,
+            # additive/opt-in -- every other caller is unaffected, see that
+            # file's docstring) -- real token counts, not a blank placeholder.
+            cards, usage = generate_weekly_digest(user_id, return_usage=True)
+            cards = cards or []
         except Exception as exc:
-            log(f"  trial {trial}: FAILED ({exc})")
+            log(f"  [{i+1}/{n}] {name}: FAILED ({exc})")
             rows.append({
                 "date": today, "task_pair": "aggregation", "side": "llm",
-                "volume_n": 1, "trial": trial, "tokens": 0, "latency_ms": "",
+                "volume_n": n, "trial": trial, "tokens": 0, "latency_ms": "",
                 "cost_usd": 0.0, "cost_usd_paid_tier_sensitivity": "", "accuracy_pass": False,
                 "notes": f"error: {exc}",
             })
             continue
         latency_ms = (time.perf_counter() - t0) * 1000
 
+        total_tokens = usage["total_tokens"] if usage else 0
+        cost_usd = ((usage["prompt_tokens"] / 1_000_000 * PRICE_PER_1M_INPUT_TOKENS +
+                     usage["completion_tokens"] / 1_000_000 * PRICE_PER_1M_OUTPUT_TOKENS)
+                    if usage else 0.0)
+
         covered, missed = check_coverage(deterministic_items, cards)
         rows.append({
             "date": today, "task_pair": "aggregation", "side": "llm",
-            "volume_n": 1, "trial": trial,
-            # generate_weekly_digest() doesn't return token counts (it
-            # discards call_llm's raw response) -- logged as blank rather
-            # than a fabricated number. Open item: thread token counts
-            # through if precise LLM-side cost is needed here.
-            "tokens": "", "latency_ms": round(latency_ms, 3),
-            "cost_usd": "", "cost_usd_paid_tier_sensitivity": "",
+            "volume_n": n, "trial": trial,
+            "tokens": total_tokens, "latency_ms": round(latency_ms, 3),
+            "cost_usd": round(cost_usd, 8), "cost_usd_paid_tier_sensitivity": "",
             "accuracy_pass": covered,
             "notes": f"{len(cards)} cards generated; " + (
                 "all deterministic items covered" if covered
                 else f"missed: {'; '.join(missed)}"
             ),
         })
-        log(f"  trial {trial}: {len(cards)} cards, {latency_ms:.0f}ms, "
-            f"{'all covered' if covered else f'{len(missed)} missed'}")
+        log(f"  [{i+1}/{n}] {name}: {len(cards)} cards, {latency_ms:.0f}ms, {total_tokens} tok, "
+            f"${cost_usd:.6f}, {'covered' if covered else f'{len(missed)} missed'}")
 
+    conn.close()
     write_rows(rows)
-    log(f"Done. Wrote {len(rows)} rows to {RESULTS_PATH}. "
-        f"NOTE: LLM-side cost_usd is blank -- generate_weekly_digest() doesn't "
-        f"expose token counts today, see notes above.")
+    log(f"Done. Wrote {len(rows)} rows to {RESULTS_PATH}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--trials", type=int, default=5, help="Number of repeated LLM trials (default: 5, per Phase 3's >=5 trials/tier)")
-    parser.add_argument("--username", default="Amit", help="Account to generate the digest for (default: Amit)")
+    parser.add_argument("--n", type=int, default=10, help="Number of friend test cases to run (default: 10)")
+    parser.add_argument("--trial", type=int, default=1, help="Trial number within this volume tier (default: 1)")
+    parser.add_argument("--username", default="Amit", help="Account whose friends to generate digests for (default: Amit)")
     args = parser.parse_args()
-    run(args.trials, args.username)
+    run(args.n, args.trial, args.username)
 
 
 if __name__ == "__main__":

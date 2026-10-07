@@ -734,6 +734,94 @@ AMIT_PREFERENCES = [
     ("media", "true crime podcasts"),
 ]
 
+# ============================================================================
+# Per-friend EI data (added 2026-10-03, see mco_asmc/README.md's "Fixes
+# Required" list) -- gives every one of the 110 friends their OWN facts/
+# beliefs/memories/preferences/personality snapshot, not just a relationship_
+# profiles row. Without this, generate_weekly_digest() has nothing to
+# summarize for anyone but Amit, so the Aggregation ASMC task pair had
+# exactly one real test case and no volume axis. Templated/combinatorial,
+# same principle as the bulk friends' messages -- no LLM cost for this
+# batch, only the actual digest-generation calls (the thing being measured)
+# hit the LLM.
+# ============================================================================
+_EI_PROFESSIONS = ["a teacher", "a graphic designer", "a data analyst", "a nurse", "an architect",
+                    "a chef", "a civil engineer", "a product manager", "a photographer", "a lawyer"]
+_EI_CITIES = ["Pune", "Chennai", "Hyderabad", "Kolkata", "Ahmedabad", "Jaipur", "Kochi", "Indore"]
+_EI_SKILLS = ["pottery", "the guitar", "French", "watercolor painting", "chess", "swimming", "baking"]
+_EI_FACT_TEMPLATES = [
+    ("works_as", _EI_PROFESSIONS), ("lives_in", _EI_CITIES), ("is_learning", _EI_SKILLS),
+]
+_EI_BELIEF_TEMPLATES = [
+    ("work-life balance", "Believes weekends should stay fully offline"),
+    ("friendship", "Believes a quick check-in text matters more than a big gesture"),
+    ("money", "Believes in saving first, spending what's left"),
+    ("growth", "Believes trying new hobbies keeps life interesting"),
+    ("family", "Believes in keeping in close touch with family, even long-distance"),
+]
+_EI_MEMORY_TEMPLATES = [
+    ("Had a relaxed weekend with no real plans", "calm", 0.5),
+    ("A good week at work, finally cleared a backlog", "relief", 0.6),
+    ("Caught up with an old friend over coffee", "joy", 0.7),
+    ("A minor disagreement with a sibling that got resolved", "relief", 0.4),
+    ("Tried a new recipe that turned out surprisingly well", "joy", 0.5),
+]
+_EI_PREFERENCE_TEMPLATES = [
+    ("food", "street food"), ("food", "home-cooked meals"), ("hobby", "cycling"),
+    ("hobby", "reading fiction"), ("media", "stand-up comedy specials"), ("media", "cricket commentary"),
+]
+
+
+def seed_friend_own_ei_data(cur, friend_subject: int, first_name: str, manifest: dict) -> None:
+    """One fact, one belief, one memory, one preference, one personality
+    snapshot -- enough for generate_weekly_digest() to have something real
+    to summarize for this subject, without hand-writing content for all 110
+    friends individually."""
+    now = datetime.now().astimezone()
+
+    predicate, pool = random.choice(_EI_FACT_TEMPLATES)
+    cur.execute(
+        "INSERT INTO emotional_intelligence.facts (subject_id, subject, predicate, object, confidence, created_at) "
+        "VALUES (%s, %s, %s, %s, 0.85, %s) RETURNING id",
+        (friend_subject, first_name, predicate, random.choice(pool), now - timedelta(days=random.randint(0, 5))),
+    )
+    manifest["ei_fact_ids"].append(cur.fetchone()[0])
+
+    topic, belief = random.choice(_EI_BELIEF_TEMPLATES)
+    cur.execute(
+        "INSERT INTO emotional_intelligence.beliefs (subject_id, topic, belief, confidence, created_at) "
+        "VALUES (%s, %s, %s, 0.8, %s) RETURNING id",
+        (friend_subject, topic, belief, now - timedelta(days=random.randint(0, 5))),
+    )
+    manifest["ei_belief_ids"].append(cur.fetchone()[0])
+
+    summary, emotion, importance = random.choice(_EI_MEMORY_TEMPLATES)
+    cur.execute(
+        "INSERT INTO emotional_intelligence.memories (subject_id, summary, emotion, importance, created_at) "
+        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (friend_subject, summary, emotion, importance, now - timedelta(days=random.randint(0, 5))),
+    )
+    manifest["ei_memory_ids"].append(cur.fetchone()[0])
+
+    category, item = random.choice(_EI_PREFERENCE_TEMPLATES)
+    cur.execute(
+        "INSERT INTO emotional_intelligence.preferences (subject_id, category, item, weight, confidence, updated_at) "
+        "VALUES (%s, %s, %s, 0.75, 0.8, %s) "
+        "ON CONFLICT (subject_id, category, item) DO UPDATE SET updated_at = EXCLUDED.updated_at RETURNING id",
+        (friend_subject, category, item, now),
+    )
+    manifest["ei_preference_ids"].append(cur.fetchone()[0])
+
+    cur.execute(
+        "INSERT INTO emotional_intelligence.personality_snapshots "
+        "(subject_id, openness, conscientiousness, extraversion, agreeableness, neuroticism, confidence, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, 0.7, %s) RETURNING id",
+        (friend_subject, round(random.uniform(0.3, 0.9), 2), round(random.uniform(0.3, 0.9), 2),
+         round(random.uniform(0.3, 0.9), 2), round(random.uniform(0.3, 0.9), 2),
+         round(random.uniform(0.2, 0.7), 2), now),
+    )
+    manifest["ei_personality_snapshot_ids"].append(cur.fetchone()[0])
+
 
 def seed_new_ei_schema(cur, amit_id: int, friends: list[dict], manifest: dict) -> None:
     """emotional_intelligence.* -- powers the weekly digest and the friend
@@ -820,6 +908,7 @@ def seed_new_ei_schema(cur, amit_id: int, friends: list[dict], manifest: dict) -
 
     for f in friends:
         friend_subject = ensure_subject(f["user_id"])
+        seed_friend_own_ei_data(cur, friend_subject, f["first"], manifest)
         if f["first"] in relationship_flavor:
             trust, freq, conflict, support, summary = relationship_flavor[f["first"]]
             topics = f["topics"][:2]

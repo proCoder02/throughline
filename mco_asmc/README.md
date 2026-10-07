@@ -68,9 +68,9 @@ For **each** of the three task pairs:
 - [ ] Build the LLM-shortcut path (reusing `call_llm`) — **done for all 3 task pairs** (2026-10-02)
 - [ ] Run both at N = 10, 100, 1,000 requests, multiple trials per tier (see Phase 3 — don't skip repeats) — **Data Retrieval: N=10 trial 1 done (production). Classification: N=10 trial 1 done (local, safe either way — synthetic data). Aggregation: structurally limited to volume_n=1 (one real test case), see Progress Log. 100/1,000 tiers and remaining trials open for all three.**
 - [ ] Log every run to `results/` (task, N, side, tokens, latency, $ cost, accuracy pass/fail) — **done for the runs above**, see `results/raw_*.csv`
-- [ ] Fit `variable_cost` + `fixed_cost` for both sides from the logged runs
-- [ ] Compute the crossover volume (where engineered cost-per-request = LLM cost-per-request)
-- [ ] Project cost at N = 10k / 100k / 1M using the formula above
+- [x] Fit `variable_cost` + `fixed_cost` for both sides from the logged runs — **done 2026-10-04** for all 3 task pairs, see `results/asmc_summary.csv` and Progress Log
+- [x] Compute the crossover volume — **done 2026-10-04**: no crossover for Retrieval/Classification (engineered dominates at every N), real crossover at N≈92,089 for Aggregation
+- [x] Project cost at N = 10k / 100k / 1M — **done 2026-10-04**, see `results/asmc_summary.csv`
 - [ ] Repeat at a second complexity level per task pair (e.g., a harder classification schema, a longer transcript to summarize) to start generalizing the decision rule
 
 **Instrumentation shortcut (revised 2026-10-02):** the plan originally said
@@ -174,22 +174,27 @@ not just discussed. Ordered by priority, not by when they were found.
       96.8% (N=1,000) accuracy figure is measured against a flawed
       reference. Decide how this gets reported: both numbers (96.8% raw /
       99.3% corrected) with the gap explained, not just the raw number.
-- [ ] **Stop reporting single-trial accuracy.** Proven necessary (not just
-      best practice) by retrieval trial 3 alone showing 80% against a true
-      pooled value of 94%. Every accuracy claim going forward needs the
-      trial range stated alongside it, not a single run's number.
+- [x] **Stop reporting single-trial accuracy — addressed 2026-10-02.**
+      Proven necessary (not just best practice) by retrieval trial 3 alone
+      showing 80% against a true pooled value of 94%. Both Classification
+      (5 trials x 3 tiers) and Retrieval (10 trials at N=10, post-fix) now
+      have real multi-trial data with stated ranges, not single-run
+      numbers. Still needed: Retrieval's N=100/1,000 tiers, which only
+      have 1 trial so far.
 
 ### Structural gaps
-- [ ] **Aggregation's LLM-side cost is unmeasured.**
-      `generate_weekly_digest()` doesn't return token counts to its caller
-      (discards `call_llm`'s raw response internally). Decide: thread
-      token counts through (a real change to existing production code) or
-      permanently document this task pair's LLM cost as unavailable.
-- [ ] **Aggregation has no volume axis.** Only one real test case exists
-      (Amit's own seeded EI data) — none of the 110 seeded friends have
-      their own facts/beliefs/memories. Either extend `seed_demo_data.py`
-      to give synthetic users their own EI data, or explicitly scope the
-      paper's aggregation claim as untested across volume.
+- [x] **Aggregation's LLM-side cost was unmeasured — fixed 2026-10-03.**
+      `weekly_digest.py`'s `generate_weekly_digest()` now takes an additive,
+      opt-in `return_usage=True` parameter (every existing caller, including
+      `nudges/nudge_engine.py`, is unaffected — verified by reading that
+      call site before changing the signature). Deployed to production with
+      a pre-change diff reviewed and a backup taken first.
+- [x] **Aggregation had no volume axis — fixed 2026-10-03.**
+      `seed_demo_data.py` now gives all 110 friends their own templated
+      facts/beliefs/memories/preferences/personality snapshot
+      (`seed_friend_own_ei_data()`), so each is a real, independent test
+      case. `aggregation.py` rewritten to take `--n`/`--trial` like the
+      other two harnesses instead of just repeating one case.
 - [ ] **Engineered-side "paid-tier cost" is a conservative upper bound,
       not a measurement** (latency x 100%-OCPU-utilization assumption).
       Fine as a documented estimate; must not be presented as more precise
@@ -632,6 +637,200 @@ Phase 3 (only trial 1 done at each tier so far), and the projected
 10K/100K/1M tiers via the variable+fixed cost fit once enough real trials
 exist to fit confidently.
 
+### 2026-10-02 (final) — Classification: 5 trials at every tier, Phase 3 satisfied for this task pair
+
+**Classification, 5 trials each at N=10/100/1,000** (`results/raw_classification.csv`,
+11,100 rows total, 5,550 real LLM calls, **$0.32 total spend**):
+
+| N | trial range | mean | spread across trials |
+|---|---|---|---|
+| 10 | 100%, 100%, 100%, 100%, 100% | **100%** | none -- 0pp spread |
+| 100 | 97%, 97%, 98%, 96%, 97% | **97.0%** | 96-98%, 2pp spread |
+| 1,000 | 96.8%, 96.9%, 96.8%, 96.7%, 96.8% | **96.8%** | 96.7-96.9%, 0.2pp spread |
+
+**This is the clean contrast to retrieval's old grader problem.**
+Classification's grading (exact label match) was always sound -- the issue
+was the ground-truth system, not the grader -- so trial-to-trial variance
+here is just genuine sampling noise from different random test messages,
+not grading instability. Compare to retrieval's old grader, which swung
+80-100% on *identical* underlying behavior. Also visible here: variance
+shrinks as N grows (0.2pp spread at N=1,000 vs effectively unmeasurable at
+N=10, since N=10 is too small a sample to ever land on the known ~3%
+failure modes) -- exactly the law-of-large-numbers behavior you'd want to
+see, and a good illustration for Phase 4's write-up of why volume matters
+for measurement quality, not just for the cost curve itself.
+
+**Classification task pair is now fully satisfied for Phase 3** (5 trials,
+all three real tiers). Latency stayed consistent throughout: ~1,400-1,700ms
+mean per tier, ~215-235 tokens/request -- no meaningful drift at higher N,
+which is reassuring for the "variable_cost stays flat across volume" check
+Phase 0 flagged as worth confirming before trusting the 10K/100K/1M
+projections.
+
+**Running total spend across all experimentation so far**: classification
+$0.32 + retrieval (~100 LLM calls across all runs, ~$0.025) ≈ **~$0.35**,
+comfortably within free-tier budget with massive headroom for the
+remaining N=100/1,000 retrieval tiers and aggregation trials.
+
+### 2026-10-03 — Aggregation: both open items fixed, first real run, and a genuine LLM-vs-engineered behavioral difference found
+
+**Both items from the "Fixes Required" list resolved.** (1) `weekly_digest.py`
+now supports `return_usage=True`, additive and opt-in -- confirmed the only
+other real caller (`nudges/nudge_engine.py`) doesn't pass it, so its
+behavior is byte-for-byte unchanged. Diffed the file against production
+before applying, backed up the original, applied, and compiled on
+production before moving on. (2) `seed_demo_data.py` now gives all 110
+friends their own facts/beliefs/memories/preferences/personality snapshot
+(`seed_friend_own_ei_data()`), making each one a real, independent
+aggregation test case instead of relying solely on Amit's single account.
+`aggregation.py` rewritten to take `--n`/`--trial`, matching the other two
+harnesses' interface. Both deployed to production; production reseeded
+with the new per-friend EI data.
+
+**First real N=10 run surfaced a real bug in the EXPERIMENT'S OWN grader,
+not the LLM.** Initial run: 0 of 9 real cases (friends with seeded EI data)
+achieved full coverage -- every single one missed the "personality" item.
+Investigated rather than accepted: the deterministic digest's personality
+`source_text` was the raw templated string `"openness=0.58,
+conscientiousness=0.88, ..."` -- word-matching against that can never
+succeed, because no LLM card would ever write `"openness=0.58,"` verbatim.
+This guaranteed a miss regardless of what the LLM actually generated, by
+construction. **Fixed**: match against the trait *names* themselves
+(`"openness conscientiousness extraversion agreeableness neuroticism"`),
+real words a card discussing personality would plausibly use. Verified
+against the same local test case before redeploying: missed items dropped
+from 2 to 1 immediately.
+
+**Re-ran N=10 on production post-fix**: coverage improved from 0/9 to
+**2/9 fully covered**, 1326 mean tokens, $0.000591 mean cost, 3,162ms mean
+latency. (One contamination note: the pre-fix and post-fix runs landed in
+the same file both labeled trial 1, since the file was pulled before the
+fix was deployed, re-run, and pulled again without the trial number
+changing. Cleaned up by hand on both local and production copies, keeping
+only the valid post-fix 20 rows -- unlike retrieval's old-grader-vs-new
+comparison, this wasn't a finding worth preserving, just my own bug.)
+
+**What's still being missed, and why it's a finding, not a bug**: 6 of the
+remaining 7 incomplete cases all missed the same thing -- the **belief**
+item ("Believes in saving first, spending what's left," "Believes in
+keeping in close touch with family," etc.). Checked whether this is
+another grader artifact the way personality was: it isn't -- the
+significant words extracted ("saving," "spending," "family") are exactly
+the kind of plain English words a real card would use. The actual
+explanation is structural: `weekly_digest.py`'s own system prompt
+instructs the LLM to **skip any category with nothing genuinely
+noteworthy "this week"** ("most weeks won't have something for every
+category... better to return fewer cards than pad"). A belief like
+"believes in saving first" doesn't change week to week, so the LLM is
+making a reasonable judgment call that it isn't fresh news -- while the
+deterministic path has no such judgment and always surfaces the
+most-recent belief regardless of staleness. **This is a genuine
+behavioral/definitional difference between the two paths, not a quality
+defect in either one** -- worth a real paragraph in the paper: the
+"engineered" and "LLM" solutions here aren't just cost/latency tradeoffs,
+they encode different philosophies about what a digest should even
+contain, and "coverage" isn't a cleanly objective target when the two
+paths disagree about what's worth including at all. One residual
+personality miss (1 of 9) remains unexplained by either the fixed grader
+or the belief-staleness theory -- not enough data yet to say whether it's
+the same phenomenon or something else.
+
+**Aggregation now has a working, bug-checked harness with real N=10 data.**
+Remaining: N=100 (now genuinely possible with 110 real test cases), ≥5
+trials per Phase 3, and a paper-level decision on how to frame the
+belief-coverage finding (a limitation of the comparison, or a result in
+its own right).
+
+### 2026-10-03 (later) — Aggregation at N=100: the belief finding holds at scale
+
+**N=100 run** (`results/raw_aggregation.csv`) ran twice back to back under
+the same trial label, same accidental-double-loop pattern as classification
+earlier -- both runs used the identical fixed code, so this is bonus sample
+size, not a second contamination to clean up. Combined: **207 real test
+cases** (friends with seeded EI data; a small number of pre-existing real
+friends without seeded data, like "Neha," are skipped as designed).
+
+| metric | value |
+|---|---|
+| fully covered | 75/207 (**36.2%**) |
+| mean tokens | 1,381 |
+| mean cost | $0.000626/request (**$0.13 total spent** across all 207 calls) |
+| mean latency | 3,394ms (range 1,725–7,180ms) |
+
+**The belief finding from N=10 holds, and gets sharper at this sample
+size.** Breaking down what's missed across all incomplete cases:
+
+| missed item | count | share of 207 cases |
+|---|---|---|
+| belief | 113 | **54.6%** |
+| personality | 14 | 6.8% |
+| preference | 2 | 1.0% |
+| memory | 1 | 0.5% |
+
+Belief is missed in over half of all cases -- not a fluke, not a tail
+event, the single dominant pattern in this task pair's data. Personality
+dropped to a 6.8% residual after the grader fix (down from 100% when it
+was a grader bug) -- small enough now to read as genuine occasional LLM
+omission rather than a second systematic issue, consistent with the
+"not noteworthy this week" theory rather than another bug. The arithmetic
+checks out too: independent ~55% belief-miss and ~7% personality-miss
+rates predict roughly 0.45 x 0.93 ≈ 42% full coverage, close to the
+observed 36.2% (some cases miss both, pulling the real number down a bit
+further, as expected).
+
+**This is now a load-bearing finding for the paper, not a footnote**: at
+real volume, the LLM digest systematically omits static, slow-changing
+information (beliefs) in favor of what looks "fresh" for the week, while
+the deterministic path has no such filter and always includes it. Whether
+that's a flaw or a feature depends entirely on what a "weekly digest" is
+supposed to do -- which is itself worth stating explicitly in the paper
+rather than assumed. The accuracy-floor methodology (Phase 0) didn't
+anticipate this: "must cover the same key facts" implicitly assumes both
+paths agree on which facts are worth including, and this task pair is a
+real counterexample to that assumption.
+
+**Aggregation is now measured at N=10 and N=100** (effectively ~207 cases
+at the N=100 tier). Remaining: N=1,000, the ≥5-trials-per-tier Phase 3
+requirement (only 1 trial run so far, albeit with bonus sample size), and
+writing the belief-vs-personality distinction into the paper's Discussion
+section.
+
+### 2026-10-04 — Aggregation at N=1,000: pattern confirmed, clean single run
+
+**N=1,000 run** (`results/raw_aggregation.csv`), clean this time -- exactly
+1,000 rows, no accidental double-loop. 990 real cases (10 hit the
+non-seeded pre-existing "Kunal"/similar accounts, correctly skipped/trivial
+as designed).
+
+| metric | N=100 | N=1,000 |
+|---|---|---|
+| fully covered | 36.2% | **39.2%** |
+| mean tokens | 1,381 | 1,394 |
+| mean cost | $0.000626 | $0.000633 |
+| mean latency | 3,394ms | 3,828ms |
+| belief missed | 54.6% | **48.1%** |
+| personality missed | 6.8% | **6.9%** |
+| preference missed | 1.0% | 2.0% |
+| memory missed | 0.5% | 0.3% |
+
+**The pattern holds at 10x the sample size, essentially unchanged.**
+Personality's residual miss rate is nearly identical (6.8% -> 6.9%) across
+a 5x larger sample -- strong confirmation it's a stable, genuine LLM
+omission rate now, not noise left over from the fixed grader bug. Belief's
+miss rate softened slightly (54.6% -> 48.1%) but remains by far the
+dominant failure mode, roughly 7x more common than personality and >20x
+more common than preference or memory. Total cost for this tier: **$0.627**
+across 990 real LLM calls (running total across all experimentation,
+all three task pairs: **~$1.11**).
+
+**Aggregation is now measured at all three real volume tiers (10/100/1,000)**,
+with the belief-omission finding holding consistently across two orders of
+magnitude of sample size -- as solid a basis as this project has for
+treating it as a real result rather than an artifact. Remaining for this
+task pair: ≥5 trials per tier (only 1 clean trial at N=1,000, 1 at N=10,
+and N=100's "trial 1" is really 2 pooled runs) to satisfy Phase 3 properly,
+and the projected 10K/100K/1M tiers once the cost curve gets fit in Phase 4.
+
 ### 2026-10-02 (later still) — Data Retrieval: 5 trials at N=10, real variance data (Phase 3's first real pass)
 
 **Data Retrieval, N=10, trials 1-5, all on production** (`results/raw_data_retrieval.csv`,
@@ -737,3 +936,154 @@ this task pair: N=100/1,000 tiers (still only N=10 has real data), and
 re-running the earlier N=10 production run's engineered-side numbers are
 unaffected by this fix (the grader only touches the LLM side), so that data
 remains valid as-is.
+
+### 2026-10-04 — Retrieval at N=100: grader fix holds, cost curve starting to take shape
+
+**N=100 run on production** (`results/raw_data_retrieval.csv`), clean
+single run with the fixed word-overlap grader:
+
+| metric | N=10 (10 pooled trials) | N=100 |
+|---|---|---|
+| LLM accuracy | 100/100 | **99/100 (99.0%)** |
+| mean tokens | ~660 | 399 |
+| mean cost | ~$0.00023 | $0.000146 |
+| mean latency (LLM) | ~1,490ms | 969ms |
+| mean latency (engineered) | ~0.8ms | 0.861ms |
+| total cost this tier | -- | $0.0146 |
+
+**Grader fix holds at 10x the sample size** -- 99% vs the earlier 100%,
+well within normal variance for a single genuine LLM miss rather than a
+sign the fix is breaking down. Engineered-side latency stayed essentially
+flat (0.86ms, consistent with the N=10 range) -- exactly the "variable_cost
+stays flat across volume" behavior Phase 0 flagged as worth confirming
+before trusting the cost-curve fit. Engineered-vs-LLM latency ratio at this
+tier: ~1,126x, consistent with the ~1,000x order of magnitude seen at N=10.
+
+**Retrieval is now measured at N=10 (10 trials) and N=100 (1 trial).**
+Remaining: N=1,000, and backfilling trials at N=100 to meet Phase 3's ≥5
+requirement.
+
+### 2026-10-04 (later) — Retrieval at N=1,000: all three task pairs now have real data at all three volume tiers
+
+**N=1,000 run on production** (`results/raw_data_retrieval.csv`), clean
+single run:
+
+| metric | N=10 (10 trials) | N=100 | N=1,000 |
+|---|---|---|---|
+| LLM accuracy | 100% | 99.0% | **99.9%** |
+| mean tokens | ~660 | 399 | 388 |
+| mean cost | ~$0.00023 | $0.000146 | $0.000141 |
+| mean latency (LLM) | ~1,490ms | 969ms | 901ms |
+| mean latency (engineered) | ~0.8ms | 0.861ms | 0.903ms |
+| total cost this tier | -- | $0.0146 | $0.1405 |
+
+Accuracy, cost, and both latencies are all stable across two full orders of
+magnitude of volume -- 100% / 99.0% / 99.9% isn't a trend, it's noise
+around a true rate near 99-100%, and engineered latency sitting at
+~0.8-0.9ms regardless of N is exactly the flat `variable_cost` Phase 0
+needed confirmed before the 10K/100K/1M projections mean anything.
+Engineered-vs-LLM latency ratio holds at ~1,000x across all three tiers.
+
+**Milestone: every one of the three ASMC task pairs now has real measured
+data at all three real volume tiers (10/100/1,000).** Running total spend
+across the entire project, all task pairs, all tiers: **~$1.26**. What
+remains before Phase 1 is genuinely complete:
+- Backfilling trials to meet Phase 3's ≥5-trials-per-tier bar (most tiers
+  currently have 1 clean trial; Retrieval N=10 and Classification are the
+  exceptions, already at 5+)
+- Fitting the `variable_cost`/`fixed_cost` curve per task pair (Phase 1's
+  remaining checklist items, Phase 4's crossover charts)
+- The projected 10K/100K/1M tiers, computed from that fit, not executed
+  directly
+
+### 2026-10-04 (later) — Cost curves fitted (`results/asmc_summary.csv`): two task pairs have NO crossover, one does, and why that happens is the real finding
+
+**variable_cost is real and measured** for every side of every task pair,
+taken from the N=1,000 tier (largest, most stable sample): engineered is
+$0 for all three (Always Free compute, confirmed earlier), LLM sides are
+$0.00014051 (retrieval), $0.00005775 (classification), $0.00063341
+(aggregation) -- all essentially flat across N=10/100/1,000 already
+established in earlier entries.
+
+**fixed_cost is the one genuinely subjective input in this whole model**,
+and it matters enormously -- see below. Estimated at $50/hr dev time, based
+on the actual work this session did building each path:
+- Retrieval: engineered $8.33 (~10 min, one SQL query) vs LLM $75 (~90 min
+  -- this included the two failed grading attempts, which is real
+  engineering cost, not wasted motion to exclude)
+- Classification: engineered **$0** (pre-existing production code,
+  `_detect_nearby_category` already existed before this research) vs LLM
+  $37.50 (~45 min, no grader iteration needed)
+- Aggregation: engineered $75 (~90 min, genuinely new code) vs LLM $16.67
+  (~20 min -- `weekly_digest.py` already existed, only the `return_usage`
+  extension was new work)
+
+**Result: two task pairs have NO crossover at all.** For Retrieval and
+Classification, engineered dominates at every volume from N=1 to N=1M --
+the formula's crossover point comes out negative (-474,486 and -649,351
+respectively), meaning it falls outside the valid domain entirely. This
+isn't a close call: at N=1M, Retrieval's LLM path still costs ~26x more
+per request than engineered ($0.000216 vs $0.0000083); Classification's
+LLM path costs infinitely more in relative terms since engineered is
+exactly $0 at every volume.
+
+**Aggregation is the one real exception, and the reason is structural, not
+random**: a genuine crossover exists at **N≈92,089**. Below that volume,
+the LLM path is cheaper (its low fixed cost, from reusing already-existing
+`weekly_digest.py`, dominates); above it, engineered's $0 variable cost
+eventually wins out despite its higher build cost. **This crossover exists
+specifically because the LLM side was cheaper to build than the engineered
+side** -- the opposite asymmetry from the other two task pairs, where the
+LLM path required new prompt+grader work while the engineered logic
+already existed or was trivial. The crossover volume is a direct function
+of which side gets to start from existing code, not of the LLM's or
+engineered path's intrinsic merit.
+
+**This is the real, generalizable finding for Phase 4's decision rule**:
+ASMC's crossover isn't just about volume and task complexity, as Phase 0
+assumed going in -- it's highly sensitive to which solution a team happens
+to already have built. A team that already has an LLM-based tool and is
+deciding whether to engineer a replacement faces a completely different
+cost curve than a team building both from scratch, even for the identical
+task. The paper's decision rule should state this explicitly: fixed_cost
+must be assessed per-organization (what do *you* already have?), not
+assumed from the task type alone.
+
+**Caveat stated plainly**: fixed_cost figures are estimates, not
+measurements -- the only non-empirical input in this entire cost model.
+`variable_cost`, the accuracy floors, and the crossover arithmetic itself
+are all real; the dev-time estimates are reasoned but not independently
+verified. Sensitivity to this assumption is itself worth a sentence in the
+paper -- e.g. Aggregation's crossover volume would shift meaningfully if
+its fixed-cost estimates changed, while Retrieval/Classification's
+"no crossover" conclusion is robust to reasonable fixed_cost variation
+(the gap is too large for a plausible estimate change to flip it).
+
+Full numbers in `results/asmc_summary.csv`.
+
+### 2026-10-08 — Retrieval N=100 backfilled to 5 trials: Phase 3 satisfied
+
+**Retrieval, N=100, trials 1-5** (`results/raw_data_retrieval.csv`, 900
+total LLM calls -- trials 2-5 each ran with double the expected sample
+size, same harmless accidental-double-loop pattern seen before, all using
+the identical fixed grader, so pooled rather than treated as a problem):
+
+| trial | accuracy | mean cost | mean latency |
+|---|---|---|---|
+| 1 | 99.0% | $0.000146 | 969ms |
+| 2 | 100.0% | $0.000145 | 874ms |
+| 3 | 100.0% | $0.000148 | 949ms |
+| 4 | 100.0% | $0.000140 | 898ms |
+| 5 | 99.5% | $0.000136 | 821ms |
+| **pooled** | **99.78%** (898/900) | -- | -- |
+
+Remarkably stable across trials -- the 99.0-100% range here is a much
+tighter spread than Retrieval's N=10 trials showed pre-fix (80-100%),
+direct confirmation the grader fix resolved the actual noise source rather
+than just moving it. Cost and latency both stayed consistent with every
+earlier measurement at this tier. **Retrieval N=100 now satisfies Phase
+3's ≥5-trials bar.**
+
+Remaining backfills: Aggregation N=10/N=100 (in progress). N=1,000
+backfills for both task pairs remain deliberately skipped per the
+cost/benefit reasoning already logged above.
