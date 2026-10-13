@@ -3254,6 +3254,126 @@ def reopen_task(task_id):
     return jsonify({"ok": True})
 
 
+@app.route("/health/heart-rate", methods=["POST"])
+@login_required
+def sync_heart_rate_session():
+    """Wear OS companion app syncs one completed heart-rate session.
+    Upserts on (user_id, watch_session_id) so a retried sync after a
+    dropped connection never double-inserts."""
+    data = request.get_json(silent=True) or {}
+    watch_session_id = (data.get("session_id") or "").strip()
+    started_at = data.get("started_at")
+    samples = data.get("samples")
+    if not watch_session_id or not started_at or not isinstance(samples, list):
+        return jsonify({"error": "session_id, started_at, and samples are required"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "INSERT INTO heart_rate_sessions (user_id, watch_session_id, source, started_at, ended_at, samples) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, watch_session_id) DO UPDATE SET "
+        "ended_at = EXCLUDED.ended_at, samples = EXCLUDED.samples "
+        "RETURNING id",
+        (current_user_id(), watch_session_id, data.get("source") or "wear_health_services",
+         started_at, data.get("ended_at"), json.dumps(samples)),
+    )
+    session_row_id = cur.fetchone()["id"]
+    db.commit()
+    return jsonify({"ok": True, "id": session_row_id})
+
+
+@app.route("/health/heart-rate", methods=["GET"])
+@login_required
+def list_heart_rate_sessions():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id, watch_session_id, source, started_at, ended_at, samples "
+        "FROM heart_rate_sessions WHERE user_id = %s ORDER BY started_at DESC LIMIT 50",
+        (current_user_id(),),
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
+
+
+@app.route("/health/heart-rate/correlate", methods=["GET"])
+@login_required
+def correlate_heart_rate():
+    """Correlates this user's recent conversations/tasks/mood_logs with
+    heart-rate samples recorded within +/- window_minutes of each one.
+    These source tables only store a single created_at point (no
+    start/end range), so "overlap" here means "close in time", not a
+    literal interval intersection."""
+    user_id = current_user_id()
+    try:
+        window_minutes = int(request.args.get("window_minutes", 15))
+    except ValueError:
+        return jsonify({"error": "window_minutes must be an integer"}), 400
+    window = timedelta(minutes=max(1, min(window_minutes, 180)))
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT (sample->>'measured_at')::timestamptz AS measured_at, (sample->>'bpm')::float AS bpm "
+        "FROM heart_rate_sessions, jsonb_array_elements(samples) AS sample "
+        "WHERE user_id = %s",
+        (user_id,),
+    )
+    hr_rows = cur.fetchall()
+
+    def stats_near(ts):
+        if ts is None:
+            return None
+        nearby = [r["bpm"] for r in hr_rows if ts - window <= r["measured_at"] <= ts + window]
+        if not nearby:
+            return None
+        return {
+            "avg_bpm": round(sum(nearby) / len(nearby), 1),
+            "min_bpm": round(min(nearby), 1),
+            "max_bpm": round(max(nearby), 1),
+            "sample_count": len(nearby),
+        }
+
+    results = []
+
+    cur.execute(
+        "SELECT id, title, created_at FROM conversations WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    )
+    for row in cur.fetchall():
+        hr = stats_near(row["created_at"])
+        if hr:
+            results.append({"type": "conversation", "id": row["id"],
+                             "label": row["title"] or "Listen session",
+                             "at": row["created_at"].isoformat(), **hr})
+
+    cur.execute(
+        "SELECT id, description, created_at FROM tasks WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    )
+    for row in cur.fetchall():
+        hr = stats_near(row["created_at"])
+        if hr:
+            results.append({"type": "task", "id": row["id"], "label": row["description"],
+                             "at": row["created_at"].isoformat(), **hr})
+
+    cur.execute(
+        "SELECT id, mood_label, created_at FROM mood_logs WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    )
+    for row in cur.fetchall():
+        hr = stats_near(row["created_at"])
+        if hr:
+            results.append({"type": "mood", "id": row["id"], "label": row["mood_label"],
+                             "at": row["created_at"].isoformat(), **hr})
+
+    results.sort(key=lambda r: r["at"], reverse=True)
+    return jsonify(results)
+
+
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
 @login_required
 def delete_task(task_id):

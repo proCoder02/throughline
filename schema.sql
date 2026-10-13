@@ -84,6 +84,24 @@ CREATE TABLE IF NOT EXISTS mood_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Wear OS companion app -- heart-rate sessions synced from the watch.
+-- samples stored as JSONB (list of {bpm, measured_at, source, accuracy}) --
+-- a session is a handful of samples, never queried per-sample, so one row
+-- per session avoids a second table for no benefit.
+CREATE TABLE IF NOT EXISTS heart_rate_sessions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    watch_session_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'wear_health_services',
+    started_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ,
+    samples JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, watch_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_heart_rate_sessions_user_started
+    ON heart_rate_sessions (user_id, started_at);
+
 -- Mutual friendship: adding a friend by code inserts both directions, so a
 -- friend list is always a plain "WHERE user_id = ?" with no OR/self-join.
 CREATE TABLE IF NOT EXISTS friendships (

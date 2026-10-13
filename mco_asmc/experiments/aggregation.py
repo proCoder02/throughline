@@ -52,10 +52,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import random
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import psycopg2
@@ -94,6 +96,62 @@ PRICE_PER_1M_OUTPUT_TOKENS = 0.60
 
 def log(msg: str) -> None:
     print(f"[aggregation] {msg}", flush=True)
+
+
+_MANIFEST_PATH = Path(__file__).resolve().parent.parent.parent / "demo_data_manifest.json"
+# One row per table: (table, manifest key, timestamp column). preferences
+# uses updated_at (no created_at column), see seed_demo_data.py's own INSERT.
+_EI_TIMESTAMP_TABLES = [
+    ("emotional_intelligence.facts", "ei_fact_ids", "created_at"),
+    ("emotional_intelligence.beliefs", "ei_belief_ids", "created_at"),
+    ("emotional_intelligence.memories", "ei_memory_ids", "created_at"),
+    ("emotional_intelligence.preferences", "ei_preference_ids", "updated_at"),
+    ("emotional_intelligence.personality_snapshots", "ei_personality_snapshot_ids", "created_at"),
+]
+
+
+def refresh_ei_timestamps(cur, conn) -> None:
+    """Re-anchors every seeded EI row's timestamp to "recent" before each
+    run (fixed 2026-10-08, see mco_asmc/README.md's "Fixes Required" list).
+
+    weekly_digest.py's LOOKBACK_DAYS=7 filter is relative to whenever a
+    digest is actually generated, not to when the data was seeded. All 110
+    friends' EI data was seeded ONCE with fixed timestamps -- run this
+    script again days later (exactly what happened backfilling Phase 3
+    trials) and a chunk of that same data silently falls outside the 7-day
+    window, shrinking the deterministic checklist itself. That looked like
+    "the LLM got better at coverage" until checked directly (personality's
+    miss rate stayed flat while belief's moved -- only explainable as a
+    data-availability artifact, not real model behavior).
+
+    Touches ONLY rows tracked in demo_data_manifest.json -- this script's
+    own seeded test data, identified the same way seed_demo_data.py's own
+    --cleanup finds what to delete. Never touches a real user's real EI
+    data, since real rows are never manifest-tracked."""
+    if not _MANIFEST_PATH.exists():
+        log("  No demo_data_manifest.json found -- skipping EI timestamp refresh "
+            "(nothing to refresh, or seed_demo_data.py hasn't been run here).")
+        return
+    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    now = datetime.now().astimezone()
+    safety_margin_days = 2  # keep timestamps comfortably inside LOOKBACK_DAYS, not right at the edge
+    max_age_days = max(1, LOOKBACK_DAYS - safety_margin_days)
+
+    touched = 0
+    for table, key, column in _EI_TIMESTAMP_TABLES:
+        ids = manifest.get(key) or []
+        if not ids:
+            continue
+        # Each row gets its own fresh random offset (0..max_age_days back),
+        # same spread convention as the original seeding, just re-anchored
+        # to actual "now" instead of stale seed-time "now".
+        for row_id in ids:
+            new_ts = now - timedelta(days=random.uniform(0, max_age_days))
+            cur.execute(f"UPDATE {table} SET {column} = %s WHERE id = %s", (new_ts, row_id))
+        touched += len(ids)
+    conn.commit()
+    log(f"  Refreshed timestamps on {touched} seeded EI rows so they're back inside "
+        f"weekly_digest.py's {LOOKBACK_DAYS}-day lookback window.")
 
 
 def build_deterministic_digest(data: dict, relationships: list[dict]) -> list[dict]:
@@ -190,6 +248,7 @@ def run(n: int, trial: int, username: str) -> None:
         raise SystemExit(f"No user named '{username}' found.")
     amit_id = row[0]
 
+    refresh_ei_timestamps(cur, conn)
     cases = load_test_users(cur, amit_id, n)
 
     dict_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)

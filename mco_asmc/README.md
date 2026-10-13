@@ -201,6 +201,25 @@ not just discussed. Ordered by priority, not by when they were found.
       than it is. Real per-query CPU attribution would need
       `pg_stat_statements` (not enabled on production) or real profiling.
 
+### Structural gaps (continued)
+- [x] **Aggregation's trial timing was confounded by the 7-day lookback
+      window — fixed 2026-10-08.** EI data was seeded once with fixed
+      timestamps; trials run on a later calendar day than seeding saw a
+      shrunken deterministic checklist (data aging out of
+      `LOOKBACK_DAYS=7`), not genuine LLM variance -- confirmed via
+      belief-miss rate moving 54%->24-33% while personality-miss stayed
+      flat 5-7%, which only makes sense as a data-availability effect, not
+      a behavior change. **Fix**: `aggregation.py` now calls
+      `refresh_ei_timestamps()` at the start of every run, re-anchoring
+      every manifest-tracked seeded EI row to a fresh random offset
+      (0 to `LOOKBACK_DAYS-2` days back) from *actual* current time, not
+      stale seed time. Self-healing -- no need to remember to reseed
+      before future trial batches, regardless of how many days have
+      passed. Deployed to production, verified working (561 rows
+      refreshed on a local test run, logged cleanly). Touches only
+      manifest-tracked rows, identified the same way `--cleanup` finds
+      what to delete, so real user data is never at risk.
+
 ### Lower priority / consistency
 - [ ] Classification's N=100/1,000 ran locally, not production — harmless
       for accuracy (synthetic test messages), but inconsistent with
@@ -1087,3 +1106,99 @@ earlier measurement at this tier. **Retrieval N=100 now satisfies Phase
 Remaining backfills: Aggregation N=10/N=100 (in progress). N=1,000
 backfills for both task pairs remain deliberately skipped per the
 cost/benefit reasoning already logged above.
+
+### 2026-10-08 — Aggregation trial backfill: a real rate-limit incident, and a real methodology confound found before it could contaminate anything
+
+**Rate limit hit mid-run.** Aggregation N=100 trial 5 started returning
+`429 Client Error: Too Many Requests` from Ollama Cloud partway through
+(after heavy sustained usage across this whole backfill session). Caught
+before trusting the data: `weekly_digest.py` catches the API error
+*internally* and returns an empty digest, which looks identical in the
+logged row to a legitimate "nothing noteworthy this week" case -- the word
+"error" never appears in the CSV. Had to distinguish them by a different
+signal: a real failure has `tokens=0` AND the deterministic side still
+found real items to miss (`"X missed"` with X>0); a genuine empty case has
+`tokens=0` AND `"all deterministic items covered"` (nothing existed to
+miss in the first place). Found **75 real failures, all in N=100 trial
+5**, confirmed and removed from both the local and production CSVs (the
+underlying rate limit was confirmed exhausted, so this trial was not
+re-run immediately -- noted as incomplete, 25 valid cases remain from it,
+not discarded).
+
+**A second, more important problem surfaced while checking the cleaned
+data**: coverage jumped from ~22-37% (trial 1) to ~60-85% (trials 2-5) --
+too large a swing to wave off as ordinary LLM sampling variance,
+especially compared to how tight Retrieval's and Classification's trial
+variance has been throughout this project. Investigated rather than
+reported: normalizing belief-miss counts per case, the rate dropped from
+~54% (trial 1) to ~24-33% (trials 2-5), while personality-miss stayed flat
+at 5-7% across every trial. If this were genuine LLM behavior change,
+personality should have moved too -- it didn't, which points at something
+structural instead.
+
+**Root cause: a timestamp/lookback-window confound, not an LLM effect.**
+All 110 friends' EI data was seeded once, with `created_at` values set
+0-5 days *before the seeding moment* (~2026-10-03/04). `weekly_digest.py`'s
+`LOOKBACK_DAYS=7` filter is relative to **whenever the digest is actually
+generated**, not to seed time. Trial 1 ran immediately after seeding, so
+nearly all seeded data was still inside the 7-day window. Trials 2-5 ran
+several real days later (this session spanned to 2026-10-08) -- by then, a
+meaningful share of that same seeded data had aged past the 7-day cutoff
+for *both* the deterministic and LLM paths, shrinking the deterministic
+checklist itself. Fewer belief items to miss looks identical to "the LLM
+got better at including beliefs" unless you check the mechanism directly,
+which is what the personality-rate staying flat while belief's rate moved
+actually proves.
+
+**Consequence: trials 1 and 2-5 are not directly comparable samples of the
+same experiment**, and pooling them into one Phase-3 variance figure would
+misrepresent what changed. Trial 1 (run same-day as seeding, same
+footing as every other task pair's clean measurements) is kept as the
+reference. Trials 2-5 are kept in the data and documented, but **not**
+folded into a single pooled accuracy number for this task pair --
+reporting a false "variance" that's actually a dataset-freshness artifact
+would be worse than reporting fewer clean trials.
+
+**Real fix, not done yet (flagged as an open item)**: either reseed
+immediately before each future trial batch (resets the clock), or change
+`seed_friend_own_ei_data()` to anchor timestamps relative to "now" at
+*read* time rather than fixed at seed time (not practical for a one-time
+INSERT), or explicitly control for elapsed time when comparing Aggregation
+trials going forward. Until one of these is done, additional Aggregation
+trials run on a different calendar day than the original seeding should be
+treated as a different experimental condition, not a repeat.
+
+### 2026-10-08 (later) — Timestamp confound fixed: aggregation.py now self-heals before every run
+
+**Chose the self-healing fix over the manual-reseed workaround.**
+Reseeding before every trial batch would work but relies on remembering to
+do it -- exactly the kind of thing that silently breaks a methodology
+months later. Instead, `aggregation.py` now has a `refresh_ei_timestamps()`
+step that runs automatically at the start of every invocation: it reads
+`demo_data_manifest.json` (the same file `seed_demo_data.py --cleanup`
+already uses to know what it created), and re-anchors every seeded fact/
+belief/memory/preference/personality-snapshot row's timestamp to a fresh
+random offset from the moment the script actually runs, using
+`LOOKBACK_DAYS` itself (imported from `weekly_digest.py`, not
+hand-duplicated) so the margin stays correct even if that constant
+changes later.
+
+**Verified before deploying, not assumed**: ran locally first -- 561 rows
+refreshed, logged cleanly, no errors. The LLM call itself still failed
+(429, Ollama's rate limit is still exhausted from today's heavy backfill
+usage, confirmed separately), which is expected and unrelated -- it
+confirms the refresh step works in isolation from whether the actual
+digest call succeeds. Test rows removed from the CSV before deploying.
+Deployed to production, compiled cleanly there too.
+
+**Why this matters beyond just fixing today's confound**: without this,
+every future Aggregation run more than a few days after the last reseed
+would silently re-introduce the same bias, and it wouldn't be obvious
+unless someone happened to compare belief-miss and personality-miss rates
+the way this was caught. Self-healing removes that entire class of future
+mistake rather than documenting a manual step someone has to remember.
+
+**Still genuinely pending**: re-running Aggregation's N=10/N=100 trial
+backfills for real now that both problems (rate limit exhaustion, timing
+confound) are understood -- blocked only on Ollama's rate limit resetting,
+not on anything else.
