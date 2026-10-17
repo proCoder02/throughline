@@ -4,14 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Throughline Ops</title>
+<script>
+  // Set the theme attribute before first paint, same reasoning as the
+  // main app's useTheme.js -- otherwise the page flashes the wrong theme
+  // for a frame on load. Own localStorage key (not the main app's "theme")
+  // since this is a separate audience/credential -- picking a theme here
+  // shouldn't silently change the consumer app's theme too.
+  (function () {
+    var saved = localStorage.getItem('admin_theme');
+    var theme = saved === 'light' || saved === 'dark' ? saved
+      : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
 <style>
-  /* Same design tokens as frontend/src/theme.css (dark palette) -- kept in
-     sync by value, not by sharing the file, since this is a plain
-     server-rendered page with no build step. Only the subset this page
-     actually uses is reproduced here. */
+  /* Same design tokens as frontend/src/theme.css -- kept in sync by value,
+     not by sharing the file, since this is a plain server-rendered page
+     with no build step. Dark is the bare :root default, same as the main
+     app; [data-theme="light"] overrides every color token. Only the
+     subset this page actually uses is reproduced here. */
   :root {
     --wa-bg-app: #313338;
     --wa-panel: #2b2d31;
@@ -28,6 +42,10 @@
     --wa-warn-bg: #3d3720;
     --wa-warn-text: #f2d585;
 
+    --pill-ok-bg: rgba(35,165,90,0.18); --pill-ok-text: #4fd189;
+    --pill-warn-bg: rgba(242,213,133,0.18); --pill-warn-text: #f2d585;
+    --pill-bad-bg: rgba(218,55,60,0.18); --pill-bad-text: #f3787c;
+
     --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
     --space-5: 20px; --space-6: 24px;
 
@@ -41,6 +59,29 @@
     --shadow-sm: 0 2px 8px rgba(0,0,0,0.28);
     --shadow-md: 0 4px 14px rgba(0,0,0,0.32);
   }
+  :root[data-theme="light"] {
+    --wa-bg-app: #ffffff;
+    --wa-panel: #f2f3f5;
+    --wa-hover: #e3e5e8;
+    --wa-border: #e3e4e8;
+    --wa-text: #060607;
+    --wa-text-soft: #5c5e66;
+    --wa-accent: #0F9C8C;
+    --wa-accent-dark: #0C7E72;
+    --wa-accent-solid: #0e816f;
+    --wa-accent-solid-hover: #0c6e5f;
+    --wa-danger: #da373c;
+    --wa-online: #1f8a4c;
+    --wa-warn-bg: #FFF3CD;
+    --wa-warn-text: #7A5B00;
+
+    --pill-ok-bg: rgba(31,138,76,0.14); --pill-ok-text: #1f8a4c;
+    --pill-warn-bg: rgba(122,91,0,0.14); --pill-warn-text: #7A5B00;
+    --pill-bad-bg: rgba(218,55,60,0.12); --pill-bad-text: #b7282c;
+
+    --shadow-sm: 0 2px 8px rgba(20,20,30,0.08);
+    --shadow-md: 0 4px 14px rgba(20,20,30,0.10);
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--wa-bg-app); color: var(--wa-text);
@@ -48,19 +89,30 @@
     -webkit-font-smoothing: antialiased;
     padding: var(--space-6) var(--space-4) 60px;
   }
+  body, .card, .btn-secondary, a.logout, .theme-toggle {
+    transition: background-color var(--duration-slow) var(--ease-standard),
+                color var(--duration-slow) var(--ease-standard),
+                border-color var(--duration-slow) var(--ease-standard);
+  }
   .wrap { max-width: 980px; margin: 0 auto; }
   header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-6); flex-wrap: wrap; gap: var(--space-3); }
   h1 { font-size: var(--text-2xl); margin: 0; font-weight: 700; }
   .meta { font-size: var(--text-xs); color: var(--wa-text-soft); }
-  a.logout { color: var(--wa-text-soft); font-size: var(--text-sm); text-decoration: none; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); transition: background-color var(--duration-base) var(--ease-standard), color var(--duration-base) var(--ease-standard); }
+  a.logout { color: var(--wa-text-soft); font-size: var(--text-sm); text-decoration: none; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); }
   a.logout:hover { background: var(--wa-hover); color: var(--wa-text); }
+
+  .theme-toggle {
+    width: 36px; height: 36px; border-radius: var(--radius-round);
+    border: 1px solid var(--wa-border); background: var(--wa-panel); color: var(--wa-text-soft);
+    display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer;
+  }
+  .theme-toggle:hover { background: var(--wa-hover); }
 
   .btn-secondary {
     background: var(--wa-hover); color: var(--wa-text); border: 0; font-family: inherit;
     font-size: var(--text-sm); font-weight: 500; padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm); cursor: pointer;
-    transition: background-color var(--duration-base) var(--ease-standard);
   }
-  .btn-secondary:hover { background: #3f4147; }
+  .btn-secondary:hover { filter: brightness(1.1); }
   .btn-secondary:disabled { opacity: 0.6; cursor: default; }
 
   section { margin-bottom: var(--space-6); }
@@ -72,7 +124,6 @@
   .card {
     background: var(--wa-panel); border: 1px solid transparent; border-radius: var(--radius-md); padding: var(--space-4);
     animation: cardIn var(--duration-slow) var(--ease-out) both;
-    transition: border-color var(--duration-base) var(--ease-standard), box-shadow var(--duration-base) var(--ease-standard);
   }
   .card:hover { border-color: var(--wa-border); box-shadow: var(--shadow-sm); }
   .card .title { font-size: var(--text-sm); color: var(--wa-text); font-weight: 600; margin-bottom: var(--space-2); display: flex; align-items: center; gap: var(--space-2); }
@@ -95,9 +146,9 @@
   table td { padding: var(--space-2); border-bottom: 1px solid var(--wa-border); color: var(--wa-text); }
 
   .pill { font-size: var(--text-xs); padding: 2px var(--space-2); border-radius: var(--radius-pill); font-weight: 600; }
-  .pill.ok { background: rgba(35,165,90,0.18); color: #4fd189; }
-  .pill.warn { background: rgba(242,213,133,0.18); color: var(--wa-warn-text); }
-  .pill.bad { background: rgba(218,55,60,0.18); color: #f3787c; }
+  .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-text); }
+  .pill.warn { background: var(--pill-warn-bg); color: var(--pill-warn-text); }
+  .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-text); }
 
   .empty { color: var(--wa-text-soft); font-size: var(--text-sm); padding: var(--space-2) 0; }
   .err { color: var(--wa-danger); font-size: var(--text-sm); }
@@ -109,6 +160,7 @@
     <h1>Throughline Ops</h1>
     <div style="display:flex; align-items:center; gap:var(--space-3);">
       <span class="meta" id="generated-at">loading...</span>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light/dark theme">🌙</button>
       <button class="btn-secondary" id="refresh-btn" onclick="refresh()">Refresh</button>
       <a class="logout" href="/admin/logout">Log out</a>
     </div>
@@ -327,6 +379,17 @@ async function refresh() {
     btn.textContent = "Refresh";
   }
 }
+
+function updateToggleIcon() {
+  document.getElementById('theme-toggle').textContent = document.documentElement.dataset.theme === 'light' ? '☀️' : '🌙';
+}
+function toggleTheme() {
+  var next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('admin_theme', next);
+  updateToggleIcon();
+}
+updateToggleIcon();
 
 refresh();
 setInterval(refresh, REFRESH_MS);
