@@ -71,13 +71,32 @@ PROMPT_VERSION = 1
 MAX_TURNS_PER_EPISODE = int(os.getenv("EI_MAX_TURNS_PER_EPISODE", "400"))
 
 
+def _ollama_api_keys() -> list[str]:
+    """Every configured Ollama Cloud key, primary first -- same fallback
+    reasoning as app.py's own _ollama_api_keys: olama_api_key_2 is a
+    fallback for quota/rate-limit exhaustion, not a second account to
+    load-balance across. Reimplemented standalone here (not imported) per
+    this file's own no-backend-changes convention, same as call_llm below
+    already was before this fix -- every sibling script that hit the
+    primary key's rate limit (confirmed live: trigger_chat_feedback_
+    extraction silently produced nothing during a live /chat/global
+    request while OLLAMA_API_KEY was rate-limited) now gets the same
+    fallback, since they all import call_llm from here rather than each
+    having their own copy."""
+    keys = [
+        os.getenv("OLLAMA_API_KEY") or os.getenv("olama_api_key"),
+        os.getenv("OLLAMA_API_KEY_2") or os.getenv("olama_api_key_2"),
+    ]
+    return [k for k in keys if k]
+
+
 def call_llm(messages: list[dict]) -> tuple[str, dict]:
     """Same Ollama Cloud endpoint/env-var convention as app.py's call_llm --
     reimplemented standalone here (not imported) per the no-backend-changes
     instruction. Returns (content, raw_response) so the caller can pull
     timing/token metadata for analysis_runs provenance."""
-    api_key = os.getenv("OLLAMA_API_KEY") or os.getenv("olama_api_key")
-    if not api_key:
+    keys = _ollama_api_keys()
+    if not keys:
         raise RuntimeError("Missing Ollama API key (OLLAMA_API_KEY / olama_api_key)")
 
     payload = {
@@ -85,15 +104,28 @@ def call_llm(messages: list[dict]) -> tuple[str, dict]:
         "messages": messages,
         "stream": False,
     }
-    response = requests.post(
-        "https://ollama.com/api/chat",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=180,
-    )
-    response.raise_for_status()
-    result = response.json()
-    return result.get("message", {}).get("content", ""), result
+    last_error = None
+    for i, api_key in enumerate(keys):
+        is_last_key = i == len(keys) - 1
+        try:
+            response = requests.post(
+                "https://ollama.com/api/chat",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=180,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if not is_last_key:
+                last_error = e
+                continue
+            raise
+        if response.status_code == 429 and not is_last_key:
+            last_error = requests.HTTPError(response=response)
+            continue
+        response.raise_for_status()
+        result = response.json()
+        return result.get("message", {}).get("content", ""), result
+    raise last_error
 
 
 def extract_json(text: str) -> dict | None:

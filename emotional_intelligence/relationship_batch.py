@@ -169,7 +169,21 @@ def fetch_real_user_subject_map(cur) -> dict[int, dict]:
         WHERE s.canonical_name ~ '^app_user:\\d+$'
         """
     )
-    return {row["user_id"]: {"id": row["subject_id"], "canonical_name": row["canonical_name"]} for row in cur.fetchall()}
+    user_map = {row["user_id"]: {"id": row["subject_id"], "canonical_name": row["canonical_name"]} for row in cur.fetchall()}
+    if not user_map:
+        return user_map
+
+    # Consent gate: drop any user who has explicitly turned off Settings >
+    # Cognitive Intelligence (default TRUE, same opt-out convention as
+    # nudges_schema.sql) -- a relationship profile between two real users
+    # is still "about" both of them even though only one pair gets assessed,
+    # so either side opting out excludes the pair.
+    cur.execute(
+        "SELECT user_id FROM nudges.user_settings WHERE user_id = ANY(%s) AND cognitive_intelligence_enabled = FALSE",
+        (list(user_map.keys()),),
+    )
+    disabled = {row["user_id"] for row in cur.fetchall()}
+    return {uid: v for uid, v in user_map.items() if uid not in disabled}
 
 
 def fetch_user_call_cooccurrence(cur) -> dict[tuple[int, int], int]:

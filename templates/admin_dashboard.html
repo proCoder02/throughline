@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Throughline Ops</title>
+<script>
+  // Set the theme attribute before first paint, same reasoning as the
+  // main app's useTheme.js -- otherwise the page flashes the wrong theme
+  // for a frame on load. Own localStorage key (not the main app's "theme")
+  // since this is a separate audience/credential -- picking a theme here
+  // shouldn't silently change the consumer app's theme too.
+  (function () {
+    var saved = localStorage.getItem('admin_theme');
+    var theme = saved === 'light' || saved === 'dark' ? saved
+      : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
+<style>
+  /* Same design tokens as frontend/src/theme.css -- kept in sync by value,
+     not by sharing the file, since this is a plain server-rendered page
+     with no build step. Dark is the bare :root default, same as the main
+     app; [data-theme="light"] overrides every color token. Only the
+     subset this page actually uses is reproduced here. */
+  :root {
+    --wa-bg-app: #313338;
+    --wa-panel: #2b2d31;
+    --wa-hover: #35373c;
+    --wa-border: #1f2023;
+    --wa-text: #f2f3f5;
+    --wa-text-soft: #a0a2a7;
+    --wa-accent: #1FC8B4;
+    --wa-accent-dark: #16A192;
+    --wa-accent-solid: #128176;
+    --wa-accent-solid-hover: #107066;
+    --wa-danger: #da373c;
+    --wa-online: #23a55a;
+    --wa-warn-bg: #3d3720;
+    --wa-warn-text: #f2d585;
+
+    --pill-ok-bg: rgba(35,165,90,0.18); --pill-ok-text: #4fd189;
+    --pill-warn-bg: rgba(242,213,133,0.18); --pill-warn-text: #f2d585;
+    --pill-bad-bg: rgba(218,55,60,0.18); --pill-bad-text: #f3787c;
+
+    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+    --space-5: 20px; --space-6: 24px;
+
+    --radius-xs: 4px; --radius-sm: 6px; --radius-md: 8px; --radius-lg: 10px; --radius-pill: 999px; --radius-round: 50%;
+
+    --text-xs: 12px; --text-sm: 13px; --text-base: 14px; --text-md: 15px; --text-lg: 16px; --text-xl: 18px; --text-2xl: 20px;
+
+    --duration-fast: 120ms; --duration-base: 180ms; --duration-slow: 240ms;
+    --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); --ease-out: cubic-bezier(0, 0, 0.2, 1);
+
+    --shadow-sm: 0 2px 8px rgba(0,0,0,0.28);
+    --shadow-md: 0 4px 14px rgba(0,0,0,0.32);
+  }
+  :root[data-theme="light"] {
+    --wa-bg-app: #ffffff;
+    --wa-panel: #f2f3f5;
+    --wa-hover: #e3e5e8;
+    --wa-border: #e3e4e8;
+    --wa-text: #060607;
+    --wa-text-soft: #5c5e66;
+    --wa-accent: #0F9C8C;
+    --wa-accent-dark: #0C7E72;
+    --wa-accent-solid: #0e816f;
+    --wa-accent-solid-hover: #0c6e5f;
+    --wa-danger: #da373c;
+    --wa-online: #1f8a4c;
+    --wa-warn-bg: #FFF3CD;
+    --wa-warn-text: #7A5B00;
+
+    --pill-ok-bg: rgba(31,138,76,0.14); --pill-ok-text: #1f8a4c;
+    --pill-warn-bg: rgba(122,91,0,0.14); --pill-warn-text: #7A5B00;
+    --pill-bad-bg: rgba(218,55,60,0.12); --pill-bad-text: #b7282c;
+
+    --shadow-sm: 0 2px 8px rgba(20,20,30,0.08);
+    --shadow-md: 0 4px 14px rgba(20,20,30,0.10);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--wa-bg-app); color: var(--wa-text);
+    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  body, .card, .btn-secondary, a.logout, .theme-toggle, .nav-item {
+    transition: background-color var(--duration-slow) var(--ease-standard),
+                color var(--duration-slow) var(--ease-standard),
+                border-color var(--duration-slow) var(--ease-standard);
+  }
+
+  /* ---------- Left nav drawer -- same shape as the main app's icon-rail/
+     app-shell (frontend/src/theme.css): a fixed-width panel pinned to the
+     left, sections grouped by a small uppercase label, one highlighted
+     active item. "Jobs" is this same page (the only internal screen so
+     far); Grafana/CostLens are external tools, opened in a new tab so the
+     ops session here stays open. ---------- */
+  .app-shell { display: flex; min-height: 100%; }
+  .sidebar { width: 220px; flex-shrink: 0; background: var(--wa-panel); border-right: 1px solid var(--wa-border); padding: var(--space-4) 0; }
+  .sidebar-brand { font-size: var(--text-lg); font-weight: 800; padding: 0 var(--space-4) var(--space-4); }
+  /* Parent category (Infra/Finance) is itself a clickable tree-collapse
+     toggle, not just a label -- the chevron rotates to reflect state,
+     persisted in localStorage so a collapsed section stays collapsed
+     across reloads. */
+  .nav-parent {
+    width: 100%; display: flex; align-items: center; gap: var(--space-2); text-align: left;
+    background: none; border: 0; font-family: inherit; cursor: pointer;
+    font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); font-weight: 700;
+    padding: var(--space-4) var(--space-4) var(--space-1);
+  }
+  .nav-parent:hover { color: var(--wa-text); }
+  .nav-chevron { display: inline-block; font-size: 9px; transition: transform var(--duration-base) var(--ease-standard); }
+  .nav-chevron.collapsed { transform: rotate(-90deg); }
+  .nav-children { display: flex; flex-direction: column; overflow: hidden; }
+  .nav-children.collapsed { display: none; }
+  .nav-item {
+    display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4);
+    color: var(--wa-text-soft); text-decoration: none; font-size: var(--text-sm); font-weight: 500;
+    border-right: 2px solid transparent;
+  }
+  .nav-item:hover { background: var(--wa-hover); color: var(--wa-text); }
+  .nav-item.active { background: color-mix(in srgb, var(--wa-accent) 16%, var(--wa-panel)); color: var(--wa-accent); border-right-color: var(--wa-accent); }
+  .nav-item.disabled { color: var(--wa-text-soft); opacity: 0.45; cursor: default; }
+  .nav-item.disabled:hover { background: none; color: var(--wa-text-soft); }
+  .nav-item-ext { margin-left: auto; font-size: 11px; opacity: 0.7; }
+
+  .main-content { flex: 1; min-width: 0; padding: var(--space-6) var(--space-4) 60px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-6); flex-wrap: wrap; gap: var(--space-3); }
+  h1 { font-size: var(--text-2xl); margin: 0; font-weight: 700; }
+  .meta { font-size: var(--text-xs); color: var(--wa-text-soft); }
+  a.logout { color: var(--wa-text-soft); font-size: var(--text-sm); text-decoration: none; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); }
+  a.logout:hover { background: var(--wa-hover); color: var(--wa-text); }
+
+  .theme-toggle {
+    width: 36px; height: 36px; border-radius: var(--radius-round);
+    border: 1px solid var(--wa-border); background: var(--wa-panel); color: var(--wa-text-soft);
+    display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer;
+  }
+  .theme-toggle:hover { background: var(--wa-hover); }
+
+  .btn-secondary {
+    background: var(--wa-hover); color: var(--wa-text); border: 0; font-family: inherit;
+    font-size: var(--text-sm); font-weight: 500; padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm); cursor: pointer;
+  }
+  .btn-secondary:hover { filter: brightness(1.1); }
+  .btn-secondary:disabled { opacity: 0.6; cursor: default; }
+
+  section { margin-bottom: var(--space-6); }
+  h2 { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); margin: 0 0 var(--space-3); font-weight: 700; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-3); }
+
+  @keyframes cardIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .card {
+    background: var(--wa-panel); border: 1px solid transparent; border-radius: var(--radius-md); padding: var(--space-4);
+    animation: cardIn var(--duration-slow) var(--ease-out) both;
+  }
+  .card:hover { border-color: var(--wa-border); box-shadow: var(--shadow-sm); }
+  .card .title { font-size: var(--text-sm); color: var(--wa-text); font-weight: 600; margin-bottom: var(--space-2); display: flex; align-items: center; gap: var(--space-2); }
+
+  .dot { width: 8px; height: 8px; border-radius: var(--radius-round); display: inline-block; flex-shrink: 0; }
+  .dot.ok { background: var(--wa-online); }
+  .dot.warn { background: var(--wa-warn-text); }
+  .dot.bad { background: var(--wa-danger); }
+
+  .row { display: flex; justify-content: space-between; align-items: center; font-size: var(--text-sm); color: var(--wa-text-soft); padding: 3px 0; gap: var(--space-2); }
+  .row b { color: var(--wa-text); font-weight: 500; }
+
+  .bar-track { height: 6px; background: var(--wa-bg-app); border-radius: var(--radius-xs); overflow: hidden; margin-top: var(--space-2); }
+  .bar-fill { height: 100%; border-radius: var(--radius-xs); background: var(--wa-accent); transition: width var(--duration-slow) var(--ease-standard); }
+  .bar-fill.warn { background: var(--wa-warn-text); }
+  .bar-fill.bad { background: var(--wa-danger); }
+
+  table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+  table th { text-align: left; color: var(--wa-text-soft); font-weight: 500; padding: var(--space-2); border-bottom: 1px solid var(--wa-border); }
+  table td { padding: var(--space-2); border-bottom: 1px solid var(--wa-border); color: var(--wa-text); }
+
+  .pill { font-size: var(--text-xs); padding: 2px var(--space-2); border-radius: var(--radius-pill); font-weight: 600; }
+  .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-text); }
+  .pill.warn { background: var(--pill-warn-bg); color: var(--pill-warn-text); }
+  .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-text); }
+
+  /* Job cards specifically -- an Autosys-style field list (schedule / last
+     run / run time / next run as clearly labeled rows) instead of the
+     generic metric-card shape used elsewhere on this page. */
+  .jobs-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .job-card .job-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
+  .job-card .job-name { font-size: var(--text-md); color: var(--wa-text); font-weight: 700; display: flex; align-items: center; gap: var(--space-2); }
+  .job-fields { display: flex; flex-direction: column; gap: 1px; }
+  .job-field { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); padding: 5px 0; border-bottom: 1px dashed var(--wa-border); }
+  .job-field:last-child { border-bottom: none; }
+  .job-field-label { font-size: var(--text-xs); color: var(--wa-text-soft); text-transform: uppercase; letter-spacing: 0.03em; flex-shrink: 0; }
+  .job-field-value { font-size: var(--text-sm); color: var(--wa-text); font-weight: 500; text-align: right; }
+  .job-field-value.muted { color: var(--wa-text-soft); font-weight: 400; }
+  .job-history { display: flex; align-items: center; justify-content: space-between; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--wa-border); }
+  .job-history-label { font-size: var(--text-xs); color: var(--wa-text-soft); }
+  .job-history-dots { display: flex; gap: 4px; }
+
+  /* Where to actually look when a card shows an error -- a file path for
+     ei_pipeline (it writes a real per-day log file), a journalctl filter
+     for everything else (no dedicated file exists; it only ever prints to
+     stdout, captured by journald under the throughline unit). */
+  .log-hint {
+    font-size: 11px; color: var(--wa-text-soft); font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--wa-bg-app); border: 1px solid var(--wa-border); border-radius: var(--radius-xs);
+    padding: 3px 6px; margin-top: var(--space-2); word-break: break-all;
+  }
+  .log-hint b { color: var(--wa-text-soft); font-family: inherit; font-weight: 600; }
+  .section-log-hint { margin: calc(-1 * var(--space-2)) 0 var(--space-3); }
+
+  .empty { color: var(--wa-text-soft); font-size: var(--text-sm); padding: var(--space-2) 0; }
+  .err { color: var(--wa-danger); font-size: var(--text-sm); }
+
+  @media (max-width: 720px) {
+    /* Sidebar becomes a horizontal top bar below this width -- a 220px
+       fixed rail has no room to coexist with content on a phone screen. */
+    .app-shell { flex-direction: column; }
+    .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--wa-border); display: flex; flex-wrap: wrap; align-items: center; padding: var(--space-3) var(--space-4); gap: var(--space-1); }
+    .sidebar-brand { padding: 0 var(--space-3) 0 0; }
+    .nav-parent { display: none; }
+    .nav-children, .nav-children.collapsed { display: flex; flex-direction: row; }
+    .nav-item { padding: var(--space-2) var(--space-3); border-right: none; border-radius: var(--radius-sm); }
+    .nav-item.active { border-right: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <nav class="sidebar">
+    <div class="sidebar-brand">Throughline Ops</div>
+
+    <button class="nav-parent" onclick="toggleNavGroup('infra')" aria-expanded="true">
+      <span class="nav-chevron" id="chevron-infra">▾</span><span>Infra</span>
+    </button>
+    <div class="nav-children" id="children-infra">
+      <a class="nav-item active" href="/admin">Jobs</a>
+      {% if grafana_url %}
+      <a class="nav-item" href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana Dashboard<span class="nav-item-ext">↗</span></a>
+      {% else %}
+      <span class="nav-item disabled" title="GRAFANA_DASHBOARD_URL not set yet">Grafana Dashboard</span>
+      {% endif %}
+    </div>
+
+    <button class="nav-parent" onclick="toggleNavGroup('finance')" aria-expanded="true">
+      <span class="nav-chevron" id="chevron-finance">▾</span><span>Finance</span>
+    </button>
+    <div class="nav-children" id="children-finance">
+      {% if costlens_url %}
+      <a class="nav-item" href="{{ costlens_url }}" target="_blank" rel="noopener noreferrer">CostLens<span class="nav-item-ext">↗</span></a>
+      {% else %}
+      <span class="nav-item disabled" title="COSTLENS_DASHBOARD_URL not set yet">CostLens</span>
+      {% endif %}
+    </div>
+  </nav>
+
+  <div class="main-content">
+  <div class="wrap">
+  <header>
+    <h1>Throughline Ops</h1>
+    <div style="display:flex; align-items:center; gap:var(--space-3);">
+      <span class="meta" id="generated-at">loading...</span>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light/dark theme">🌙</button>
+      <button class="btn-secondary" id="refresh-btn" onclick="refresh()">Refresh</button>
+      <a class="logout" href="/admin/logout">Log out</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>Cron / Background Jobs</h2>
+    <div class="grid jobs-grid" id="jobs-grid"><div class="empty">Loading...</div></div>
+  </section>
+
+  <section>
+    <h2>EI Extraction (last 24h)</h2>
+    <div id="ei-table"><div class="empty">Loading...</div></div>
+  </section>
+
+  <section>
+    <h2>Weekly Digest</h2>
+    <div class="grid" id="digest-grid"></div>
+  </section>
+
+  <section>
+    <h2>FCM Push (last 24h)</h2>
+    <div class="grid" id="fcm-grid"></div>
+  </section>
+
+  <section>
+    <h2>Database</h2>
+    <div class="grid" id="db-grid"></div>
+  </section>
+
+  <section>
+    <h2>Compute</h2>
+    <div class="grid" id="system-grid"></div>
+  </section>
+  </div>
+  </div>
+</div>
+
+<script>
+const REFRESH_MS = 30000;
+
+function fmtAge(hours) {
+  if (hours === null || hours === undefined) return "never";
+  if (hours < 1) return Math.round(hours * 60) + "m ago";
+  if (hours < 48) return hours.toFixed(1) + "h ago";
+  return (hours / 24).toFixed(1) + "d ago";
+}
+
+function fmtDuration(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 60) return seconds.toFixed(1) + "s";
+  const m = Math.floor(seconds / 60), s = Math.round(seconds % 60);
+  return `${m}m ${s}s`;
+}
+
+function fmtNextRun(iso) {
+  if (!iso) return "—";
+  const next = new Date(iso);
+  const diffMs = next.getTime() - Date.now();
+  const diffH = diffMs / 3600000;
+  const relative = diffH < 1 ? Math.max(0, Math.round(diffH * 60)) + "m" : diffH.toFixed(1) + "h";
+  const clock = next.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `in ${relative} (${clock})`;
+}
+
+function statusDot(job) {
+  if (job.status === "never_run" || job.stale) return "bad";
+  if (job.status === "success") return "ok";
+  if (job.status === "partial") return "warn";
+  return "bad";
+}
+
+function statusPillClass(job) {
+  if (job.status === "never_run" || job.stale) return "bad";
+  if (job.status === "success") return "ok";
+  if (job.status === "partial") return "warn";
+  return "bad";
+}
+
+function historyDot(status) {
+  if (status === "success") return "ok";
+  if (status === "partial") return "warn";
+  return "bad";
+}
+
+function renderHistoryDots(history) {
+  if (!history || !history.length) return '<span class="job-field-value muted">no runs yet</span>';
+  // Oldest first, left to right, so the most recent run is the rightmost
+  // dot -- matches how a sparkline/heartbeat strip reads.
+  return history.slice().reverse().map(h => {
+    const when = h.started_at ? new Date(h.started_at).toLocaleString() : "unknown";
+    return `<span class="dot ${historyDot(h.status)}" title="${h.status} -- ${when}"></span>`;
+  }).join("");
+}
+
+// Where this job's own output actually lands -- ei_pipeline writes a real
+// per-day file (path comes straight from its own tracking row's detail
+// when available, so it's the exact file that run used, not a guess);
+// nudge_cycle never writes a file, only prints to stdout under the
+// throughline systemd unit, so a journalctl filter is the real answer.
+function logHintForJob(j) {
+  if (j.job_name === "ei_pipeline") {
+    const fromRun = j.detail && j.detail.log_file;
+    const today = new Date().toISOString().slice(0, 10);
+    return fromRun || `emotional_intelligence/logs/ei_pipeline_${today}.log`;
+  }
+  return 'journalctl -u throughline -g "nudge_engine"';
+}
+
+// Autosys-style job card: a status badge up top, then a clean label/value
+// field list (Schedule / Last Run / Run Time / Next Run) -- the layout
+// an ops person checking "did this run, and when's it due next" actually
+// scans for, instead of a loose stack of rows.
+function renderJobs(jobs) {
+  const el = document.getElementById("jobs-grid");
+  if (!jobs || !jobs.length) { el.innerHTML = '<div class="empty">No jobs recorded yet.</div>'; return; }
+  el.innerHTML = jobs.map(j => {
+    const lastRunValue = j.started_at
+      ? `${fmtAge(j.age_hours)} <span class="job-field-value muted">(${j.status})</span>`
+      : "never run";
+    return `
+      <div class="card job-card">
+        <div class="job-header">
+          <div class="job-name"><span class="dot ${statusDot(j)}"></span>${j.job_name}</div>
+          <span class="pill ${statusPillClass(j)}">${j.stale ? "STALE" : j.status.toUpperCase()}</span>
+        </div>
+        <div class="job-fields">
+          <div class="job-field"><span class="job-field-label">Schedule</span><span class="job-field-value">${j.cadence_label}</span></div>
+          <div class="job-field"><span class="job-field-label">Last run</span><span class="job-field-value">${lastRunValue}</span></div>
+          <div class="job-field"><span class="job-field-label">Run time</span><span class="job-field-value">${fmtDuration(j.duration_seconds)}</span></div>
+          <div class="job-field"><span class="job-field-label">Next run</span><span class="job-field-value">${fmtNextRun(j.next_run_at)}</span></div>
+        </div>
+        <div class="job-history">
+          <span class="job-history-label">Last ${(j.history||[]).length || 0} runs</span>
+          <span class="job-history-dots">${renderHistoryDots(j.history)}</span>
+        </div>
+        <div class="log-hint"><b>Log:</b> ${logHintForJob(j)}</div>
+      </div>`;
+  }).join("");
+}
+
+// Shared per-section log pointers -- these cards don't each have their own
+// distinct source (unlike the job cards above), they're all different
+// views of the same underlying prints/rows, so one hint string per
+// section, repeated on every card in it per the "every card" ask.
+const EI_LOG_HINT = 'journalctl -u throughline -g "ei_adapter"';
+const DIGEST_LOG_HINT = 'journalctl -u throughline -g "nudge_engine"';
+const FCM_LOG_HINT = 'journalctl -u throughline -g "fcm"';
+const DB_LOG_HINT = 'journalctl -u throughline';
+const SYSTEM_LOG_HINT = 'journalctl -u throughline';
+
+function renderEi(ei) {
+  const el = document.getElementById("ei-table");
+  const keys = Object.keys(ei || {});
+  if (!keys.length) { el.innerHTML = '<div class="empty">No extraction activity in the last 24h.</div>'; return; }
+  const rows = keys.map(k => {
+    const v = ei[k];
+    const pill = v.error > 0 ? "warn" : "ok";
+    return `<tr><td>${k}</td><td>${v.success}</td><td><span class="pill ${pill}">${v.error}</span></td><td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td></tr>`;
+  }).join("");
+  el.innerHTML = `<div class="card" style="padding:0;">
+    <table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table>
+    <div class="log-hint" style="margin:0; border:none; border-top:1px solid var(--wa-border); border-radius:0;"><b>Log:</b> ${EI_LOG_HINT}</div>
+  </div>`;
+}
+
+function renderDigest(d) {
+  const el = document.getElementById("digest-grid");
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Sent (7d)</div>
+      <div class="row"><b style="font-size:22px;">${d.sent_last_7d ?? 0}</b></div>
+      <div class="log-hint"><b>Log:</b> ${DIGEST_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">Last sent</div>
+      <div class="row"><b>${d.last_sent_at ? new Date(d.last_sent_at).toLocaleString() : "never"}</b></div>
+      <div class="log-hint"><b>Log:</b> ${DIGEST_LOG_HINT}</div>
+    </div>`;
+}
+
+function renderFcm(fcm) {
+  const el = document.getElementById("fcm-grid");
+  const by = fcm.last_24h || {};
+  const sent = by.sent || 0, stale = by.stale || 0, error = by.error || 0, noToken = by.no_token || 0;
+  const errPill = (error > 0 || stale > 0) ? "warn" : "ok";
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Sent</div>
+      <div class="row"><b style="font-size:22px;">${sent}</b></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">Stale / Error</div>
+      <div class="row"><span class="pill ${errPill}">${stale} stale, ${error} error</span></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">No token</div>
+      <div class="row"><b>${noToken}</b></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">Registered devices</div>
+      <div class="row"><b>${fcm.registered_tokens ?? 0}</b></div>
+      <div class="row" style="font-size:11px;"><span>Last send</span><span>${fcm.last_send_at ? new Date(fcm.last_send_at).toLocaleString() : "never"}</span></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
+    </div>`;
+}
+
+function fmtBytes(b) {
+  if (b === null || b === undefined) return "-";
+  const gb = b / 1e9;
+  if (gb >= 1) return gb.toFixed(2) + " GB";
+  return (b / 1e6).toFixed(1) + " MB";
+}
+
+function renderDb(db) {
+  const el = document.getElementById("db-grid");
+  const tableRows = (db.largest_tables || []).map(t =>
+    `<tr><td>${t.table}</td><td>${fmtBytes(t.bytes)}</td></tr>`
+  ).join("");
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Total DB size</div>
+      <div class="row"><b style="font-size:22px;">${fmtBytes(db.total_bytes)}</b></div>
+      <div class="log-hint"><b>Log:</b> ${DB_LOG_HINT}</div>
+    </div>
+    <div class="card" style="grid-column: span 2; padding:0;">
+      <div class="title" style="padding:var(--space-4) var(--space-4) 0;">Largest tables</div>
+      <table style="padding:0 var(--space-4) var(--space-3);"><tr><th>table</th><th>size</th></tr>${tableRows}</table>
+      <div class="log-hint" style="margin:0 var(--space-4) var(--space-3); border-radius:var(--radius-xs);"><b>Log:</b> ${DB_LOG_HINT}</div>
+    </div>`;
+}
+
+function barClass(pct) {
+  if (pct >= 90) return "bad";
+  if (pct >= 70) return "warn";
+  return "";
+}
+
+function renderSystem(sys) {
+  const el = document.getElementById("system-grid");
+  const disk = sys.disk || {};
+  const mem = sys.memory || {};
+  const cpu = sys.cpu || {};
+
+  const diskHtml = disk.error
+    ? `<div class="err">${disk.error}</div>`
+    : `<div class="row"><span>Used</span><b>${disk.used_gb} / ${disk.total_gb} GB</b></div>
+       <div class="bar-track"><div class="bar-fill ${barClass(disk.percent_used)}" style="width:${disk.percent_used}%"></div></div>
+       <div class="row" style="margin-top:6px;"><span>Free</span><b>${disk.free_gb} GB</b></div>`;
+
+  const memHtml = mem.error
+    ? `<div class="err">${mem.error}</div>`
+    : `<div class="row"><span>Used</span><b>${(mem.used_mb/1024).toFixed(1)} / ${(mem.total_mb/1024).toFixed(1)} GB</b></div>
+       <div class="bar-track"><div class="bar-fill ${barClass(mem.percent_used)}" style="width:${mem.percent_used}%"></div></div>`;
+
+  const cpuHtml = cpu.error
+    ? `<div class="err">${cpu.error}</div>`
+    : `<div class="row"><span>Load (1m/5m/15m)</span><b>${cpu.load_1m} / ${cpu.load_5m} / ${cpu.load_15m}</b></div>
+       <div class="row"><span>Cores</span><b>${cpu.core_count}</b></div>`;
+
+  el.innerHTML = `
+    <div class="card"><div class="title">Disk</div>${diskHtml}</div>
+    <div class="card"><div class="title">Memory</div>${memHtml}</div>
+    <div class="card"><div class="title">CPU</div>${cpuHtml}</div>`;
+}
+
+async function refresh() {
+  const btn = document.getElementById("refresh-btn");
+  btn.disabled = true;
+  btn.textContent = "Refreshing...";
+  try {
+    const res = await fetch("/admin/api/status", { credentials: "same-origin" });
+    if (res.status === 401 || res.redirected) { window.location.href = "/admin/login"; return; }
+    const data = await res.json();
+    renderJobs(data.jobs);
+    renderEi(data.ei_realtime);
+    renderDigest(data.weekly_digest);
+    renderFcm(data.fcm);
+    renderDb(data.db);
+    renderSystem(data.system);
+    document.getElementById("generated-at").textContent =
+      "Updated " + new Date(data.generated_at).toLocaleTimeString() +
+      " · EI " + (data.flags.emotional_intelligence_enabled ? "on" : "off") +
+      " · Nudges " + (data.flags.nudge_feature_enabled ? "on" : "off");
+  } catch (e) {
+    document.getElementById("generated-at").textContent = "Failed to load: " + e;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Refresh";
+  }
+}
+
+function updateToggleIcon() {
+  document.getElementById('theme-toggle').textContent = document.documentElement.dataset.theme === 'light' ? '☀️' : '🌙';
+}
+function toggleTheme() {
+  var next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('admin_theme', next);
+  updateToggleIcon();
+}
+updateToggleIcon();
+
+function toggleNavGroup(key) {
+  var children = document.getElementById('children-' + key);
+  var chevron = document.getElementById('chevron-' + key);
+  var collapsing = !children.classList.contains('collapsed');
+  children.classList.toggle('collapsed', collapsing);
+  chevron.classList.toggle('collapsed', collapsing);
+  document.querySelector('.nav-parent[onclick*="' + key + '"]').setAttribute('aria-expanded', String(!collapsing));
+  try { localStorage.setItem('admin_nav_' + key, collapsing ? 'closed' : 'open'); } catch (e) {}
+}
+// Restore each group's collapsed/expanded state from the last visit --
+// defaults to expanded (both are small, two-and-one-item trees) if never
+// toggled before.
+['infra', 'finance'].forEach(function (key) {
+  var saved;
+  try { saved = localStorage.getItem('admin_nav_' + key); } catch (e) { saved = null; }
+  if (saved === 'closed') toggleNavGroup(key);
+});
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

@@ -191,23 +191,36 @@ def _summarize_for_prompt(data: dict, relationships: list[dict]) -> str:
     return "\n\n".join(lines) if lines else "(nothing new this week)"
 
 
-def generate_weekly_digest(user_id: int) -> list[dict] | None:
+def generate_weekly_digest(user_id: int, return_usage: bool = False):
     """Returns a list of insight-card dicts, or None if the user has no EI
     subject yet, or nothing genuinely new was found (never an error in
-    that case -- both are ordinary, common outcomes, not failures)."""
+    that case -- both are ordinary, common outcomes, not failures).
+
+    return_usage (added 2026-10-03, additive/opt-in -- see
+    mco_asmc/README.md's "Fixes Required" list): when True, returns
+    (cards_or_none, usage_dict_or_none) instead, where usage_dict is
+    {"prompt_tokens", "completion_tokens", "total_tokens"} from the
+    underlying Ollama call, or None wherever no LLM call was made (no EI
+    subject, nothing new this week, or the call itself failed). Every
+    existing caller (nudge_engine.py, this module's own CLI) omits this
+    argument and gets the exact same plain list-or-None return as before --
+    nothing about their behavior changes."""
+    def _done(cards, usage=None):
+        return (cards, usage) if return_usage else cards
+
     conn = psycopg2.connect(DB_URL)
     try:
         plain_cur = conn.cursor()
         subject_id = _resolve_subject_id(plain_cur, user_id)
         if subject_id is None:
-            return None
+            return _done(None)
 
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         data = _fetch_recent_ei_data(cur, subject_id)
         relationships = _fetch_recent_relationship_insights(cur, user_id, subject_id)
 
         if not any(data[k] for k in ("facts", "beliefs", "memories", "preferences", "personality_snapshots")) and not relationships:
-            return None
+            return _done(None)
 
         prompt = DIGEST_PROMPT.format(
             today=datetime.now().strftime("%A, %Y-%m-%d"),
@@ -216,14 +229,19 @@ def generate_weekly_digest(user_id: int) -> list[dict] | None:
             data_summary=_summarize_for_prompt(data, relationships),
         )
         try:
-            content, _raw = call_llm([{"role": "user", "content": prompt}])
+            content, raw = call_llm([{"role": "user", "content": prompt}])
         except Exception as e:
             print(f"[weekly_digest] LLM call failed for user {user_id}: {e!r}")
-            return None
+            return _done(None)
+
+        prompt_tokens = raw.get("prompt_eval_count", 0)
+        completion_tokens = raw.get("eval_count", 0)
+        usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                  "total_tokens": prompt_tokens + completion_tokens}
 
         parsed = extract_json(content)
         if not parsed:
-            return None
+            return _done(None, usage)
         cards = parsed.get("cards") or []
 
         valid_cards = []
@@ -239,7 +257,7 @@ def generate_weekly_digest(user_id: int) -> list[dict] | None:
                 "headline": headline,
                 "body": body,
             })
-        return valid_cards or None
+        return _done(valid_cards or None, usage)
     finally:
         conn.close()
 

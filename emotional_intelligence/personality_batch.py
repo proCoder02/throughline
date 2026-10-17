@@ -58,6 +58,11 @@ Reply with ONLY this JSON, no preamble/fences:
 
 
 def fetch_qualifying_subjects(cur, min_data: int, min_new_data: int, limit: int) -> list[dict]:
+    """Excludes an app_user subject whose owner has turned off Settings >
+    Cognitive Intelligence (nudges.user_settings.cognitive_intelligence_enabled
+    = FALSE) -- default TRUE, same opt-out convention as nudges_schema.sql.
+    Non-app_user (Friends-corpus) subjects are never affected by this join,
+    since the ON condition only matches canonical_name's 'app_user:<id>' shape."""
     cur.execute(
         """
         WITH last_snapshot AS (
@@ -76,10 +81,20 @@ def fetch_qualifying_subjects(cur, min_data: int, min_new_data: int, limit: int)
                 (SELECT count(*) FROM emotional_intelligence.memories m WHERE m.subject_id=s.id AND (ls.last_at IS NULL OR m.created_at > ls.last_at)) AS new_since_last
             FROM emotional_intelligence.subjects s
             LEFT JOIN last_snapshot ls ON ls.subject_id = s.id
+        ),
+        consent AS (
+            SELECT st.id, COALESCE(ns.cognitive_intelligence_enabled, TRUE) AS enabled
+            FROM subject_totals st
+            LEFT JOIN nudges.user_settings ns
+                ON st.canonical_name ~ '^app_user:\\d+$'
+               AND ns.user_id = (regexp_match(st.canonical_name, '^app_user:(\\d+)$'))[1]::int
         )
-        SELECT id, canonical_name, total, last_at, new_since_last FROM subject_totals
-        WHERE total >= %s AND (last_at IS NULL OR new_since_last >= %s)
-        ORDER BY (last_at IS NULL) DESC, new_since_last DESC
+        SELECT st.id, st.canonical_name, st.total, st.last_at, st.new_since_last
+        FROM subject_totals st
+        JOIN consent c ON c.id = st.id
+        WHERE st.total >= %s AND (st.last_at IS NULL OR st.new_since_last >= %s)
+          AND c.enabled = TRUE
+        ORDER BY (st.last_at IS NULL) DESC, st.new_since_last DESC
         """ + (f" LIMIT {int(limit)}" if limit else ""),
         (min_data, min_new_data),
     )

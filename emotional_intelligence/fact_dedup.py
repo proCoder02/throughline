@@ -64,12 +64,19 @@ Empty "clusters" list if nothing overlaps."""
 
 
 def fetch_qualifying_subjects(cur, min_facts: int, subject_name: str | None = None) -> list[dict]:
+    """Excludes an app_user subject whose owner has turned off Settings >
+    Cognitive Intelligence (default TRUE, same opt-out convention as
+    nudges_schema.sql) -- same consent gate as the other batch scripts."""
     cur.execute(
         """
         SELECT s.id, s.canonical_name, count(f.id) AS fact_count
         FROM emotional_intelligence.subjects s
         JOIN emotional_intelligence.facts f ON f.subject_id = s.id
+        LEFT JOIN nudges.user_settings ns
+            ON s.canonical_name ~ '^app_user:\\d+$'
+           AND ns.user_id = (regexp_match(s.canonical_name, '^app_user:(\\d+)$'))[1]::int
         WHERE (%s IS NULL OR lower(s.canonical_name) = lower(%s))
+          AND COALESCE(ns.cognitive_intelligence_enabled, TRUE) = TRUE
         GROUP BY s.id, s.canonical_name
         HAVING count(f.id) >= %s
         ORDER BY fact_count DESC

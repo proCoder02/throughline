@@ -57,32 +57,101 @@ Scheduling (Windows Task Scheduler, twice daily at 8am and 8pm):
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv()
 
 HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / "logs"
+DB_URL = os.getenv("DATABASE_URL")
 
 
-def run_stage(name: str, cmd: list[str], log_file) -> int:
+def _ensure_ops_schema(conn) -> None:
+    """Idempotent, run every invocation -- same self-migrating convention
+    as real_user_extraction.py's ensure_migration(). Shared by this file,
+    nudge_engine.py, and app.py's admin dashboard (the reader), so whichever
+    of those runs first creates it."""
+    cur = conn.cursor()
+    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops.job_runs (
+            id SERIAL PRIMARY KEY,
+            job_name TEXT NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'running',
+            detail JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
+    conn.commit()
+    cur.close()
+
+
+def _start_job_run(conn, job_name: str) -> int | None:
+    """Best-effort: a tracking-row failure must never stop the actual
+    pipeline from running, same reasoning as every other optional/additive
+    module in this repo (ei_adapter.py, nudges/nudge_engine.py)."""
+    try:
+        _ensure_ops_schema(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO ops.job_runs (job_name, started_at, status) VALUES (%s, now(), 'running') RETURNING id",
+            (job_name,),
+        )
+        run_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return run_id
+    except Exception as e:
+        print(f"[ops.job_runs] failed to start tracking row: {e!r}")
+        return None
+
+
+def _finish_job_run(conn, run_id: int | None, status: str, detail: dict) -> None:
+    if run_id is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE ops.job_runs SET finished_at = now(), status = %s, detail = %s WHERE id = %s",
+            (status, json.dumps(detail), run_id),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[ops.job_runs] failed to finish tracking row: {e!r}")
+
+
+def run_stage(name: str, cmd: list[str], log_file) -> dict:
     started = datetime.now()
     result = subprocess.run(cmd, cwd=str(HERE), capture_output=True, text=True)
     finished = datetime.now()
+    duration_s = (finished - started).total_seconds()
 
     log_file.write(f"\n--- stage: {name} ---\n")
     log_file.write(f"started={started.isoformat()} finished={finished.isoformat()} "
-                    f"duration={(finished - started).total_seconds():.1f}s exit_code={result.returncode}\n")
+                    f"duration={duration_s:.1f}s exit_code={result.returncode}\n")
     log_file.write(f"command={' '.join(cmd)}\n")
     log_file.write("stdout:\n" + result.stdout)
     if result.stderr:
         log_file.write("stderr:\n" + result.stderr)
 
     status = "OK" if result.returncode == 0 else "FAILED"
-    print(f"[{status}] {name} finished in {(finished - started).total_seconds():.1f}s (exit_code={result.returncode})")
+    print(f"[{status}] {name} finished in {duration_s:.1f}s (exit_code={result.returncode})")
     print(result.stdout[-800:])
-    return result.returncode
+    return {"exit_code": result.returncode, "duration_s": round(duration_s, 1)}
 
 
 def main() -> int:
@@ -100,29 +169,50 @@ def main() -> int:
     if args.limit:
         extraction_cmd += ["--limit", str(args.limit)]
 
-    exit_codes = {}
-    with open(log_path, "a", encoding="utf-8") as log_file:
-        log_file.write(f"\n{'=' * 70}\nrun begins {datetime.now().isoformat()}\n")
+    tracking_conn = None
+    run_id = None
+    if DB_URL:
+        try:
+            tracking_conn = psycopg2.connect(DB_URL)
+            run_id = _start_job_run(tracking_conn, "ei_pipeline")
+        except Exception as e:
+            print(f"[ops.job_runs] failed to open tracking connection: {e!r}")
 
-        chat_feedback_cmd = [sys.executable, str(HERE / "chat_feedback_extraction.py")]
-        if args.user_id is not None:
-            chat_feedback_cmd += ["--user-id", str(args.user_id)]
+    stages: dict[str, dict] = {}
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"\n{'=' * 70}\nrun begins {datetime.now().isoformat()}\n")
 
-        exit_codes["extraction"] = run_stage("real_user_extraction", extraction_cmd, log_file)
-        exit_codes["chat_feedback"] = run_stage("chat_feedback_extraction", chat_feedback_cmd, log_file)
-        exit_codes["fact_dedup"] = run_stage(
-            "fact_dedup", [sys.executable, str(HERE / "fact_dedup.py")], log_file
-        )
-        exit_codes["personality"] = run_stage(
-            "personality_batch", [sys.executable, str(HERE / "personality_batch.py")], log_file
-        )
-        exit_codes["relationship"] = run_stage(
-            "relationship_batch", [sys.executable, str(HERE / "relationship_batch.py")], log_file
-        )
+            chat_feedback_cmd = [sys.executable, str(HERE / "chat_feedback_extraction.py")]
+            if args.user_id is not None:
+                chat_feedback_cmd += ["--user-id", str(args.user_id)]
 
-        log_file.write(f"\nrun ends {datetime.now().isoformat()} exit_codes={exit_codes}\n")
+            stages["extraction"] = run_stage("real_user_extraction", extraction_cmd, log_file)
+            stages["chat_feedback"] = run_stage("chat_feedback_extraction", chat_feedback_cmd, log_file)
+            stages["fact_dedup"] = run_stage(
+                "fact_dedup", [sys.executable, str(HERE / "fact_dedup.py")], log_file
+            )
+            stages["personality"] = run_stage(
+                "personality_batch", [sys.executable, str(HERE / "personality_batch.py")], log_file
+            )
+            stages["relationship"] = run_stage(
+                "relationship_batch", [sys.executable, str(HERE / "relationship_batch.py")], log_file
+            )
 
-    overall_ok = all(code == 0 for code in exit_codes.values())
+            exit_codes = {k: v["exit_code"] for k, v in stages.items()}
+            log_file.write(f"\nrun ends {datetime.now().isoformat()} exit_codes={exit_codes}\n")
+    finally:
+        if tracking_conn is not None:
+            if stages:
+                overall_ok = all(s["exit_code"] == 0 for s in stages.values())
+                any_ok = any(s["exit_code"] == 0 for s in stages.values())
+                status = "success" if overall_ok else ("partial" if any_ok else "error")
+            else:
+                status = "error"
+            _finish_job_run(tracking_conn, run_id, status, {"stages": stages, "log_file": str(log_path)})
+            tracking_conn.close()
+
+    overall_ok = bool(stages) and all(s["exit_code"] == 0 for s in stages.values())
     print(f"\n{'ALL STAGES OK' if overall_ok else 'ONE OR MORE STAGES FAILED'} -- see {log_path}")
     return 0 if overall_ok else 1
 

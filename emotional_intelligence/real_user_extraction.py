@@ -104,13 +104,22 @@ def ensure_user_subject(cur, user_id: int) -> int:
 
 
 def fetch_unprocessed_conversations(cur, user_id: int | None, limit: int) -> list[dict]:
+    """Only processes a user whose Settings > Cognitive Intelligence toggle
+    (nudges.user_settings.cognitive_intelligence_enabled) isn't explicitly
+    off -- default TRUE for a user who's never touched that setting, same
+    opt-out convention as nudges_schema.sql. This is the consent gate
+    PRODUCTION_READINESS_ANALYSIS.md item 5 flagged as missing (an earlier
+    unscoped run of this script processed real friends' private
+    conversations with zero notice)."""
     cur.execute(
         """
         SELECT c.id, c.user_id, u.username, c.raw_transcript
         FROM conversations c
         JOIN users u ON u.id = c.user_id
+        LEFT JOIN nudges.user_settings ns ON ns.user_id = u.id
         WHERE (%(user_id)s IS NULL OR c.user_id = %(user_id)s)
           AND c.raw_transcript IS NOT NULL AND length(trim(c.raw_transcript)) > 0
+          AND COALESCE(ns.cognitive_intelligence_enabled, TRUE) = TRUE
           AND NOT EXISTS (
               SELECT 1 FROM emotional_intelligence.analysis_runs r
               WHERE r.run_type = %(run_type)s AND r.status = 'success'
