@@ -104,7 +104,21 @@
   .app-shell { display: flex; min-height: 100%; }
   .sidebar { width: 220px; flex-shrink: 0; background: var(--wa-panel); border-right: 1px solid var(--wa-border); padding: var(--space-4) 0; }
   .sidebar-brand { font-size: var(--text-lg); font-weight: 800; padding: 0 var(--space-4) var(--space-4); }
-  .nav-section-title { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); font-weight: 700; padding: var(--space-4) var(--space-4) var(--space-1); }
+  /* Parent category (Infra/Finance) is itself a clickable tree-collapse
+     toggle, not just a label -- the chevron rotates to reflect state,
+     persisted in localStorage so a collapsed section stays collapsed
+     across reloads. */
+  .nav-parent {
+    width: 100%; display: flex; align-items: center; gap: var(--space-2); text-align: left;
+    background: none; border: 0; font-family: inherit; cursor: pointer;
+    font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); font-weight: 700;
+    padding: var(--space-4) var(--space-4) var(--space-1);
+  }
+  .nav-parent:hover { color: var(--wa-text); }
+  .nav-chevron { display: inline-block; font-size: 9px; transition: transform var(--duration-base) var(--ease-standard); }
+  .nav-chevron.collapsed { transform: rotate(-90deg); }
+  .nav-children { display: flex; flex-direction: column; overflow: hidden; }
+  .nav-children.collapsed { display: none; }
   .nav-item {
     display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4);
     color: var(--wa-text-soft); text-decoration: none; font-size: var(--text-sm); font-weight: 500;
@@ -189,6 +203,18 @@
   .job-history-label { font-size: var(--text-xs); color: var(--wa-text-soft); }
   .job-history-dots { display: flex; gap: 4px; }
 
+  /* Where to actually look when a card shows an error -- a file path for
+     ei_pipeline (it writes a real per-day log file), a journalctl filter
+     for everything else (no dedicated file exists; it only ever prints to
+     stdout, captured by journald under the throughline unit). */
+  .log-hint {
+    font-size: 11px; color: var(--wa-text-soft); font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--wa-bg-app); border: 1px solid var(--wa-border); border-radius: var(--radius-xs);
+    padding: 3px 6px; margin-top: var(--space-2); word-break: break-all;
+  }
+  .log-hint b { color: var(--wa-text-soft); font-family: inherit; font-weight: 600; }
+  .section-log-hint { margin: calc(-1 * var(--space-2)) 0 var(--space-3); }
+
   .empty { color: var(--wa-text-soft); font-size: var(--text-sm); padding: var(--space-2) 0; }
   .err { color: var(--wa-danger); font-size: var(--text-sm); }
 
@@ -198,7 +224,8 @@
     .app-shell { flex-direction: column; }
     .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--wa-border); display: flex; flex-wrap: wrap; align-items: center; padding: var(--space-3) var(--space-4); gap: var(--space-1); }
     .sidebar-brand { padding: 0 var(--space-3) 0 0; }
-    .nav-section-title { display: none; }
+    .nav-parent { display: none; }
+    .nav-children, .nav-children.collapsed { display: flex; flex-direction: row; }
     .nav-item { padding: var(--space-2) var(--space-3); border-right: none; border-radius: var(--radius-sm); }
     .nav-item.active { border-right: none; }
   }
@@ -209,20 +236,28 @@
   <nav class="sidebar">
     <div class="sidebar-brand">Throughline Ops</div>
 
-    <div class="nav-section-title">Infra</div>
-    <a class="nav-item active" href="/admin">Jobs</a>
-    {% if grafana_url %}
-    <a class="nav-item" href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana Dashboard<span class="nav-item-ext">↗</span></a>
-    {% else %}
-    <span class="nav-item disabled" title="GRAFANA_DASHBOARD_URL not set yet">Grafana Dashboard</span>
-    {% endif %}
+    <button class="nav-parent" onclick="toggleNavGroup('infra')" aria-expanded="true">
+      <span class="nav-chevron" id="chevron-infra">▾</span><span>Infra</span>
+    </button>
+    <div class="nav-children" id="children-infra">
+      <a class="nav-item active" href="/admin">Jobs</a>
+      {% if grafana_url %}
+      <a class="nav-item" href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana Dashboard<span class="nav-item-ext">↗</span></a>
+      {% else %}
+      <span class="nav-item disabled" title="GRAFANA_DASHBOARD_URL not set yet">Grafana Dashboard</span>
+      {% endif %}
+    </div>
 
-    <div class="nav-section-title">Finance</div>
-    {% if costlens_url %}
-    <a class="nav-item" href="{{ costlens_url }}" target="_blank" rel="noopener noreferrer">CostLens<span class="nav-item-ext">↗</span></a>
-    {% else %}
-    <span class="nav-item disabled" title="COSTLENS_DASHBOARD_URL not set yet">CostLens</span>
-    {% endif %}
+    <button class="nav-parent" onclick="toggleNavGroup('finance')" aria-expanded="true">
+      <span class="nav-chevron" id="chevron-finance">▾</span><span>Finance</span>
+    </button>
+    <div class="nav-children" id="children-finance">
+      {% if costlens_url %}
+      <a class="nav-item" href="{{ costlens_url }}" target="_blank" rel="noopener noreferrer">CostLens<span class="nav-item-ext">↗</span></a>
+      {% else %}
+      <span class="nav-item disabled" title="COSTLENS_DASHBOARD_URL not set yet">CostLens</span>
+      {% endif %}
+    </div>
   </nav>
 
   <div class="main-content">
@@ -327,6 +362,20 @@ function renderHistoryDots(history) {
   }).join("");
 }
 
+// Where this job's own output actually lands -- ei_pipeline writes a real
+// per-day file (path comes straight from its own tracking row's detail
+// when available, so it's the exact file that run used, not a guess);
+// nudge_cycle never writes a file, only prints to stdout under the
+// throughline systemd unit, so a journalctl filter is the real answer.
+function logHintForJob(j) {
+  if (j.job_name === "ei_pipeline") {
+    const fromRun = j.detail && j.detail.log_file;
+    const today = new Date().toISOString().slice(0, 10);
+    return fromRun || `emotional_intelligence/logs/ei_pipeline_${today}.log`;
+  }
+  return 'journalctl -u throughline -g "nudge_engine"';
+}
+
 // Autosys-style job card: a status badge up top, then a clean label/value
 // field list (Schedule / Last Run / Run Time / Next Run) -- the layout
 // an ops person checking "did this run, and when's it due next" actually
@@ -354,9 +403,20 @@ function renderJobs(jobs) {
           <span class="job-history-label">Last ${(j.history||[]).length || 0} runs</span>
           <span class="job-history-dots">${renderHistoryDots(j.history)}</span>
         </div>
+        <div class="log-hint"><b>Log:</b> ${logHintForJob(j)}</div>
       </div>`;
   }).join("");
 }
+
+// Shared per-section log pointers -- these cards don't each have their own
+// distinct source (unlike the job cards above), they're all different
+// views of the same underlying prints/rows, so one hint string per
+// section, repeated on every card in it per the "every card" ask.
+const EI_LOG_HINT = 'journalctl -u throughline -g "ei_adapter"';
+const DIGEST_LOG_HINT = 'journalctl -u throughline -g "nudge_engine"';
+const FCM_LOG_HINT = 'journalctl -u throughline -g "fcm"';
+const DB_LOG_HINT = 'journalctl -u throughline';
+const SYSTEM_LOG_HINT = 'journalctl -u throughline';
 
 function renderEi(ei) {
   const el = document.getElementById("ei-table");
@@ -367,7 +427,10 @@ function renderEi(ei) {
     const pill = v.error > 0 ? "warn" : "ok";
     return `<tr><td>${k}</td><td>${v.success}</td><td><span class="pill ${pill}">${v.error}</span></td><td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td></tr>`;
   }).join("");
-  el.innerHTML = `<div class="card" style="padding:0;"><table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table></div>`;
+  el.innerHTML = `<div class="card" style="padding:0;">
+    <table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table>
+    <div class="log-hint" style="margin:0; border:none; border-top:1px solid var(--wa-border); border-radius:0;"><b>Log:</b> ${EI_LOG_HINT}</div>
+  </div>`;
 }
 
 function renderDigest(d) {
@@ -376,10 +439,12 @@ function renderDigest(d) {
     <div class="card">
       <div class="title">Sent (7d)</div>
       <div class="row"><b style="font-size:22px;">${d.sent_last_7d ?? 0}</b></div>
+      <div class="log-hint"><b>Log:</b> ${DIGEST_LOG_HINT}</div>
     </div>
     <div class="card">
       <div class="title">Last sent</div>
       <div class="row"><b>${d.last_sent_at ? new Date(d.last_sent_at).toLocaleString() : "never"}</b></div>
+      <div class="log-hint"><b>Log:</b> ${DIGEST_LOG_HINT}</div>
     </div>`;
 }
 
@@ -392,19 +457,23 @@ function renderFcm(fcm) {
     <div class="card">
       <div class="title">Sent</div>
       <div class="row"><b style="font-size:22px;">${sent}</b></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
     </div>
     <div class="card">
       <div class="title">Stale / Error</div>
       <div class="row"><span class="pill ${errPill}">${stale} stale, ${error} error</span></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
     </div>
     <div class="card">
       <div class="title">No token</div>
       <div class="row"><b>${noToken}</b></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
     </div>
     <div class="card">
       <div class="title">Registered devices</div>
       <div class="row"><b>${fcm.registered_tokens ?? 0}</b></div>
       <div class="row" style="font-size:11px;"><span>Last send</span><span>${fcm.last_send_at ? new Date(fcm.last_send_at).toLocaleString() : "never"}</span></div>
+      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
     </div>`;
 }
 
@@ -424,10 +493,12 @@ function renderDb(db) {
     <div class="card">
       <div class="title">Total DB size</div>
       <div class="row"><b style="font-size:22px;">${fmtBytes(db.total_bytes)}</b></div>
+      <div class="log-hint"><b>Log:</b> ${DB_LOG_HINT}</div>
     </div>
     <div class="card" style="grid-column: span 2; padding:0;">
       <div class="title" style="padding:var(--space-4) var(--space-4) 0;">Largest tables</div>
       <table style="padding:0 var(--space-4) var(--space-3);"><tr><th>table</th><th>size</th></tr>${tableRows}</table>
+      <div class="log-hint" style="margin:0 var(--space-4) var(--space-3); border-radius:var(--radius-xs);"><b>Log:</b> ${DB_LOG_HINT}</div>
     </div>`;
 }
 
@@ -501,6 +572,24 @@ function toggleTheme() {
   updateToggleIcon();
 }
 updateToggleIcon();
+
+function toggleNavGroup(key) {
+  var children = document.getElementById('children-' + key);
+  var chevron = document.getElementById('chevron-' + key);
+  var collapsing = !children.classList.contains('collapsed');
+  children.classList.toggle('collapsed', collapsing);
+  chevron.classList.toggle('collapsed', collapsing);
+  document.querySelector('.nav-parent[onclick*="' + key + '"]').setAttribute('aria-expanded', String(!collapsing));
+  try { localStorage.setItem('admin_nav_' + key, collapsing ? 'closed' : 'open'); } catch (e) {}
+}
+// Restore each group's collapsed/expanded state from the last visit --
+// defaults to expanded (both are small, two-and-one-item trees) if never
+// toggled before.
+['infra', 'finance'].forEach(function (key) {
+  var saved;
+  try { saved = localStorage.getItem('admin_nav_' + key); } catch (e) { saved = null; }
+  if (saved === 'closed') toggleNavGroup(key);
+});
 
 refresh();
 setInterval(refresh, REFRESH_MS);
