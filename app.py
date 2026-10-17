@@ -1,4 +1,4 @@
-﻿
+
 import os
 import re
 import io
@@ -66,6 +66,33 @@ except Exception:
 # import app.py. Defaults to "web" so the existing Flask-serving paths
 # (gunicorn import, or `python app.py` directly) are unaffected.
 IS_WEB_ROLE = os.getenv("SPEECH2TEXT_ROLE", "web") == "web"
+
+
+def _spawn_background(fn, *args):
+    """Fire-and-forget background work (EI extraction, reminder extraction,
+    etc.) -- uses gevent's own spawn under gunicorn's gevent worker instead
+    of threading.Thread(daemon=True).start(). Confirmed live: a plain daemon
+    thread started that way was not reliably completing in production (an
+    EI extraction call that worked perfectly when invoked directly produced
+    nothing when fired this way from a real /chat/global request) --
+    gevent.spawn is the documented, correct way to schedule background work
+    under a gevent worker, rather than relying on monkey-patched threading's
+    less-well-defined scheduling guarantees for a daemon thread specifically.
+    Only takes that path when threading is actually monkey-patched (i.e.
+    really running under gunicorn's gevent worker) -- otherwise (local
+    `python app.py`/the Flask dev server) falls back to a plain daemon
+    thread, since a spawned-but-never-driven greenlet would silently never
+    run at all without an active gevent hub looping."""
+    try:
+        import gevent.monkey
+        if gevent.monkey.is_module_patched("threading"):
+            import gevent
+            gevent.spawn(fn, *args)
+            return
+    except ImportError:
+        pass
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -442,10 +469,10 @@ FRIEND_CODE_LENGTH = 6
 # (there's no cron/scheduler in this app, and a read-time aggregate over an
 # already-indexed range is cheap enough not to need one).
 MOOD_EMOJI = {
-    "happy": "😊", "stressed": "😰", "calm": "😌", "frustrated": "😤",
-    "excited": "🤩", "neutral": "😐", "sad": "😢", "anxious": "😟",
+    "happy": "ðŸ˜Š", "stressed": "ðŸ˜°", "calm": "ðŸ˜Œ", "frustrated": "ðŸ˜¤",
+    "excited": "ðŸ¤©", "neutral": "ðŸ˜", "sad": "ðŸ˜¢", "anxious": "ðŸ˜Ÿ",
 }
-DEFAULT_MOOD_EMOJI = "🙂"
+DEFAULT_MOOD_EMOJI = "ðŸ™‚"
 MOOD_BUCKET_HOURS = 2
 
 
@@ -1625,7 +1652,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. A friend_name email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent.",
+            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. If the user wants it emailed to themself (e.g. 'email me a reminder') and names no one else, omit both friend_name and to_email -- it goes to their own registered address. A friend_name email or a self-email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1772,15 +1799,20 @@ def _tool_make_call(cur, db, user_id, args):
 
 
 def _tool_send_email(cur, db, user_id, args):
-    """Known friend -> sends immediately, unchanged. Arbitrary address (a
-    professor, a boss, anyone outside the trust graph) -> drafted instead of
-    sent, since that's the case where a wrong guess (misread name, wrong
-    tone) actually costs something and can't be unsent. Mirrors the
-    Swiggy commerce_actions recommend-then-confirm shape -- see
-    /email-drafts/<id>/confirm and /dismiss below."""
+    """Known friend, or the user themself -> sends immediately. Arbitrary
+    address (a professor, a boss, anyone outside the trust graph) ->
+    drafted instead of sent, since that's the case where a wrong guess
+    (misread name, wrong tone) actually costs something and can't be
+    unsent. Mirrors the Swiggy commerce_actions recommend-then-confirm
+    shape -- see /email-drafts/<id>/confirm and /dismiss below."""
+    cur.execute("SELECT username, email FROM users WHERE id = %s", (user_id,))
+    sender = cur.fetchone()
+    from_name = sender["username"] if sender else None
+    reply_to = sender["email"] if sender and sender.get("email") else None
+
     to_email = (args.get("to_email") or "").strip()
     friend_name = args.get("friend_name")
-    is_friend = False
+    sends_immediately = False
     if friend_name:
         friend = _resolve_friend_by_name(cur, user_id, friend_name)
         if not friend:
@@ -1788,17 +1820,19 @@ def _tool_send_email(cur, db, user_id, args):
         if not friend.get("email"):
             return {"error": f"{friend['name']} has no registered email"}
         to_email = friend["email"]
-        is_friend = True
-    if not to_email:
-        return {"error": "to_email or a known friend_name is required"}
+        sends_immediately = True
+    elif not to_email:
+        # Neither given -- the user meant themself ("email me a reminder"),
+        # the one other case with no misjudgment risk, same as the friend
+        # path above.
+        if not reply_to:
+            return {"error": "to_email or a known friend_name is required (and this user has no registered email to fall back to)"}
+        to_email = reply_to
+        sends_immediately = True
     subject = args.get("subject") or "(no subject)"
     body = args.get("body") or ""
-    cur.execute("SELECT username, email FROM users WHERE id = %s", (user_id,))
-    sender = cur.fetchone()
-    from_name = sender["username"] if sender else None
-    reply_to = sender["email"] if sender and sender.get("email") else None
 
-    if is_friend:
+    if sends_immediately:
         sent = send_plain_email(to_email, subject, body, from_name=from_name, reply_to=reply_to)
         return {"ok": sent, "to_email": to_email} if sent else {"error": f"Failed to send email to {to_email}"}
 
@@ -4693,7 +4727,7 @@ def _generate_attachment_summary(attachment_url, attachment_type):
         return None
     words = summary.split()
     if len(words) > ATTACHMENT_SUMMARY_MAX_WORDS:
-        summary = " ".join(words[:ATTACHMENT_SUMMARY_MAX_WORDS]).rstrip(",.;:") + "…"
+        summary = " ".join(words[:ATTACHMENT_SUMMARY_MAX_WORDS]).rstrip(",.;:") + "â€¦"
     return summary
 
 
@@ -4800,7 +4834,7 @@ def send_direct_message(friend_id):
     # the client can show a real name in a foreground local notification
     # without a separate lookup (mirrors the FCM title below).
     push_notification(friend_id, {"type": "direct_message", "message": message, "sender_username": sender_name})
-    fcm_body = content or {"image": "📷 Photo", "video": "🎥 Video"}.get(attachment_type, "📎 Attachment")
+    fcm_body = content or {"image": "ðŸ“· Photo", "video": "ðŸŽ¥ Video"}.get(attachment_type, "ðŸ“Ž Attachment")
     send_fcm_to_user(
         friend_id, title=sender_name, body=fcm_body,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message["id"])},
@@ -4818,7 +4852,7 @@ def send_direct_message(friend_id):
             # Monday, not next week") is exactly the kind of thing that pipeline
             # already looks for, regardless of which surface it was said on.
             from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
-            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, content), daemon=True).start()
+            _spawn_background(trigger_chat_feedback_extraction, user_id, content)
         except Exception:
             pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
 
@@ -5839,7 +5873,7 @@ def chat():
 
     try:
         from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
-        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
+        _spawn_background(trigger_chat_feedback_extraction, user_id, prompt)
     except Exception:
         pass  # EI engine is optional and additive -- never affects this endpoint's own behavior, and this
               # runs in the background after the reply below is already on its way -- never blocks the user.
@@ -6093,7 +6127,7 @@ def chat_global():
         db.commit()
         try:
             from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
-            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
+            _spawn_background(trigger_chat_feedback_extraction, user_id, prompt)
         except Exception:
             pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
         return jsonify({"reply": reply, "matched_speaker": None, "conversations_used": 0})
@@ -6172,7 +6206,7 @@ def chat_global():
 
     try:
         from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
-        threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
+        _spawn_background(trigger_chat_feedback_extraction, user_id, prompt)
     except Exception:
         pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
     if not created_task_this_turn:
@@ -6532,7 +6566,7 @@ def chat_global_image():
             # description only, not extracted_text -- real_user_extraction.py's
             # nightly batch already turns the conversations row inserted above
             # into facts for free, so there's no gap here to fix.
-            threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, description), daemon=True).start()
+            _spawn_background(trigger_chat_feedback_extraction, user_id, description)
         except Exception:
             pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
         # Unlike trigger_chat_feedback_extraction above, this one has no

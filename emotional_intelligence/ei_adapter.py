@@ -677,7 +677,6 @@ def trigger_chat_feedback_extraction(user_id, message_content) -> None:
     if is_probably_just_a_question(message_content):
         return
     try:
-        import sys
         from pathlib import Path
 
         import psycopg2.extras
