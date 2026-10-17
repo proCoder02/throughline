@@ -700,6 +700,18 @@ def trigger_chat_feedback_extraction(user_id, message_content) -> None:
         conn = _connect()
         try:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            # Same consent gate as the batch scripts (Settings > Cognitive
+            # Intelligence toggle) -- default TRUE for a user who's never
+            # touched that setting, same opt-out convention as
+            # nudges_schema.sql. Checked here too so turning the toggle off
+            # actually stops real-time extraction, not just the nightly batch.
+            cur.execute(
+                "SELECT cognitive_intelligence_enabled FROM nudges.user_settings WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row and row["cognitive_intelligence_enabled"] is False:
+                return
             subject_id = ensure_user_subject(cur, user_id)
             process_batch(cur, subject_id, [{"content": message_content}],
                            run_type="chat_feedback_extraction_realtime")

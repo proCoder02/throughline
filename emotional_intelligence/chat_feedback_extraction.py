@@ -99,7 +99,9 @@ def fetch_users_with_new_messages(cur, user_id: int | None) -> list[dict]:
         """
         SELECT DISTINCT cm.user_id
         FROM chat_messages cm
+        LEFT JOIN nudges.user_settings ns ON ns.user_id = cm.user_id
         WHERE cm.role = 'user' AND (%(user_id)s IS NULL OR cm.user_id = %(user_id)s)
+          AND COALESCE(ns.cognitive_intelligence_enabled, TRUE) = TRUE
         """,
         {"user_id": user_id},
     )
