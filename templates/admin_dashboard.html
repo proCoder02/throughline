@@ -83,17 +83,40 @@
     --shadow-md: 0 4px 14px rgba(20,20,30,0.10);
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0; background: var(--wa-bg-app); color: var(--wa-text);
     font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
-    padding: var(--space-6) var(--space-4) 60px;
   }
-  body, .card, .btn-secondary, a.logout, .theme-toggle {
+  body, .card, .btn-secondary, a.logout, .theme-toggle, .nav-item {
     transition: background-color var(--duration-slow) var(--ease-standard),
                 color var(--duration-slow) var(--ease-standard),
                 border-color var(--duration-slow) var(--ease-standard);
   }
+
+  /* ---------- Left nav drawer -- same shape as the main app's icon-rail/
+     app-shell (frontend/src/theme.css): a fixed-width panel pinned to the
+     left, sections grouped by a small uppercase label, one highlighted
+     active item. "Jobs" is this same page (the only internal screen so
+     far); Grafana/CostLens are external tools, opened in a new tab so the
+     ops session here stays open. ---------- */
+  .app-shell { display: flex; min-height: 100%; }
+  .sidebar { width: 220px; flex-shrink: 0; background: var(--wa-panel); border-right: 1px solid var(--wa-border); padding: var(--space-4) 0; }
+  .sidebar-brand { font-size: var(--text-lg); font-weight: 800; padding: 0 var(--space-4) var(--space-4); }
+  .nav-section-title { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); font-weight: 700; padding: var(--space-4) var(--space-4) var(--space-1); }
+  .nav-item {
+    display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4);
+    color: var(--wa-text-soft); text-decoration: none; font-size: var(--text-sm); font-weight: 500;
+    border-right: 2px solid transparent;
+  }
+  .nav-item:hover { background: var(--wa-hover); color: var(--wa-text); }
+  .nav-item.active { background: color-mix(in srgb, var(--wa-accent) 16%, var(--wa-panel)); color: var(--wa-accent); border-right-color: var(--wa-accent); }
+  .nav-item.disabled { color: var(--wa-text-soft); opacity: 0.45; cursor: default; }
+  .nav-item.disabled:hover { background: none; color: var(--wa-text-soft); }
+  .nav-item-ext { margin-left: auto; font-size: 11px; opacity: 0.7; }
+
+  .main-content { flex: 1; min-width: 0; padding: var(--space-6) var(--space-4) 60px; }
   .wrap { max-width: 980px; margin: 0 auto; }
   header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-6); flex-wrap: wrap; gap: var(--space-3); }
   h1 { font-size: var(--text-2xl); margin: 0; font-weight: 700; }
@@ -168,10 +191,42 @@
 
   .empty { color: var(--wa-text-soft); font-size: var(--text-sm); padding: var(--space-2) 0; }
   .err { color: var(--wa-danger); font-size: var(--text-sm); }
+
+  @media (max-width: 720px) {
+    /* Sidebar becomes a horizontal top bar below this width -- a 220px
+       fixed rail has no room to coexist with content on a phone screen. */
+    .app-shell { flex-direction: column; }
+    .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--wa-border); display: flex; flex-wrap: wrap; align-items: center; padding: var(--space-3) var(--space-4); gap: var(--space-1); }
+    .sidebar-brand { padding: 0 var(--space-3) 0 0; }
+    .nav-section-title { display: none; }
+    .nav-item { padding: var(--space-2) var(--space-3); border-right: none; border-radius: var(--radius-sm); }
+    .nav-item.active { border-right: none; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="app-shell">
+  <nav class="sidebar">
+    <div class="sidebar-brand">Throughline Ops</div>
+
+    <div class="nav-section-title">Infra</div>
+    <a class="nav-item active" href="/admin">Jobs</a>
+    {% if grafana_url %}
+    <a class="nav-item" href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana Dashboard<span class="nav-item-ext">↗</span></a>
+    {% else %}
+    <span class="nav-item disabled" title="GRAFANA_DASHBOARD_URL not set yet">Grafana Dashboard</span>
+    {% endif %}
+
+    <div class="nav-section-title">Finance</div>
+    {% if costlens_url %}
+    <a class="nav-item" href="{{ costlens_url }}" target="_blank" rel="noopener noreferrer">CostLens<span class="nav-item-ext">↗</span></a>
+    {% else %}
+    <span class="nav-item disabled" title="COSTLENS_DASHBOARD_URL not set yet">CostLens</span>
+    {% endif %}
+  </nav>
+
+  <div class="main-content">
+  <div class="wrap">
   <header>
     <h1>Throughline Ops</h1>
     <div style="display:flex; align-items:center; gap:var(--space-3);">
@@ -211,6 +266,8 @@
     <h2>Compute</h2>
     <div class="grid" id="system-grid"></div>
   </section>
+  </div>
+  </div>
 </div>
 
 <script>

@@ -6757,7 +6757,15 @@ def admin_logout():
 @app.route("/admin")
 @admin_required
 def admin_dashboard_page():
-    return render_template("admin_dashboard.html")
+    # Both optional -- an unset URL renders its nav item disabled instead
+    # of a broken/empty link. Infra vs Finance stays two separate external
+    # tools linked from one nav, not merged into this page, per standing
+    # instruction (ops and finance stay apart for now).
+    return render_template(
+        "admin_dashboard.html",
+        grafana_url=os.getenv("GRAFANA_DASHBOARD_URL", "").strip(),
+        costlens_url=os.getenv("COSTLENS_DASHBOARD_URL", "").strip(),
+    )
 
 
 _admin_ops_schema_ensured = False
