@@ -18,6 +18,12 @@
   .meta { font-size: 12px; color: #6b7384; }
   a.logout { color: #8b93a7; font-size: 13px; text-decoration: none; }
   a.logout:hover { color: #e6e9f0; }
+  #refresh-btn {
+    background: #1c2333; border: 1px solid #2a3244; color: #c3c8d4; font-size: 12px;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-family: inherit;
+  }
+  #refresh-btn:hover { background: #242b3d; color: #e6e9f0; }
+  #refresh-btn:disabled { opacity: 0.6; cursor: default; }
   section { margin-bottom: 28px; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b93a7; margin: 0 0 12px; font-weight: 600; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
@@ -52,6 +58,7 @@
     <h1>Throughline Ops</h1>
     <div style="display:flex; align-items:center; gap:16px;">
       <span class="meta" id="generated-at">loading...</span>
+      <button id="refresh-btn" onclick="refresh()">Refresh</button>
       <a class="logout" href="/admin/logout">Log out</a>
     </div>
   </header>
@@ -203,6 +210,9 @@ function renderSystem(sys) {
 }
 
 async function refresh() {
+  const btn = document.getElementById("refresh-btn");
+  btn.disabled = true;
+  btn.textContent = "Refreshing...";
   try {
     const res = await fetch("/admin/api/status", { credentials: "same-origin" });
     if (res.status === 401 || res.redirected) { window.location.href = "/admin/login"; return; }
@@ -218,6 +228,9 @@ async function refresh() {
       " · Nudges " + (data.flags.nudge_feature_enabled ? "on" : "off");
   } catch (e) {
     document.getElementById("generated-at").textContent = "Failed to load: " + e;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Refresh";
   }
 }
 
