@@ -6809,6 +6809,46 @@ def _admin_ensure_ops_schema(cur, db) -> None:
 # over their own schedule so a slightly late run doesn't flash red.
 _ADMIN_JOB_STALE_HOURS = {"ei_pipeline": 15, "nudge_cycle": 3}
 
+# Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
+# just documentation of the real schedule (root's crontab for ei_pipeline,
+# see infra/BASTION_ACCESS.md-adjacent ops notes; nudge_engine.py's
+# start_nudge_worker(interval_seconds=3600) for nudge_cycle), not read from
+# either live -- if either schedule ever changes, this dict has to be
+# updated to match, same as _ADMIN_JOB_STALE_HOURS above it already does.
+_ADMIN_JOB_SCHEDULE = {
+    "ei_pipeline": {
+        "kind": "cron", "hours_utc": [8, 20],
+        "cadence_label": "Daily at 08:00 & 20:00 UTC",
+    },
+    "nudge_cycle": {
+        "kind": "interval", "interval_seconds": 3600,
+        "cadence_label": "Every 1 hour",
+    },
+}
+
+
+def _admin_next_run_at(job_name: str, last_started_at, now):
+    """cron-kind jobs have a next run independent of history (the next
+    clock time the schedule fires); interval-kind jobs (the in-process
+    nudge worker, not a real cron entry) only have a next run relative to
+    when they last actually started, so None without any history yet."""
+    sched = _ADMIN_JOB_SCHEDULE.get(job_name)
+    if not sched:
+        return None
+    if sched["kind"] == "cron":
+        candidates = []
+        for hour in sched["hours_utc"]:
+            candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += timedelta(days=1)
+            candidates.append(candidate)
+        return min(candidates)
+    if sched["kind"] == "interval":
+        if last_started_at is None:
+            return None
+        return last_started_at + timedelta(seconds=sched["interval_seconds"])
+    return None
+
 
 _ADMIN_JOB_HISTORY_LIMIT = 5
 
@@ -6843,6 +6883,11 @@ def _admin_job_status(cur) -> list:
         reference = latest["finished_at"] or latest["started_at"]
         age_hours = (now - reference).total_seconds() / 3600 if reference else None
         stale_after = _ADMIN_JOB_STALE_HOURS.get(job_name, 24)
+        duration_seconds = None
+        if latest["started_at"] and latest["finished_at"]:
+            duration_seconds = (latest["finished_at"] - latest["started_at"]).total_seconds()
+        next_run_at = _admin_next_run_at(job_name, latest["started_at"], now)
+        sched = _ADMIN_JOB_SCHEDULE.get(job_name, {})
         jobs.append({
             "job_name": job_name,
             "started_at": latest["started_at"].isoformat() if latest["started_at"] else None,
@@ -6851,6 +6896,9 @@ def _admin_job_status(cur) -> list:
             "detail": latest["detail"],
             "age_hours": round(age_hours, 2) if age_hours is not None else None,
             "stale": age_hours is not None and age_hours > stale_after,
+            "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
+            "cadence_label": sched.get("cadence_label", "—"),
+            "next_run_at": next_run_at.isoformat() if next_run_at else None,
             "history": [
                 {
                     "status": r["status"],
@@ -6861,9 +6909,12 @@ def _admin_job_status(cur) -> list:
         })
     for job_name in _ADMIN_JOB_STALE_HOURS:
         if job_name not in by_job:
+            sched = _ADMIN_JOB_SCHEDULE.get(job_name, {})
             jobs.append({
                 "job_name": job_name, "started_at": None, "finished_at": None,
                 "status": "never_run", "detail": None, "age_hours": None, "stale": True,
+                "duration_seconds": None, "cadence_label": sched.get("cadence_label", "—"),
+                "next_run_at": (lambda n: n.isoformat() if n else None)(_admin_next_run_at(job_name, None, now)),
                 "history": [],
             })
     return jobs
