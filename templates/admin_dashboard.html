@@ -4,61 +4,112 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Throughline Ops</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: dark; }
+  /* Same design tokens as frontend/src/theme.css (dark palette) -- kept in
+     sync by value, not by sharing the file, since this is a plain
+     server-rendered page with no build step. Only the subset this page
+     actually uses is reproduced here. */
+  :root {
+    --wa-bg-app: #313338;
+    --wa-panel: #2b2d31;
+    --wa-hover: #35373c;
+    --wa-border: #1f2023;
+    --wa-text: #f2f3f5;
+    --wa-text-soft: #a0a2a7;
+    --wa-accent: #1FC8B4;
+    --wa-accent-dark: #16A192;
+    --wa-accent-solid: #128176;
+    --wa-accent-solid-hover: #107066;
+    --wa-danger: #da373c;
+    --wa-online: #23a55a;
+    --wa-warn-bg: #3d3720;
+    --wa-warn-text: #f2d585;
+
+    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+    --space-5: 20px; --space-6: 24px;
+
+    --radius-xs: 4px; --radius-sm: 6px; --radius-md: 8px; --radius-lg: 10px; --radius-pill: 999px; --radius-round: 50%;
+
+    --text-xs: 12px; --text-sm: 13px; --text-base: 14px; --text-md: 15px; --text-lg: 16px; --text-xl: 18px; --text-2xl: 20px;
+
+    --duration-fast: 120ms; --duration-base: 180ms; --duration-slow: 240ms;
+    --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); --ease-out: cubic-bezier(0, 0, 0.2, 1);
+
+    --shadow-sm: 0 2px 8px rgba(0,0,0,0.28);
+    --shadow-md: 0 4px 14px rgba(0,0,0,0.32);
+  }
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: #0b0e14; color: #e6e9f0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding: 24px 16px 60px;
+    margin: 0; background: var(--wa-bg-app); color: var(--wa-text);
+    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: var(--space-6) var(--space-4) 60px;
   }
   .wrap { max-width: 980px; margin: 0 auto; }
-  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
-  h1 { font-size: 20px; margin: 0; font-weight: 600; }
-  .meta { font-size: 12px; color: #6b7384; }
-  a.logout { color: #8b93a7; font-size: 13px; text-decoration: none; }
-  a.logout:hover { color: #e6e9f0; }
-  #refresh-btn {
-    background: #1c2333; border: 1px solid #2a3244; color: #c3c8d4; font-size: 12px;
-    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-family: inherit;
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-6); flex-wrap: wrap; gap: var(--space-3); }
+  h1 { font-size: var(--text-2xl); margin: 0; font-weight: 700; }
+  .meta { font-size: var(--text-xs); color: var(--wa-text-soft); }
+  a.logout { color: var(--wa-text-soft); font-size: var(--text-sm); text-decoration: none; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); transition: background-color var(--duration-base) var(--ease-standard), color var(--duration-base) var(--ease-standard); }
+  a.logout:hover { background: var(--wa-hover); color: var(--wa-text); }
+
+  .btn-secondary {
+    background: var(--wa-hover); color: var(--wa-text); border: 0; font-family: inherit;
+    font-size: var(--text-sm); font-weight: 500; padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm); cursor: pointer;
+    transition: background-color var(--duration-base) var(--ease-standard);
   }
-  #refresh-btn:hover { background: #242b3d; color: #e6e9f0; }
-  #refresh-btn:disabled { opacity: 0.6; cursor: default; }
-  section { margin-bottom: 28px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b93a7; margin: 0 0 12px; font-weight: 600; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .btn-secondary:hover { background: #3f4147; }
+  .btn-secondary:disabled { opacity: 0.6; cursor: default; }
+
+  section { margin-bottom: var(--space-6); }
+  h2 { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); margin: 0 0 var(--space-3); font-weight: 700; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-3); }
+
+  @keyframes cardIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
   .card {
-    background: #141925; border: 1px solid #242b3d; border-radius: 10px; padding: 16px;
+    background: var(--wa-panel); border: 1px solid transparent; border-radius: var(--radius-md); padding: var(--space-4);
+    animation: cardIn var(--duration-slow) var(--ease-out) both;
+    transition: border-color var(--duration-base) var(--ease-standard), box-shadow var(--duration-base) var(--ease-standard);
   }
-  .card .title { font-size: 13px; color: #c3c8d4; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-  .dot.ok { background: #3ddc84; }
-  .dot.warn { background: #ffb020; }
-  .dot.bad { background: #ff5c5c; }
-  .row { display: flex; justify-content: space-between; font-size: 13px; color: #9aa1b2; padding: 3px 0; }
-  .row b { color: #e6e9f0; font-weight: 500; }
-  .bar-track { height: 6px; background: #0f131c; border-radius: 4px; overflow: hidden; margin-top: 10px; }
-  .bar-fill { height: 100%; border-radius: 4px; background: #4a7cff; transition: width 0.3s; }
-  .bar-fill.warn { background: #ffb020; }
-  .bar-fill.bad { background: #ff5c5c; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table th { text-align: left; color: #6b7384; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #242b3d; }
-  table td { padding: 6px 8px; border-bottom: 1px solid #1a2030; color: #c3c8d4; }
-  .pill { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
-  .pill.ok { background: rgba(61,220,132,0.15); color: #3ddc84; }
-  .pill.warn { background: rgba(255,176,32,0.15); color: #ffb020; }
-  .pill.bad { background: rgba(255,92,92,0.15); color: #ff5c5c; }
-  .empty { color: #6b7384; font-size: 13px; padding: 8px 0; }
-  .err { color: #ff5c5c; font-size: 13px; }
+  .card:hover { border-color: var(--wa-border); box-shadow: var(--shadow-sm); }
+  .card .title { font-size: var(--text-sm); color: var(--wa-text); font-weight: 600; margin-bottom: var(--space-2); display: flex; align-items: center; gap: var(--space-2); }
+
+  .dot { width: 8px; height: 8px; border-radius: var(--radius-round); display: inline-block; flex-shrink: 0; }
+  .dot.ok { background: var(--wa-online); }
+  .dot.warn { background: var(--wa-warn-text); }
+  .dot.bad { background: var(--wa-danger); }
+
+  .row { display: flex; justify-content: space-between; align-items: center; font-size: var(--text-sm); color: var(--wa-text-soft); padding: 3px 0; gap: var(--space-2); }
+  .row b { color: var(--wa-text); font-weight: 500; }
+
+  .bar-track { height: 6px; background: var(--wa-bg-app); border-radius: var(--radius-xs); overflow: hidden; margin-top: var(--space-2); }
+  .bar-fill { height: 100%; border-radius: var(--radius-xs); background: var(--wa-accent); transition: width var(--duration-slow) var(--ease-standard); }
+  .bar-fill.warn { background: var(--wa-warn-text); }
+  .bar-fill.bad { background: var(--wa-danger); }
+
+  table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+  table th { text-align: left; color: var(--wa-text-soft); font-weight: 500; padding: var(--space-2); border-bottom: 1px solid var(--wa-border); }
+  table td { padding: var(--space-2); border-bottom: 1px solid var(--wa-border); color: var(--wa-text); }
+
+  .pill { font-size: var(--text-xs); padding: 2px var(--space-2); border-radius: var(--radius-pill); font-weight: 600; }
+  .pill.ok { background: rgba(35,165,90,0.18); color: #4fd189; }
+  .pill.warn { background: rgba(242,213,133,0.18); color: var(--wa-warn-text); }
+  .pill.bad { background: rgba(218,55,60,0.18); color: #f3787c; }
+
+  .empty { color: var(--wa-text-soft); font-size: var(--text-sm); padding: var(--space-2) 0; }
+  .err { color: var(--wa-danger); font-size: var(--text-sm); }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Throughline Ops</h1>
-    <div style="display:flex; align-items:center; gap:16px;">
+    <div style="display:flex; align-items:center; gap:var(--space-3);">
       <span class="meta" id="generated-at">loading...</span>
-      <button id="refresh-btn" onclick="refresh()">Refresh</button>
+      <button class="btn-secondary" id="refresh-btn" onclick="refresh()">Refresh</button>
       <a class="logout" href="/admin/logout">Log out</a>
     </div>
   </header>
@@ -111,12 +162,6 @@ function statusDot(job) {
   return "bad";
 }
 
-function pillClass(status) {
-  if (status === "success") return "ok";
-  if (status === "partial") return "warn";
-  return "bad";
-}
-
 function historyDot(status) {
   if (status === "success") return "ok";
   if (status === "partial") return "warn";
@@ -145,7 +190,7 @@ function renderJobs(jobs) {
         <div class="row"><span>Status</span><b>${j.status}</b></div>
         <div class="row"><span>Last run</span><b>${fmtAge(j.age_hours)}</b></div>
         ${renderHistory(j.history)}
-        ${detail ? `<div class="row" style="font-size:11px; color:#6b7384;">${detail}</div>` : ""}
+        ${detail ? `<div class="row" style="font-size:11px; color:var(--wa-text-soft);">${detail}</div>` : ""}
       </div>`;
   }).join("");
 }
@@ -159,7 +204,7 @@ function renderEi(ei) {
     const pill = v.error > 0 ? "warn" : "ok";
     return `<tr><td>${k}</td><td>${v.success}</td><td><span class="pill ${pill}">${v.error}</span></td><td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td></tr>`;
   }).join("");
-  el.innerHTML = `<table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table>`;
+  el.innerHTML = `<div class="card" style="padding:0;"><table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table></div>`;
 }
 
 function renderDigest(d) {
@@ -217,9 +262,9 @@ function renderDb(db) {
       <div class="title">Total DB size</div>
       <div class="row"><b style="font-size:22px;">${fmtBytes(db.total_bytes)}</b></div>
     </div>
-    <div class="card" style="grid-column: span 2;">
-      <div class="title">Largest tables</div>
-      <table><tr><th>table</th><th>size</th></tr>${tableRows}</table>
+    <div class="card" style="grid-column: span 2; padding:0;">
+      <div class="title" style="padding:var(--space-4) var(--space-4) 0;">Largest tables</div>
+      <table style="padding:0 var(--space-4) var(--space-3);"><tr><th>table</th><th>size</th></tr>${tableRows}</table>
     </div>`;
 }
 
