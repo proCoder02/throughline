@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Throughline Admin</title>
+<title>Throughline Ops</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -112,6 +112,23 @@ function pillClass(status) {
   return "bad";
 }
 
+function historyDot(status) {
+  if (status === "success") return "ok";
+  if (status === "partial") return "warn";
+  return "bad";
+}
+
+function renderHistory(history) {
+  if (!history || !history.length) return "";
+  // Oldest first, left to right, so the most recent run is the rightmost
+  // dot -- matches how a sparkline/heartbeat strip reads.
+  const dots = history.slice().reverse().map(h => {
+    const when = h.started_at ? new Date(h.started_at).toLocaleString() : "unknown";
+    return `<span class="dot ${historyDot(h.status)}" title="${h.status} -- ${when}"></span>`;
+  }).join("");
+  return `<div class="row" style="gap:4px; margin-top:6px;"><span>History</span><span style="display:flex; gap:4px;">${dots}</span></div>`;
+}
+
 function renderJobs(jobs) {
   const el = document.getElementById("jobs-grid");
   if (!jobs || !jobs.length) { el.innerHTML = '<div class="empty">No jobs recorded yet.</div>'; return; }
@@ -122,6 +139,7 @@ function renderJobs(jobs) {
         <div class="title"><span class="dot ${statusDot(j)}"></span>${j.job_name}</div>
         <div class="row"><span>Status</span><b>${j.status}</b></div>
         <div class="row"><span>Last run</span><b>${fmtAge(j.age_hours)}</b></div>
+        ${renderHistory(j.history)}
         ${detail ? `<div class="row" style="font-size:11px; color:#6b7384;">${detail}</div>` : ""}
       </div>`;
   }).join("");

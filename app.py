@@ -70,30 +70,32 @@ except Exception:
 IS_WEB_ROLE = os.getenv("SPEECH2TEXT_ROLE", "web") == "web"
 
 
-def _spawn_background(fn, *args):
+def _spawn_background(fn, *args, **kwargs):
     """Fire-and-forget background work (EI extraction, reminder extraction,
-    etc.) -- uses gevent's own spawn under gunicorn's gevent worker instead
-    of threading.Thread(daemon=True).start(). Confirmed live: a plain daemon
-    thread started that way was not reliably completing in production (an
-    EI extraction call that worked perfectly when invoked directly produced
-    nothing when fired this way from a real /chat/global request) --
-    gevent.spawn is the documented, correct way to schedule background work
-    under a gevent worker, rather than relying on monkey-patched threading's
-    less-well-defined scheduling guarantees for a daemon thread specifically.
-    Only takes that path when threading is actually monkey-patched (i.e.
-    really running under gunicorn's gevent worker) -- otherwise (local
-    `python app.py`/the Flask dev server) falls back to a plain daemon
-    thread, since a spawned-but-never-driven greenlet would silently never
-    run at all without an active gevent hub looping."""
+    FCM push, etc.) -- uses gevent's own spawn under gunicorn's gevent
+    worker instead of threading.Thread(daemon=True).start(). Confirmed live:
+    a plain daemon thread started that way was not reliably completing in
+    production (an EI extraction call that worked perfectly when invoked
+    directly produced nothing when fired this way from a real /chat/global
+    request) -- gevent.spawn is the documented, correct way to schedule
+    background work under a gevent worker, rather than relying on
+    monkey-patched threading's less-well-defined scheduling guarantees for a
+    daemon thread specifically. Only takes that path when threading is
+    actually monkey-patched (i.e. really running under gunicorn's gevent
+    worker) -- otherwise (local `python app.py`/the Flask dev server) falls
+    back to a plain daemon thread, since a spawned-but-never-driven greenlet
+    would silently never run at all without an active gevent hub looping.
+    Accepts kwargs too (send_fcm_to_user's callers mostly pass title=/body=/
+    data= by keyword)."""
     try:
         import gevent.monkey
         if gevent.monkey.is_module_patched("threading"):
             import gevent
-            gevent.spawn(fn, *args)
+            gevent.spawn(fn, *args, **kwargs)
             return
     except ImportError:
         pass
-    threading.Thread(target=fn, args=args, daemon=True).start()
+    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
 
 
 app = Flask(__name__)
@@ -542,7 +544,7 @@ def notify_friends_of_mood_update(user_id, mood_label, friend_ids):
     }
     for fid in friend_ids:
         push_notification(fid, event)
-        send_fcm_to_user(fid, title=f"{name} seems {mood_label} {emoji}", body="Tap to check in", data=event)
+        _spawn_background(send_fcm_to_user, fid, title=f"{name} seems {mood_label} {emoji}", body="Tap to check in", data=event)
 
 
 def generate_unique_friend_code(cur):
@@ -845,7 +847,7 @@ def email_reminder_worker():
                     push_notification(row["user_id"], {
                         "type": "reminder_email_sent", "task_id": row["id"], "description": row["description"],
                     })
-                    send_fcm_to_user(
+                    _spawn_background(send_fcm_to_user, 
                         row["user_id"], title="Reminder sent", body=row["description"],
                         data={"type": "reminder_email_sent", "task_id": row["id"]},
                     )
@@ -918,19 +920,19 @@ def call_ring_timeout_worker():
 
         for call_id, initiator_id, caller_name, missed_user_ids in to_notify:
             push_notification(initiator_id, {"type": "call_ended", "call_id": call_id})
-            send_fcm_to_user(
+            _spawn_background(send_fcm_to_user, 
                 initiator_id, title="Call ended", body="",
                 data={"type": "call_ended", "call_id": call_id},
                 include_notification=False,
             )
             for uid in missed_user_ids:
                 push_notification(uid, {"type": "call_ended", "call_id": call_id})
-                send_fcm_to_user(
+                _spawn_background(send_fcm_to_user, 
                     uid, title="Call ended", body="",
                     data={"type": "call_ended", "call_id": call_id},
                     include_notification=False,
                 )
-                send_fcm_to_user(
+                _spawn_background(send_fcm_to_user, 
                     uid, title="Missed call", body=f"{caller_name} called you",
                     data={
                         "type": "missed_call", "call_id": call_id,
@@ -1186,7 +1188,7 @@ def _notify_setting_toggled(user_id, feature_label, enabled):
     state = "on" if enabled else "off"
     event = {"type": "setting_toggled", "feature": feature_label, "enabled": enabled}
     push_notification(user_id, event)
-    send_fcm_to_user(
+    _spawn_background(send_fcm_to_user, 
         user_id, title="Setting updated", body=f"You've turned {state} {feature_label}.",
         data={"type": "setting_toggled", "feature": feature_label, "enabled": str(enabled)},
     )
@@ -1746,7 +1748,7 @@ def _tool_message_friend(cur, db, user_id, args):
         "message": {"id": message_id, "sender_id": user_id, "recipient_id": friend["id"], "content": content},
         "sender_username": sender_name,
     })
-    send_fcm_to_user(
+    _spawn_background(send_fcm_to_user, 
         friend["id"], title=sender_name, body=content,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message_id)},
     )
@@ -1786,7 +1788,7 @@ def _tool_make_call(cur, db, user_id, args):
         "caller_id": user_id, "caller_name": username,
     }
     push_notification(friend["id"], call_event)
-    send_fcm_to_user(
+    _spawn_background(send_fcm_to_user, 
         friend["id"], title="Incoming call", body=f"{username} is calling...",
         data=call_event, include_notification=False,
     )
@@ -2489,7 +2491,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
             "type": "task_created", "task_id": task_id, "description": description,
             "conversation_id": conversation_id,
         })
-        send_fcm_to_user(
+        _spawn_background(send_fcm_to_user, 
             user_id, title="New task", body=description,
             data={"type": "task_created", "task_id": task_id, "conversation_id": conversation_id},
         )
@@ -2612,7 +2614,7 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
                 "type": "task_created", "task_id": task_id, "description": description,
                 "conversation_id": None,
             })
-            send_fcm_to_user(
+            _spawn_background(send_fcm_to_user, 
                 user_id, title="New task", body=description,
                 data={"type": "task_created", "task_id": task_id, "conversation_id": ""},
             )
@@ -3476,7 +3478,7 @@ def ws_listen(ws):
                 # pattern of a generic body rather than coordinating with a
                 # second async LLM call.
                 push_notification(user_id, {"type": "conversation_created", "conversation_id": conversation_id})
-                send_fcm_to_user(
+                _spawn_background(send_fcm_to_user, 
                     user_id, title="Conversation saved",
                     body="Your conversation has been saved and transcribed.",
                     data={"type": "conversation_created", "conversation_id": conversation_id},
@@ -3629,7 +3631,7 @@ def analyze_conversation():
             "type": "task_created", "task_id": task_id, "description": description,
             "conversation_id": conversation_id,
         })
-        send_fcm_to_user(
+        _spawn_background(send_fcm_to_user, 
             user_id, title="New task", body=description,
             data={"type": "task_created", "task_id": task_id, "conversation_id": conversation_id},
         )
@@ -4530,7 +4532,7 @@ def request_cognitive_suggestion(friend_id):
     push_notification(friend_id, {
         "type": "cognitive_suggestion", "suggestion_id": row["id"], "friend_id": user_id,
     })
-    send_fcm_to_user(
+    _spawn_background(send_fcm_to_user, 
         friend_id, title="Cognitive Sharing", body=f"A suggestion for you and {requester_name}",
         data={"type": "cognitive_suggestion", "suggestion_id": str(row["id"]), "friend_id": str(user_id)},
     )
@@ -4837,7 +4839,7 @@ def send_direct_message(friend_id):
     # without a separate lookup (mirrors the FCM title below).
     push_notification(friend_id, {"type": "direct_message", "message": message, "sender_username": sender_name})
     fcm_body = content or {"image": "ðŸ“· Photo", "video": "ðŸŽ¥ Video"}.get(attachment_type, "ðŸ“Ž Attachment")
-    send_fcm_to_user(
+    _spawn_background(send_fcm_to_user, 
         friend_id, title=sender_name, body=fcm_body,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message["id"])},
     )
@@ -5020,7 +5022,7 @@ def create_call():
             "caller_id": user_id, "caller_name": username,
         }
         push_notification(fid, call_event)
-        send_fcm_to_user(
+        _spawn_background(send_fcm_to_user, 
             fid, title="Incoming call", body=f"{username} is calling...",
             data=call_event, include_notification=False,
         )
@@ -5143,7 +5145,7 @@ def leave_call(call_id):
 
     for pid in other_ids:
         push_notification(pid, {"type": "call_ended", "call_id": call_id})
-        send_fcm_to_user(
+        _spawn_background(send_fcm_to_user, 
             pid, title="Call ended", body="",
             data={"type": "call_ended", "call_id": call_id},
             include_notification=False,
@@ -5271,7 +5273,7 @@ def upload_call_recording(call_id):
         push_notification(pid, {
             "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conv_id,
         })
-        send_fcm_to_user(
+        _spawn_background(send_fcm_to_user, 
             pid, title="Conversation ready",
             body="Your call has been transcribed into a new conversation.",
             data={"type": "call_conversation_ready", "call_id": call_id, "conversation_id": conv_id},
@@ -5361,7 +5363,7 @@ def process_own_call_recording_job(call_id, user_id, audio_path, content_type, c
     push_notification(user_id, {
         "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
     })
-    send_fcm_to_user(
+    _spawn_background(send_fcm_to_user, 
         user_id, title="Conversation ready",
         body="Your call has been transcribed into a new conversation.",
         data={"type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id},
@@ -6774,37 +6776,61 @@ def _admin_ensure_ops_schema(cur, db) -> None:
 _ADMIN_JOB_STALE_HOURS = {"ei_pipeline": 15, "nudge_cycle": 3}
 
 
+_ADMIN_JOB_HISTORY_LIMIT = 5
+
+
 def _admin_job_status(cur) -> list:
+    """Last 5 runs per job, not just the latest -- a job that flips
+    success/fail/success looks identical to a solidly healthy one if only
+    its single latest row is shown; the history list makes a flaky job
+    visible instead of just its current (possibly lucky) state."""
     cur.execute(
         """
-        SELECT DISTINCT ON (job_name) job_name, started_at, finished_at, status, detail
-        FROM ops.job_runs
+        SELECT job_name, started_at, finished_at, status, detail
+        FROM (
+            SELECT job_name, started_at, finished_at, status, detail,
+                   ROW_NUMBER() OVER (PARTITION BY job_name ORDER BY started_at DESC) AS rn
+            FROM ops.job_runs
+        ) ranked
+        WHERE rn <= %s
         ORDER BY job_name, started_at DESC
-        """
+        """,
+        (_ADMIN_JOB_HISTORY_LIMIT,),
     )
     rows = cur.fetchall()
     now = datetime.now(timezone.utc)
-    jobs = []
-    seen = set()
+    by_job: dict = {}
     for r in rows:
-        seen.add(r["job_name"])
-        reference = r["finished_at"] or r["started_at"]
+        by_job.setdefault(r["job_name"], []).append(r)
+
+    jobs = []
+    for job_name, runs in by_job.items():
+        latest = runs[0]
+        reference = latest["finished_at"] or latest["started_at"]
         age_hours = (now - reference).total_seconds() / 3600 if reference else None
-        stale_after = _ADMIN_JOB_STALE_HOURS.get(r["job_name"], 24)
+        stale_after = _ADMIN_JOB_STALE_HOURS.get(job_name, 24)
         jobs.append({
-            "job_name": r["job_name"],
-            "started_at": r["started_at"].isoformat() if r["started_at"] else None,
-            "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
-            "status": r["status"],
-            "detail": r["detail"],
+            "job_name": job_name,
+            "started_at": latest["started_at"].isoformat() if latest["started_at"] else None,
+            "finished_at": latest["finished_at"].isoformat() if latest["finished_at"] else None,
+            "status": latest["status"],
+            "detail": latest["detail"],
             "age_hours": round(age_hours, 2) if age_hours is not None else None,
             "stale": age_hours is not None and age_hours > stale_after,
+            "history": [
+                {
+                    "status": r["status"],
+                    "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                }
+                for r in runs
+            ],
         })
     for job_name in _ADMIN_JOB_STALE_HOURS:
-        if job_name not in seen:
+        if job_name not in by_job:
             jobs.append({
                 "job_name": job_name, "started_at": None, "finished_at": None,
                 "status": "never_run", "detail": None, "age_hours": None, "stale": True,
+                "history": [],
             })
     return jobs
 
@@ -6922,6 +6948,72 @@ def admin_api_status():
     })
 
 
+_ADMIN_ALERT_CHECK_INTERVAL_SECONDS = 1800  # 30 min
+_ADMIN_ALERT_COOLDOWN_HOURS = 6  # re-alert while still stale, but not every check
+
+
+def _admin_ensure_alerts_table(cur, conn) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops.alerts_sent (
+            job_name TEXT PRIMARY KEY,
+            last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    conn.commit()
+
+
+def ops_alert_worker():
+    """Runs continuously in a background thread, same pattern as
+    email_reminder_worker above -- this is what turns the admin dashboard
+    from a pull view (only useful if someone opens it) into something that
+    actually catches a job going silently stale overnight. Only fires when
+    ADMIN_ALERT_EMAIL is configured; otherwise this loop is a cheap no-op,
+    same convention as nudge_engine.is_enabled()'s early return."""
+    alert_email = os.getenv("ADMIN_ALERT_EMAIL", "").strip()
+    while True:
+        if not alert_email:
+            time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
+            continue
+        conn = None
+        try:
+            conn = get_raw_connection()
+            cur = dict_cursor(conn)
+            _admin_ensure_ops_schema(cur, conn)
+            _admin_ensure_alerts_table(cur, conn)
+            for job in _admin_job_status(cur):
+                if not job["stale"]:
+                    continue
+                cur.execute("SELECT last_alerted_at FROM ops.alerts_sent WHERE job_name = %s", (job["job_name"],))
+                row = cur.fetchone()
+                if row and (datetime.now(timezone.utc) - row["last_alerted_at"]).total_seconds() < _ADMIN_ALERT_COOLDOWN_HOURS * 3600:
+                    continue
+                age_desc = f"{job['age_hours']:.1f}h ago" if job["age_hours"] is not None else "never run"
+                send_plain_email(
+                    alert_email,
+                    f"[Throughline] {job['job_name']} is stale",
+                    f"{job['job_name']} last ran: {age_desc} (status: {job['status']}).\n\n"
+                    f"Check https://129-213-21-239.sslip.io/admin for details.",
+                )
+                cur.execute(
+                    "INSERT INTO ops.alerts_sent (job_name, last_alerted_at) VALUES (%s, now()) "
+                    "ON CONFLICT (job_name) DO UPDATE SET last_alerted_at = now()",
+                    (job["job_name"],),
+                )
+                conn.commit()
+                print(f"[ops_alert_worker] sent stale-job alert for {job['job_name']}")
+            cur.close()
+        except Exception as e:
+            print(f"[ops_alert_worker] error: {e!r}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                release_raw_connection(conn)
+        time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
+
+
 @app.route("/<path:_any>")
 def spa_fallback(_any):
     """React Router client-side paths (e.g. /insights, /calls, once those
@@ -6965,6 +7057,7 @@ def _start_nudge_worker_safely():
 if __name__ != "__main__" and IS_WEB_ROLE:
     threading.Thread(target=email_reminder_worker, daemon=True).start()
     threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
+    threading.Thread(target=ops_alert_worker, daemon=True).start()
     _start_nudge_worker_safely()
 
 if __name__ == "__main__":
@@ -6984,6 +7077,7 @@ if __name__ == "__main__":
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true" and IS_WEB_ROLE:
         threading.Thread(target=email_reminder_worker, daemon=True).start()
         threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
+        threading.Thread(target=ops_alert_worker, daemon=True).start()
         _start_nudge_worker_safely()
 
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True, ssl_context=ssl_context)

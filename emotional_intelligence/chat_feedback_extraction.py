@@ -130,6 +130,25 @@ def fetch_new_messages(cur, user_id: int, subject_id: int) -> list[dict]:
     return cur.fetchall()
 
 
+def _record_batch_error(cur, subject_id: int, run_type: str, error: str) -> dict:
+    """Writes the error row process_batch's two failure branches used to
+    skip entirely -- confirmed live: a crashing real-time trigger
+    (ei_adapter.py's trigger_chat_feedback_extraction) produced zero trace
+    anywhere except a stderr print, invisible to the admin dashboard's
+    error counts. Commits immediately via cur.connection.commit() rather
+    than leaving it to the caller: the real-time caller's connection is
+    already autocommit=True (a no-op there), but the batch main() below
+    rolls back on this same return value, which would otherwise discard
+    the row it's trying to record."""
+    cur.execute(
+        "INSERT INTO emotional_intelligence.analysis_runs (subject_id, run_type, prompt_version, status, error) "
+        "VALUES (%s, %s, %s, 'error', %s)",
+        (subject_id, run_type, PROMPT_VERSION, error),
+    )
+    cur.connection.commit()
+    return {"status": "error", "error": error}
+
+
 def process_batch(cur, subject_id: int, messages: list[dict], run_type: str = RUN_TYPE) -> dict:
     """run_type is overridable so the real-time trigger (ei_adapter.py's
     trigger_chat_feedback_extraction, fired right after /chat responds) can
@@ -160,11 +179,11 @@ def process_batch(cur, subject_id: int, messages: list[dict], run_type: str = RU
     try:
         content, raw_response = call_llm([{"role": "user", "content": prompt}])
     except Exception as e:
-        return {"status": "error", "error": f"LLM call failed: {e!r}"}
+        return _record_batch_error(cur, subject_id, run_type, f"LLM call failed: {e!r}")
 
     parsed = extract_json(content)
     if parsed is None:
-        return {"status": "error", "error": "unparseable LLM response"}
+        return _record_batch_error(cur, subject_id, run_type, "unparseable LLM response")
 
     tokens = (raw_response.get("prompt_eval_count") or 0) + (raw_response.get("eval_count") or 0)
     cur.execute(
