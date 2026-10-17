@@ -79,6 +79,11 @@
   </section>
 
   <section>
+    <h2>FCM Push (last 24h)</h2>
+    <div class="grid" id="fcm-grid"></div>
+  </section>
+
+  <section>
     <h2>Database</h2>
     <div class="grid" id="db-grid"></div>
   </section>
@@ -170,6 +175,31 @@ function renderDigest(d) {
     </div>`;
 }
 
+function renderFcm(fcm) {
+  const el = document.getElementById("fcm-grid");
+  const by = fcm.last_24h || {};
+  const sent = by.sent || 0, stale = by.stale || 0, error = by.error || 0, noToken = by.no_token || 0;
+  const errPill = (error > 0 || stale > 0) ? "warn" : "ok";
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Sent</div>
+      <div class="row"><b style="font-size:22px;">${sent}</b></div>
+    </div>
+    <div class="card">
+      <div class="title">Stale / Error</div>
+      <div class="row"><span class="pill ${errPill}">${stale} stale, ${error} error</span></div>
+    </div>
+    <div class="card">
+      <div class="title">No token</div>
+      <div class="row"><b>${noToken}</b></div>
+    </div>
+    <div class="card">
+      <div class="title">Registered devices</div>
+      <div class="row"><b>${fcm.registered_tokens ?? 0}</b></div>
+      <div class="row" style="font-size:11px;"><span>Last send</span><span>${fcm.last_send_at ? new Date(fcm.last_send_at).toLocaleString() : "never"}</span></div>
+    </div>`;
+}
+
 function fmtBytes(b) {
   if (b === null || b === undefined) return "-";
   const gb = b / 1e9;
@@ -238,6 +268,7 @@ async function refresh() {
     renderJobs(data.jobs);
     renderEi(data.ei_realtime);
     renderDigest(data.weekly_digest);
+    renderFcm(data.fcm);
     renderDb(data.db);
     renderSystem(data.system);
     document.getElementById("generated-at").textContent =

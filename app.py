@@ -3031,44 +3031,66 @@ def send_fcm_to_user(user_id, title, body, data=None, include_notification=True)
     app_ = get_firebase_app()
     if not app_:
         return
+    notif_type = (data or {}).get("type")
     conn = get_raw_connection()
     try:
         cur = conn.cursor()
+        # Best-effort tracking for the admin dashboard's FCM Push card --
+        # same idempotent ensure as ops.job_runs, reused here since this is
+        # the first write path for this table. A failure here must never
+        # block the actual push, which is why every call below is its own
+        # try/except rather than one wrapping the whole function.
+        try:
+            _admin_ensure_ops_schema(cur, conn)
+        except Exception as e:
+            print(f"[fcm] ops.fcm_sends ensure failed (tracking only, push still proceeds): {e!r}")
+            conn.rollback()
+
+        def _record(status):
+            try:
+                cur.execute(
+                    "INSERT INTO ops.fcm_sends (user_id, status, notification_type) VALUES (%s, %s, %s)",
+                    (user_id, status, notif_type),
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"[fcm] failed to record send status (tracking only): {e!r}")
+                conn.rollback()
+
         cur.execute("SELECT token FROM push_tokens WHERE user_id = %s", (user_id,))
         tokens = [r[0] for r in cur.fetchall()]
-    finally:
-        release_raw_connection(conn)
-    if not tokens:
-        print(f"[fcm] user {user_id} has no registered device tokens -- skipping push")
-        return
+        if not tokens:
+            print(f"[fcm] user {user_id} has no registered device tokens -- skipping push")
+            _record("no_token")
+            return
 
-    data_str = {k: str(v) for k, v in (data or {}).items()}
-    stale_tokens = []
-    for token in tokens:
-        message = firebase_messaging.Message(
-            token=token,
-            notification=firebase_messaging.Notification(title=title, body=body) if include_notification else None,
-            data=data_str,
-            android=firebase_messaging.AndroidConfig(priority="high"),
-            apns=firebase_messaging.APNSConfig(headers={"apns-priority": "10"}),
-        )
-        try:
-            firebase_messaging.send(message, app=app_)
-            print(f"[fcm] sent '{data_str.get('type')}' to user {user_id} ({token[:12]}...)")
-        except firebase_messaging.UnregisteredError:
-            stale_tokens.append(token)
-            print(f"[fcm] token for user {user_id} is stale/unregistered, removing ({token[:12]}...)")
-        except Exception as e:
-            print(f"[fcm] send failed for user {user_id}: {e!r}")
+        data_str = {k: str(v) for k, v in (data or {}).items()}
+        stale_tokens = []
+        for token in tokens:
+            message = firebase_messaging.Message(
+                token=token,
+                notification=firebase_messaging.Notification(title=title, body=body) if include_notification else None,
+                data=data_str,
+                android=firebase_messaging.AndroidConfig(priority="high"),
+                apns=firebase_messaging.APNSConfig(headers={"apns-priority": "10"}),
+            )
+            try:
+                firebase_messaging.send(message, app=app_)
+                print(f"[fcm] sent '{data_str.get('type')}' to user {user_id} ({token[:12]}...)")
+                _record("sent")
+            except firebase_messaging.UnregisteredError:
+                stale_tokens.append(token)
+                print(f"[fcm] token for user {user_id} is stale/unregistered, removing ({token[:12]}...)")
+                _record("stale")
+            except Exception as e:
+                print(f"[fcm] send failed for user {user_id}: {e!r}")
+                _record("error")
 
-    if stale_tokens:
-        conn = get_raw_connection()
-        try:
-            cur = conn.cursor()
+        if stale_tokens:
             cur.execute("DELETE FROM push_tokens WHERE token = ANY(%s)", (stale_tokens,))
             conn.commit()
-        finally:
-            release_raw_connection(conn)
+    finally:
+        release_raw_connection(conn)
 
 
 @app.route("/devices/register", methods=["POST"])
@@ -6764,6 +6786,18 @@ def _admin_ensure_ops_schema(cur, db) -> None:
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops.fcm_sends (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            status TEXT NOT NULL,
+            notification_type TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_fcm_sends_created ON ops.fcm_sends (created_at DESC)")
     db.commit()
     _admin_ops_schema_ensured = True
 
@@ -6871,6 +6905,31 @@ def _admin_weekly_digest_stats(cur) -> dict:
     return {"sent_last_7d": r["n"], "last_sent_at": r["last_at"].isoformat() if r["last_at"] else None}
 
 
+def _admin_fcm_stats(cur) -> dict:
+    """Derived from ops.fcm_sends, written by send_fcm_to_user itself --
+    'no_token' means the push never reached Firebase at all (no device
+    registered), distinct from 'error' (Firebase rejected or the call
+    itself failed) and 'stale' (a token that's since been deleted)."""
+    cur.execute(
+        """
+        SELECT status, count(*) AS n
+        FROM ops.fcm_sends
+        WHERE created_at > now() - interval '24 hours'
+        GROUP BY status
+        """
+    )
+    by_status = {r["status"]: r["n"] for r in cur.fetchall()}
+    cur.execute("SELECT max(created_at) AS last_at FROM ops.fcm_sends")
+    last_at = cur.fetchone()["last_at"]
+    cur.execute("SELECT count(*) AS n FROM push_tokens")
+    registered_tokens = cur.fetchone()["n"]
+    return {
+        "last_24h": by_status,
+        "last_send_at": last_at.isoformat() if last_at else None,
+        "registered_tokens": registered_tokens,
+    }
+
+
 def _admin_db_stats(cur) -> dict:
     cur.execute("SELECT pg_database_size(current_database()) AS bytes")
     db_bytes = cur.fetchone()["bytes"]
@@ -6938,6 +6997,7 @@ def admin_api_status():
         "jobs": _admin_job_status(cur),
         "ei_realtime": _admin_ei_realtime_stats(cur),
         "weekly_digest": _admin_weekly_digest_stats(cur),
+        "fcm": _admin_fcm_stats(cur),
         "db": _admin_db_stats(cur),
         "system": _admin_system_stats(),
         "flags": {
@@ -6964,14 +7024,34 @@ def _admin_ensure_alerts_table(cur, conn) -> None:
     conn.commit()
 
 
+_ADMIN_ALERT_CONFIRM_COUNT = 2  # consecutive stale checks required before actually alerting
+_admin_alert_consecutive_stale: dict = {}  # job_name -> count, in-memory, reset to 0 the moment a job looks healthy
+
+
 def ops_alert_worker():
     """Runs continuously in a background thread, same pattern as
     email_reminder_worker above -- this is what turns the admin dashboard
     from a pull view (only useful if someone opens it) into something that
     actually catches a job going silently stale overnight. Only fires when
     ADMIN_ALERT_EMAIL is configured; otherwise this loop is a cheap no-op,
-    same convention as nudge_engine.is_enabled()'s early return."""
+    same convention as nudge_engine.is_enabled()'s early return.
+
+    Two safeguards against a false alarm right after a deploy restart
+    (confirmed live: the very first check immediately after a restart once
+    reported ei_pipeline as never_run despite a real, hours-old successful
+    row already in ops.job_runs -- some transient visibility/startup race,
+    root cause not pinned down, but a one-off blip is exactly what these
+    two guards are for regardless of its exact cause):
+    1. Sleeps one full interval before its very first check, instead of
+       checking immediately on thread start -- skips the riskiest window
+       (the instant right after this and every other background worker/
+       migration starts concurrently).
+    2. Requires a job to look stale on _ADMIN_ALERT_CONFIRM_COUNT
+       consecutive checks (default 2, i.e. ~30-60 min of confirmed
+       staleness) before sending anything -- a transient one-check blip no
+       longer reaches send_plain_email at all, not just a logging fix."""
     alert_email = os.getenv("ADMIN_ALERT_EMAIL", "").strip()
+    time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
     while True:
         if not alert_email:
             time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
@@ -6983,29 +7063,36 @@ def ops_alert_worker():
             _admin_ensure_ops_schema(cur, conn)
             _admin_ensure_alerts_table(cur, conn)
             for job in _admin_job_status(cur):
+                job_name = job["job_name"]
                 if not job["stale"]:
+                    _admin_alert_consecutive_stale[job_name] = 0
                     continue
-                cur.execute("SELECT last_alerted_at FROM ops.alerts_sent WHERE job_name = %s", (job["job_name"],))
+                _admin_alert_consecutive_stale[job_name] = _admin_alert_consecutive_stale.get(job_name, 0) + 1
+                if _admin_alert_consecutive_stale[job_name] < _ADMIN_ALERT_CONFIRM_COUNT:
+                    print(f"[ops_alert_worker] {job_name} looks stale "
+                          f"({_admin_alert_consecutive_stale[job_name]}/{_ADMIN_ALERT_CONFIRM_COUNT} checks) -- not yet confirmed", flush=True)
+                    continue
+                cur.execute("SELECT last_alerted_at FROM ops.alerts_sent WHERE job_name = %s", (job_name,))
                 row = cur.fetchone()
                 if row and (datetime.now(timezone.utc) - row["last_alerted_at"]).total_seconds() < _ADMIN_ALERT_COOLDOWN_HOURS * 3600:
                     continue
                 age_desc = f"{job['age_hours']:.1f}h ago" if job["age_hours"] is not None else "never run"
                 send_plain_email(
                     alert_email,
-                    f"[Throughline] {job['job_name']} is stale",
-                    f"{job['job_name']} last ran: {age_desc} (status: {job['status']}).\n\n"
+                    f"[Throughline] {job_name} is stale",
+                    f"{job_name} last ran: {age_desc} (status: {job['status']}).\n\n"
                     f"Check https://129-213-21-239.sslip.io/admin for details.",
                 )
                 cur.execute(
                     "INSERT INTO ops.alerts_sent (job_name, last_alerted_at) VALUES (%s, now()) "
                     "ON CONFLICT (job_name) DO UPDATE SET last_alerted_at = now()",
-                    (job["job_name"],),
+                    (job_name,),
                 )
                 conn.commit()
-                print(f"[ops_alert_worker] sent stale-job alert for {job['job_name']}")
+                print(f"[ops_alert_worker] sent stale-job alert for {job_name}", flush=True)
             cur.close()
         except Exception as e:
-            print(f"[ops_alert_worker] error: {e!r}")
+            print(f"[ops_alert_worker] error: {e!r}", flush=True)
             if conn:
                 conn.rollback()
         finally:
