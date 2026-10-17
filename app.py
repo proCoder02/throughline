@@ -17,6 +17,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+from email.utils import formataddr
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -682,22 +683,69 @@ def build_ics(summary, description, start_utc, duration_minutes=30):
     return "\r\n".join(lines)
 
 
-def send_reminder_email(to_email, description, owner, due_date, reminder_at):
-    """Sends the reminder over SMTP with an .ics attachment. POC note: From
-    and To are both set to the user's own registered email, per how this is
-    being tested -- register using the same address configured as
-    SMTP_USERNAME so the mail is coming from (and going to) one real inbox.
-    Some providers (Gmail included) may rewrite or reject a From header that
-    doesn't match the authenticated SMTP account; for anything beyond a POC,
-    send through a transactional provider (SES/SendGrid/Mailgun) instead."""
+def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None):
+    """Shared send for send_reminder_email/send_plain_email below, over a
+    real hosted mailbox (throughline@zoomxcom.com, Hostinger) rather than a
+    personal Gmail account -- Gmail SMTP hit a real account-level Google
+    security lock under this app's automated sending pattern (confirmed
+    live: wrong both after a browser re-login AND after rotating the App
+    Password, so it wasn't fixable from this end). A domain-hosted mailbox
+    meant for exactly this doesn't carry that risk. The old Gmail
+    credentials stay in .env as GMAIL_SMTP_* in case they're needed again;
+    a brief Resend-API-based attempt also came and went (see git history) --
+    dropped once a real mailbox was available, since it avoided both
+    Gmail's abuse detection AND Resend's sandbox-only-to-self restriction
+    without needing separate domain DNS verification.
+
+    Port 465 is implicit TLS (SMTP_SSL) -- 587 would be STARTTLS instead;
+    picked automatically so SMTP_PORT alone decides which.
+
+    from_name/reply_to: every email actually goes out from the shared
+    mailbox address, so without these the recipient sees no trace of which
+    throughline user sent it. from_name sets the From header's display
+    name (e.g. "Amit via Throughline <throughline@zoomxcom.com>" -- still
+    the same authenticated address, just a recognizable label) and
+    reply_to points replies at the sending user's own registered email
+    instead of the shared mailbox, so a reply reaches them directly."""
     smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_username = os.getenv("SMTP_USERNAME")
     smtp_password = os.getenv("SMTP_PASSWORD")
     if not all([smtp_host, smtp_username, smtp_password]):
         print("[email] SMTP not configured (SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD) -- skipping")
         return False
 
+    msg = MIMEMultipart()
+    msg["From"] = formataddr((f"{from_name} via Throughline", smtp_username)) if from_name else smtp_username
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    msg.attach(MIMEText(text_body, "plain"))
+
+    if ics_content:
+        ics_part = MIMEBase("text", "calendar", method="REQUEST", name="reminder.ics")
+        ics_part.set_payload(ics_content)
+        encoders.encode_base64(ics_part)
+        ics_part.add_header("Content-Disposition", "attachment", filename="reminder.ics")
+        msg.attach(ics_part)
+
+    try:
+        smtp_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
+        with smtp_class(smtp_host, smtp_port, timeout=15) as server:
+            if smtp_port != 465:
+                server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.sendmail(smtp_username, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[email] SMTP send to {to_email} failed: {e!r}")
+        return False
+
+
+def send_reminder_email(to_email, description, owner, due_date, reminder_at):
+    """Sends the reminder with an .ics attachment. POC note: To is the
+    user's own registered email, per how this is being tested."""
     # reminder_at comes straight from Postgres as a native datetime object
     # (TIMESTAMPTZ column) -- but tolerate a string too, in case this is
     # ever called from somewhere that hasn't made that switch.
@@ -714,33 +762,12 @@ def send_reminder_email(to_email, description, owner, due_date, reminder_at):
         f"Owner: {owner or 'unspecified'} | Due: {due_date or 'not specified'}",
         start_utc,
     )
-
-    msg = MIMEMultipart()
-    msg["From"] = to_email
-    msg["To"] = to_email
-    msg["Subject"] = f"Reminder: {description}"
     body = (
         f"This is a reminder for a task extracted from your conversation:\n\n"
         f"{description}\n\nOwner: {owner or 'unspecified'}\nDue: {due_date or 'not specified'}\n\n"
         f"An .ics file is attached -- open it to add this to Google Calendar, Outlook, or Apple Calendar."
     )
-    msg.attach(MIMEText(body, "plain"))
-
-    ics_part = MIMEBase("text", "calendar", method="REQUEST", name="reminder.ics")
-    ics_part.set_payload(ics_content)
-    encoders.encode_base64(ics_part)
-    ics_part.add_header("Content-Disposition", "attachment", filename="reminder.ics")
-    msg.attach(ics_part)
-
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-            server.starttls()
-            server.login(smtp_username, smtp_password)
-            server.sendmail(smtp_username, [to_email], msg.as_string())
-        return True
-    except Exception as e:
-        print(f"[email] Failed to send reminder email to {to_email}: {e!r}")
-        return False
+    return _smtp_send(to_email, f"Reminder: {description}", body, ics_content=ics_content)
 
 
 def email_reminder_worker():
@@ -1455,11 +1482,57 @@ def parse_speakers(raw_text):
 # LLM call
 # ---------------------------------------------------------------------------
 
-def call_llm(messages):
-    api_key = os.getenv("OLLAMA_API_KEY") or os.getenv("olama_api_key")
-    if not api_key:
+def _ollama_api_keys():
+    """Every configured Ollama Cloud key, primary first -- olama_api_key_2
+    is a fallback for when the primary hits its rate limit/quota, not a
+    second account to load-balance across."""
+    keys = [
+        os.getenv("OLLAMA_API_KEY") or os.getenv("olama_api_key"),
+        os.getenv("OLLAMA_API_KEY_2") or os.getenv("olama_api_key_2"),
+    ]
+    return [k for k in keys if k]
+
+
+def _post_ollama_chat(payload):
+    """Shared POST for call_llm/call_llm_with_tools -- tries each configured
+    key in turn, falling through to the next one on a 429 (quota/rate limit)
+    or a timeout (Ollama Cloud occasionally not answering within 90s under
+    load -- confirmed live, not hypothetical), so a real error (bad payload,
+    5xx) still surfaces immediately instead of being masked by a pointless
+    retry on the same broken request."""
+    keys = _ollama_api_keys()
+    if not keys:
         raise RuntimeError("Missing Ollama API key")
 
+    last_error = None
+    for i, api_key in enumerate(keys):
+        is_last_key = i == len(keys) - 1
+        try:
+            response = requests.post(
+                "https://ollama.com/api/chat",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=90,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if not is_last_key:
+                print(f"[ollama] key {i + 1}/{len(keys)} timed out, trying next key")
+                last_error = e
+                continue
+            raise
+        if response.status_code == 429 and not is_last_key:
+            print(f"[ollama] key {i + 1}/{len(keys)} rate-limited, trying next key")
+            last_error = requests.HTTPError(response=response)
+            continue
+        response.raise_for_status()
+        return response.json()
+    raise last_error
+
+
+def call_llm(messages):
     # Ollama Cloud bills by GPU-time/usage-level, not strict token count --
     # lighter models (e.g. gpt-oss:20b) sit in a cheaper usage tier than
     # gpt-oss:120b. Override via .env to test cost/quality tradeoff without
@@ -1469,19 +1542,349 @@ def call_llm(messages):
         "messages": messages,
         "stream": False,
     }
-
-    response = requests.post(
-        "https://ollama.com/api/chat",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=90,
-    )
-    response.raise_for_status()
-    result = response.json()
+    result = _post_ollama_chat(payload)
     return result.get("message", {}).get("content", "")
+
+
+def call_llm_with_tools(messages, tools):
+    """Tool-calling counterpart to call_llm, above -- same Ollama Cloud
+    endpoint and model, but returns the full assistant message (content +
+    tool_calls) instead of just the text, and passes the OpenAI-style
+    `tools` array through. gpt-oss (the default OLLAMA_MODEL) was built
+    with native function calling, so no model swap is needed for this."""
+    payload = {
+        "model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"),
+        "messages": messages,
+        "tools": tools,
+        "stream": False,
+    }
+    result = _post_ollama_chat(payload)
+    return result.get("message", {}) or {}
+
+
+# ---------------------------------------------------------------------------
+# Global chat agent tools -- create_task/message_friend/make_call reuse the
+# exact DB + push logic already proven out by the manual reminder-extraction
+# path, POST /friends/<id>/messages, and POST /calls respectively; this is
+# just a second entry point into the same effects, reachable via tool-calling
+# instead of a dedicated route. send_email is the one genuinely new piece,
+# generalizing send_reminder_email's SMTP call below past the reminder/.ics
+# use case.
+# ---------------------------------------------------------------------------
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_task",
+            "description": "Create a task/to-do for the user, optionally with a reminder. Use whenever the user asks to be reminded of something or to add/track a task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "What the task is."},
+                    "due_date": {"type": "string", "description": "Due date if mentioned, else omit."},
+                    "reminder_at": {
+                        "type": "string",
+                        "description": "ISO 8601 'YYYY-MM-DDTHH:MM:SS' if a specific reminder time was stated or clearly implied, else omit. Assume 09:00:00 if only a day is given.",
+                    },
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "message_friend",
+            "description": "Send a direct message to one of the user's friends inside the app. Use when the user asks to tell/message/let someone know something.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "friend_name": {"type": "string", "description": "The friend's name or nickname, as the user referred to them."},
+                    "content": {"type": "string", "description": "The message to send."},
+                },
+                "required": ["friend_name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_call",
+            "description": "Start an in-app call with one of the user's friends. Use when the user explicitly asks to call someone.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "friend_name": {"type": "string", "description": "The friend's name or nickname to call."},
+                },
+                "required": ["friend_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. A friend_name email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "friend_name": {"type": "string", "description": "A friend's name/nickname, if emailing a friend."},
+                    "to_email": {"type": "string", "description": "A literal email address, if the user stated one."},
+                    "subject": {
+                        "type": "string",
+                        "description": "Match the register to the recipient: plain and direct for a professor/boss/official contact ('Absence from Tuesday's lecture'), casual is fine for a friend ('missing class tomorrow').",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": (
+                            "Write this the way the user actually would for this recipient -- infer "
+                            "formality from who it's going to and the context, don't default to the "
+                            "casual register of this chat. A professor, teacher, employer, or anyone "
+                            "addressed by title/last name gets a formal register: a greeting (e.g. "
+                            "'Dear Professor Shah,'), full sentences, no slang or emoji, a proper "
+                            "closing with the user's name. A friend gets whatever casual tone the user "
+                            "used when asking. If the user dictates exact wording, use it verbatim "
+                            "instead of rewriting it."
+                        ),
+                    },
+                },
+                "required": ["subject", "body"],
+            },
+        },
+    },
+]
+
+
+def _resolve_friend_by_name(cur, user_id, name):
+    """Case-insensitive match against each friend's nickname (if set) or
+    username -- same identity space /chat/global's matched_friend lookup
+    already uses, just name-to-id instead of text-scan-for-a-known-name."""
+    if not name:
+        return None
+    cur.execute(
+        "SELECT u.id, u.email, COALESCE(f.nickname, u.username) AS name FROM friendships f "
+        "JOIN users u ON u.id = f.friend_id WHERE f.user_id = %s",
+        (user_id,),
+    )
+    name_lower = name.strip().lower()
+    for row in cur.fetchall():
+        if row["name"].lower() == name_lower:
+            return row
+    return None
+
+
+def send_plain_email(to_email, subject, body, from_name=None, reply_to=None):
+    """General-purpose counterpart to send_reminder_email, above -- no .ics
+    attachment, arbitrary recipient instead of always the authenticated
+    user's own address."""
+    return _smtp_send(to_email, subject, body, from_name=from_name, reply_to=reply_to)
+
+
+def _tool_create_task(cur, db, user_id, args):
+    description = (args.get("description") or "").strip()
+    if not description:
+        return {"error": "description is required"}
+    cur.execute(
+        "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
+        "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
+        (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at"))),
+    )
+    task_id = cur.fetchone()["id"]
+    db.commit()
+    return {"ok": True, "task_id": task_id, "description": description}
+
+
+def _tool_message_friend(cur, db, user_id, args):
+    friend = _resolve_friend_by_name(cur, user_id, args.get("friend_name"))
+    content = (args.get("content") or "").strip()
+    if not friend:
+        return {"error": f"No friend named '{args.get('friend_name')}' found"}
+    if not content:
+        return {"error": "content is required"}
+
+    cur.execute(
+        "INSERT INTO direct_messages (sender_id, recipient_id, content) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, friend["id"], content),
+    )
+    message_id = cur.fetchone()["id"]
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    sender_name = cur.fetchone()["username"]
+    push_notification(friend["id"], {
+        "type": "direct_message",
+        "message": {"id": message_id, "sender_id": user_id, "recipient_id": friend["id"], "content": content},
+        "sender_username": sender_name,
+    })
+    send_fcm_to_user(
+        friend["id"], title=sender_name, body=content,
+        data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message_id)},
+    )
+    return {"ok": True, "friend_name": friend["name"], "message_id": message_id}
+
+
+def _tool_make_call(cur, db, user_id, args):
+    if not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
+        return {"error": "Calling is not configured"}
+    friend = _resolve_friend_by_name(cur, user_id, args.get("friend_name"))
+    if not friend:
+        return {"error": f"No friend named '{args.get('friend_name')}' found"}
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    username = cur.fetchone()["username"]
+    category = get_user_personalization(cur, user_id)
+    room_name = f"call-{uuid.uuid4().hex[:16]}"
+
+    cur.execute(
+        "INSERT INTO calls (initiator_user_id, room_name, category) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, room_name, category),
+    )
+    call_id = cur.fetchone()["id"]
+    cur.execute(
+        "INSERT INTO call_participants (call_id, user_id, status, joined_at) VALUES (%s, %s, 'joined', now())",
+        (call_id, user_id),
+    )
+    cur.execute(
+        "INSERT INTO call_participants (call_id, user_id, status) VALUES (%s, %s, 'invited')",
+        (call_id, friend["id"]),
+    )
+    db.commit()
+
+    token = generate_livekit_token(user_id, username, room_name)
+    call_event = {
+        "type": "incoming_call", "call_id": call_id, "room_name": room_name,
+        "caller_id": user_id, "caller_name": username,
+    }
+    push_notification(friend["id"], call_event)
+    send_fcm_to_user(
+        friend["id"], title="Incoming call", body=f"{username} is calling...",
+        data=call_event, include_notification=False,
+    )
+    return {
+        "ok": True, "friend_name": friend["name"], "call_id": call_id, "room_name": room_name,
+        "_action_card": {
+            "type": "call", "call_id": call_id, "room_name": room_name,
+            "token": token, "livekit_url": os.getenv("LIVEKIT_URL"),
+            "friend_name": friend["name"],
+        },
+    }
+
+
+def _tool_send_email(cur, db, user_id, args):
+    """Known friend -> sends immediately, unchanged. Arbitrary address (a
+    professor, a boss, anyone outside the trust graph) -> drafted instead of
+    sent, since that's the case where a wrong guess (misread name, wrong
+    tone) actually costs something and can't be unsent. Mirrors the
+    Swiggy commerce_actions recommend-then-confirm shape -- see
+    /email-drafts/<id>/confirm and /dismiss below."""
+    to_email = (args.get("to_email") or "").strip()
+    friend_name = args.get("friend_name")
+    is_friend = False
+    if friend_name:
+        friend = _resolve_friend_by_name(cur, user_id, friend_name)
+        if not friend:
+            return {"error": f"No friend named '{friend_name}' found"}
+        if not friend.get("email"):
+            return {"error": f"{friend['name']} has no registered email"}
+        to_email = friend["email"]
+        is_friend = True
+    if not to_email:
+        return {"error": "to_email or a known friend_name is required"}
+    subject = args.get("subject") or "(no subject)"
+    body = args.get("body") or ""
+    cur.execute("SELECT username, email FROM users WHERE id = %s", (user_id,))
+    sender = cur.fetchone()
+    from_name = sender["username"] if sender else None
+    reply_to = sender["email"] if sender and sender.get("email") else None
+
+    if is_friend:
+        sent = send_plain_email(to_email, subject, body, from_name=from_name, reply_to=reply_to)
+        return {"ok": sent, "to_email": to_email} if sent else {"error": f"Failed to send email to {to_email}"}
+
+    cur.execute(
+        "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (user_id, to_email, subject, body, from_name, reply_to),
+    )
+    draft_id = cur.fetchone()["id"]
+    db.commit()
+    return {
+        "ok": True, "pending": True, "to_email": to_email, "draft_id": draft_id,
+        "_action_card": {
+            "type": "email_draft", "draft_id": draft_id,
+            "to_email": to_email, "subject": subject, "body": body,
+        },
+    }
+
+
+AGENT_TOOL_DISPATCH = {
+    "create_task": lambda cur, db, user_id, args: _tool_create_task(cur, db, user_id, args),
+    "message_friend": lambda cur, db, user_id, args: _tool_message_friend(cur, db, user_id, args),
+    "make_call": lambda cur, db, user_id, args: _tool_make_call(cur, db, user_id, args),
+    "send_email": lambda cur, db, user_id, args: _tool_send_email(cur, db, user_id, args),
+}
+
+AGENT_LOOP_MAX_TURNS = 4
+
+
+def run_agent_tool_loop(cur, db, user_id, messages):
+    """Drives up to AGENT_LOOP_MAX_TURNS rounds of tool-calling on top of
+    call_llm_with_tools: dispatches every tool_call the model returns,
+    feeds each result back as a `tool` message, and stops as soon as a
+    turn comes back with no tool_calls (that message's content is the
+    final reply). Returns (reply_text, action_card, created_task).
+
+    created_task is surfaced so the caller can skip the separate
+    trigger_reminder_extraction background pass for this same message --
+    without it, a single "remind me to..." could create two tasks: one
+    from this loop's create_task call, one from that older regex-triggered
+    extraction path."""
+    action_card = None
+    created_task = False
+    messages = list(messages)
+
+    for _ in range(AGENT_LOOP_MAX_TURNS):
+        message = call_llm_with_tools(messages, AGENT_TOOLS)
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return message.get("content") or "", action_card, created_task
+
+        messages.append(message)
+        for call in tool_calls:
+            fn = (call.get("function") or {})
+            name = fn.get("name")
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except ValueError:
+                    args = {}
+            else:
+                args = raw_args or {}
+
+            handler = AGENT_TOOL_DISPATCH.get(name)
+            if not handler:
+                result = {"error": f"Unknown tool '{name}'"}
+            else:
+                try:
+                    result = handler(cur, db, user_id, args)
+                except Exception as e:
+                    db.rollback()
+                    result = {"error": str(e)}
+
+            if name == "create_task" and result.get("ok"):
+                created_task = True
+            card = result.pop("_action_card", None)
+            if card:
+                action_card = card
+
+            messages.append({"role": "tool", "content": json.dumps(result)})
+
+    # Ran out of turns -- fall back to a plain call so the user still gets
+    # a reply instead of an empty response.
+    final = call_llm(messages)
+    return final, action_card, created_task
 
 
 # Strips a leading <think>...</think> reasoning block some models (e.g. Groq's
@@ -2070,6 +2473,19 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
 # is_closing_acknowledgment/is_probably_just_a_question).
 _REMINDER_INTENT_RE = re.compile(
     r"\bremind(?:er|ers)?\b|\bdon'?t let me forget\b", re.IGNORECASE
+)
+
+# Guards /chat/global's own no-context short-circuit (below) from skipping
+# the agent tool loop entirely -- without this, a brand-new user with zero
+# saved conversations asking "remind me to call mom" or "message Priya..."
+# would just get the canned "I don't have any past conversations" reply and
+# no task/message/call would ever happen. Deliberately broad (a false
+# positive just costs one extra tool-loop call; a false negative silently
+# breaks the feature), unlike _REMINDER_INTENT_RE above which only gates an
+# optional background extraction pass.
+_AGENT_ACTION_INTENT_RE = re.compile(
+    r"\bremind(?:er|ers)?\b|\btask\b|\bto-?do\b|\bcall\b|\bmessage\b|\btell\b|\be-?mail\b|\bschedule\b",
+    re.IGNORECASE,
 )
 
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
@@ -3372,6 +3788,175 @@ def correlate_heart_rate():
 
     results.sort(key=lambda r: r["at"], reverse=True)
     return jsonify(results)
+
+
+@app.route("/tv/activity", methods=["POST"])
+@login_required
+def sync_tv_activity_session():
+    """Smart TV companion app syncs one TV-on-to-TV-off watch session.
+    Upserts on (user_id, device_session_id) so a retried sync after a
+    dropped connection never double-inserts."""
+    data = request.get_json(silent=True) or {}
+    device_session_id = (data.get("session_id") or "").strip()
+    started_at = data.get("started_at")
+    events = data.get("events")
+    if not device_session_id or not started_at or not isinstance(events, list):
+        return jsonify({"error": "session_id, started_at, and events are required"}), 400
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "INSERT INTO tv_activity_sessions (user_id, device_session_id, started_at, ended_at, events) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, device_session_id) DO UPDATE SET "
+        "ended_at = EXCLUDED.ended_at, events = EXCLUDED.events "
+        "RETURNING id",
+        (current_user_id(), device_session_id, started_at, data.get("ended_at"), json.dumps(events)),
+    )
+    session_row_id = cur.fetchone()["id"]
+    db.commit()
+    return jsonify({"ok": True, "id": session_row_id})
+
+
+@app.route("/tv/activity", methods=["GET"])
+@login_required
+def list_tv_activity_sessions():
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT id, device_session_id, started_at, ended_at, events "
+        "FROM tv_activity_sessions WHERE user_id = %s ORDER BY started_at DESC LIMIT 50",
+        (current_user_id(),),
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
+
+
+@app.route("/tv/activity/correlate", methods=["GET"])
+@login_required
+def correlate_tv_activity():
+    """Correlates this user's recent conversations/tasks/mood_logs with
+    TV media-session events recorded within +/- window_minutes of each one.
+    Same "close in time, not literal interval overlap" semantics as
+    correlate_heart_rate above, for the same reason (source tables only
+    store a single created_at point)."""
+    user_id = current_user_id()
+    try:
+        window_minutes = int(request.args.get("window_minutes", 15))
+    except ValueError:
+        return jsonify({"error": "window_minutes must be an integer"}), 400
+    window = timedelta(minutes=max(1, min(window_minutes, 180)))
+
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT (event->>'at')::timestamptz AS at, event->>'media_title' AS media_title, "
+        "event->>'app_package' AS app_package "
+        "FROM tv_activity_sessions, jsonb_array_elements(events) AS event "
+        "WHERE user_id = %s AND event->>'type' = 'media_session'",
+        (user_id,),
+    )
+    tv_rows = cur.fetchall()
+
+    def watching_near(ts):
+        if ts is None:
+            return None
+        nearby = [r for r in tv_rows if ts - window <= r["at"] <= ts + window]
+        if not nearby:
+            return None
+        titles = sorted({r["media_title"] for r in nearby if r["media_title"]})
+        return {"watching": titles, "event_count": len(nearby)}
+
+    results = []
+
+    cur.execute(
+        "SELECT id, title, created_at FROM conversations WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    )
+    for row in cur.fetchall():
+        tv = watching_near(row["created_at"])
+        if tv:
+            results.append({"type": "conversation", "id": row["id"],
+                             "label": row["title"] or "Listen session",
+                             "at": row["created_at"].isoformat(), **tv})
+
+    cur.execute(
+        "SELECT id, description, created_at FROM tasks WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    )
+    for row in cur.fetchall():
+        tv = watching_near(row["created_at"])
+        if tv:
+            results.append({"type": "task", "id": row["id"], "label": row["description"],
+                             "at": row["created_at"].isoformat(), **tv})
+
+    cur.execute(
+        "SELECT id, mood_label, created_at FROM mood_logs WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    )
+    for row in cur.fetchall():
+        tv = watching_near(row["created_at"])
+        if tv:
+            results.append({"type": "mood", "id": row["id"], "label": row["mood_label"],
+                             "at": row["created_at"].isoformat(), **tv})
+
+    results.sort(key=lambda r: r["at"], reverse=True)
+    return jsonify(results)
+
+
+@app.route("/email-drafts/<int:draft_id>/confirm", methods=["POST"])
+@login_required
+def confirm_email_draft(draft_id):
+    """User tapped Send on an EmailDraftCard (see _tool_send_email) -- the
+    one point where a drafted email actually goes out. Ownership + pending
+    check in the same query via the WHERE clause, same shape as
+    delete_task below, rather than a separate SELECT-then-check."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT to_email, subject, body, from_name, reply_to FROM email_drafts "
+        "WHERE id = %s AND user_id = %s AND status = 'pending'",
+        (draft_id, user_id),
+    )
+    draft = cur.fetchone()
+    if not draft:
+        return jsonify({"error": "No pending draft with that id"}), 404
+
+    sent = send_plain_email(
+        draft["to_email"], draft["subject"], draft["body"],
+        from_name=draft["from_name"], reply_to=draft["reply_to"],
+    )
+    if not sent:
+        return jsonify({"error": f"Failed to send email to {draft['to_email']}"}), 502
+
+    cur.execute(
+        "UPDATE email_drafts SET status = 'sent', resolved_at = now() WHERE id = %s",
+        (draft_id,),
+    )
+    db.commit()
+    return jsonify({"ok": True, "status": "sent"})
+
+
+@app.route("/email-drafts/<int:draft_id>/dismiss", methods=["POST"])
+@login_required
+def dismiss_email_draft(draft_id):
+    """User tapped Cancel -- nothing is ever sent for a dismissed draft."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE email_drafts SET status = 'dismissed', resolved_at = now() "
+        "WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING id",
+        (draft_id, user_id),
+    )
+    updated = cur.fetchone()
+    db.commit()
+    if not updated:
+        return jsonify({"error": "No pending draft with that id"}), 404
+    return jsonify({"ok": True, "status": "dismissed"})
 
 
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
@@ -5501,7 +6086,8 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
-    if not conversations and not ei_context and not personal_notes_context and not direct_messages_context and not nearby_context and not commerce_context:
+    if (not conversations and not ei_context and not personal_notes_context and not direct_messages_context
+            and not nearby_context and not commerce_context and not _AGENT_ACTION_INTENT_RE.search(prompt_lower)):
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -5555,7 +6141,7 @@ def chat_global():
     messages.append({"role": "user", "content": user_content})
 
     try:
-        reply = call_llm(messages)
+        reply, tool_action_card, created_task_this_turn = run_agent_tool_loop(cur, db, user_id, messages)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 500
         if status == 429:
@@ -5569,6 +6155,13 @@ def chat_global():
         return jsonify({"error": error_json}), status
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return jsonify({
+            "reply": "The assistant is taking too long to respond right now. Please try again in a moment."
+        })
+
+    if tool_action_card:
+        action_card = tool_action_card
 
     if reply:
         # Store the clean question/reply, not the retrieval blob -- that
@@ -5582,7 +6175,11 @@ def chat_global():
         threading.Thread(target=trigger_chat_feedback_extraction, args=(user_id, prompt), daemon=True).start()
     except Exception:
         pass  # EI engine is optional and additive -- never affects this endpoint's own behavior
-    threading.Thread(target=trigger_reminder_extraction, args=(user_id, prompt), daemon=True).start()
+    if not created_task_this_turn:
+        # Skip the older regex-triggered extraction pass when the agent loop
+        # already created a task for this same message -- otherwise "remind
+        # me to..." creates two tasks, one from each path.
+        threading.Thread(target=trigger_reminder_extraction, args=(user_id, prompt), daemon=True).start()
 
     return jsonify({
         "reply": reply,

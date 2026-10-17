@@ -102,6 +102,44 @@ CREATE TABLE IF NOT EXISTS heart_rate_sessions (
 CREATE INDEX IF NOT EXISTS idx_heart_rate_sessions_user_started
     ON heart_rate_sessions (user_id, started_at);
 
+-- Smart TV companion app -- one row per TV-on-to-TV-off watch session.
+-- events stored as JSONB (list of {at, type: media_session|power_on|power_off,
+-- app_package, media_title, playback_state}) -- same one-row-per-session
+-- shape as heart_rate_sessions above, for the same reason (a session is a
+-- handful of events, never queried per-event).
+CREATE TABLE IF NOT EXISTS tv_activity_sessions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    device_session_id TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ,
+    events JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, device_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tv_activity_sessions_user_started
+    ON tv_activity_sessions (user_id, started_at);
+
+-- Global-chat send_email tool, arbitrary-recipient path only (a known
+-- friend still sends immediately, see _tool_send_email) -- a draft held
+-- here until the user taps Send/Cancel on its action_card, same
+-- recommend-then-act shape as commerce_actions below, just for email
+-- instead of a Swiggy order.
+CREATE TABLE IF NOT EXISTS email_drafts (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    to_email TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    from_name TEXT,
+    reply_to TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | dismissed
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_email_drafts_user_status
+    ON email_drafts (user_id, status);
+
 -- Mutual friendship: adding a friend by code inserts both directions, so a
 -- friend list is always a plain "WHERE user_id = ?" with no OR/self-join.
 CREATE TABLE IF NOT EXISTS friendships (
