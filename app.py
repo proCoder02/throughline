@@ -6,7 +6,9 @@ import math
 import json
 import base64
 import hashlib
+import hmac
 import secrets
+import shutil
 import tempfile
 import threading
 import jwt as pyjwt
@@ -6679,6 +6681,245 @@ def update_profile_picture():
     if old_key and old_key != object_key:
         storage.delete_object(old_key)
     return jsonify({"ok": True, "profile_picture_url": url})
+
+
+# ----------------------------------------------------------------------------
+# Admin ops dashboard -- a separate fixed credential (ADMIN_USERNAME/
+# ADMIN_PASSWORD in .env), not tied to the users table at all, since there's
+# no admin/role concept anywhere else in this app and this is a single-
+# operator ops view, not a per-user feature. Session-scoped via its own
+# "is_admin" flag, independent of the normal login's "user_id" flag.
+# ----------------------------------------------------------------------------
+
+def admin_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not session.get("is_admin"):
+            return redirect("/admin/login")
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+@app.route("/admin/login", methods=["GET"])
+def admin_login_page():
+    if session.get("is_admin"):
+        return redirect("/admin")
+    return render_template("admin_login.html", error=None)
+
+
+@app.route("/admin/login", methods=["POST"])
+def admin_login_submit():
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    expected_user = os.getenv("ADMIN_USERNAME", "")
+    expected_pass = os.getenv("ADMIN_PASSWORD", "")
+    # hmac.compare_digest instead of == -- a naive comparison short-circuits
+    # on the first mismatched character, leaking how many leading
+    # characters matched via response timing.
+    user_ok = bool(expected_user) and hmac.compare_digest(username, expected_user)
+    pass_ok = bool(expected_pass) and hmac.compare_digest(password, expected_pass)
+    if not (user_ok and pass_ok):
+        return render_template("admin_login.html", error="Invalid username or password"), 401
+    session["is_admin"] = True
+    return redirect("/admin")
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("is_admin", None)
+    return redirect("/admin/login")
+
+
+@app.route("/admin")
+@admin_required
+def admin_dashboard_page():
+    return render_template("admin_dashboard.html")
+
+
+_admin_ops_schema_ensured = False
+
+
+def _admin_ensure_ops_schema(cur, db) -> None:
+    """Idempotent; only actually runs the DDL once per process (module-level
+    flag) since this gets called on every dashboard poll -- same table
+    run_daily_ei_pipeline.py and nudges/nudge_engine.py write to, so
+    whichever of those three runs first creates it in practice."""
+    global _admin_ops_schema_ensured
+    if _admin_ops_schema_ensured:
+        return
+    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops.job_runs (
+            id SERIAL PRIMARY KEY,
+            job_name TEXT NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'running',
+            detail JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
+    db.commit()
+    _admin_ops_schema_ensured = True
+
+
+# job_name -> expected max gap between runs before it's flagged stale, in
+# hours. ei_pipeline runs twice daily (cron: 08:00/20:00 UTC -- see
+# emotional_intelligence/run_daily_ei_pipeline.py), nudge_cycle hourly (see
+# nudges/nudge_engine.py's start_nudge_worker); both get a generous buffer
+# over their own schedule so a slightly late run doesn't flash red.
+_ADMIN_JOB_STALE_HOURS = {"ei_pipeline": 15, "nudge_cycle": 3}
+
+
+def _admin_job_status(cur) -> list:
+    cur.execute(
+        """
+        SELECT DISTINCT ON (job_name) job_name, started_at, finished_at, status, detail
+        FROM ops.job_runs
+        ORDER BY job_name, started_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    now = datetime.now(timezone.utc)
+    jobs = []
+    seen = set()
+    for r in rows:
+        seen.add(r["job_name"])
+        reference = r["finished_at"] or r["started_at"]
+        age_hours = (now - reference).total_seconds() / 3600 if reference else None
+        stale_after = _ADMIN_JOB_STALE_HOURS.get(r["job_name"], 24)
+        jobs.append({
+            "job_name": r["job_name"],
+            "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+            "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+            "status": r["status"],
+            "detail": r["detail"],
+            "age_hours": round(age_hours, 2) if age_hours is not None else None,
+            "stale": age_hours is not None and age_hours > stale_after,
+        })
+    for job_name in _ADMIN_JOB_STALE_HOURS:
+        if job_name not in seen:
+            jobs.append({
+                "job_name": job_name, "started_at": None, "finished_at": None,
+                "status": "never_run", "detail": None, "age_hours": None, "stale": True,
+            })
+    return jobs
+
+
+def _admin_ei_realtime_stats(cur) -> dict:
+    """Derived entirely from existing emotional_intelligence.analysis_runs
+    rows -- no new writes needed, since real_user_extraction.py and
+    chat_feedback_extraction.py (both real-time and batch invocations)
+    already write one there per conversation/message processed."""
+    cur.execute(
+        """
+        SELECT run_type,
+               count(*) FILTER (WHERE status = 'success') AS success,
+               count(*) FILTER (WHERE status != 'success') AS error,
+               max(created_at) AS last_at
+        FROM emotional_intelligence.analysis_runs
+        WHERE created_at > now() - interval '24 hours'
+          AND run_type IN ('chat_feedback_extraction_realtime', 'chat_feedback_extraction',
+                            'real_user_extraction', 'personality_batch', 'relationship_batch', 'fact_dedup')
+        GROUP BY run_type
+        """
+    )
+    return {
+        r["run_type"]: {
+            "success": r["success"], "error": r["error"],
+            "last_at": r["last_at"].isoformat() if r["last_at"] else None,
+        }
+        for r in cur.fetchall()
+    }
+
+
+def _admin_weekly_digest_stats(cur) -> dict:
+    cur.execute(
+        "SELECT count(*) AS n, max(sent_at) AS last_at FROM nudges.sent_log "
+        "WHERE nudge_type = 'weekly_digest' AND sent_at > now() - interval '7 days'"
+    )
+    r = cur.fetchone()
+    return {"sent_last_7d": r["n"], "last_sent_at": r["last_at"].isoformat() if r["last_at"] else None}
+
+
+def _admin_db_stats(cur) -> dict:
+    cur.execute("SELECT pg_database_size(current_database()) AS bytes")
+    db_bytes = cur.fetchone()["bytes"]
+    cur.execute(
+        """
+        SELECT schemaname || '.' || relname AS table_name,
+               pg_total_relation_size(schemaname || '.' || relname) AS bytes
+        FROM pg_catalog.pg_statio_user_tables
+        ORDER BY bytes DESC
+        LIMIT 8
+        """
+    )
+    largest = [{"table": r["table_name"], "bytes": r["bytes"]} for r in cur.fetchall()]
+    return {"total_bytes": db_bytes, "largest_tables": largest}
+
+
+def _admin_system_stats() -> dict:
+    """Linux-only (os.getloadavg(), /proc/meminfo) -- this dashboard only
+    ever runs against the real prod host, the same single Oracle Cloud VM
+    that runs Postgres (DATABASE_URL is localhost), so shutil.disk_usage('/')
+    reports the real volume both the app and the DB live on. Falls back to
+    an "error" field per section rather than failing the whole endpoint if
+    run somewhere these aren't available (e.g. local Windows dev)."""
+    out = {}
+    try:
+        total, used, free = shutil.disk_usage("/")
+        out["disk"] = {
+            "total_gb": round(total / 1e9, 1), "used_gb": round(used / 1e9, 1),
+            "free_gb": round(free / 1e9, 1), "percent_used": round(used / total * 100, 1),
+        }
+    except Exception as e:
+        out["disk"] = {"error": str(e)}
+    try:
+        load1, load5, load15 = os.getloadavg()
+        out["cpu"] = {"load_1m": round(load1, 2), "load_5m": round(load5, 2),
+                      "load_15m": round(load15, 2), "core_count": os.cpu_count()}
+    except Exception as e:
+        out["cpu"] = {"error": str(e)}
+    try:
+        meminfo = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                meminfo[key] = int(rest.strip().split()[0])  # kB
+        total_kb = meminfo.get("MemTotal", 0)
+        available_kb = meminfo.get("MemAvailable", 0)
+        used_kb = total_kb - available_kb
+        out["memory"] = {
+            "total_mb": round(total_kb / 1024, 1), "available_mb": round(available_kb / 1024, 1),
+            "used_mb": round(used_kb / 1024, 1),
+            "percent_used": round(used_kb / total_kb * 100, 1) if total_kb else None,
+        }
+    except Exception as e:
+        out["memory"] = {"error": str(e)}
+    return out
+
+
+@app.route("/admin/api/status")
+@admin_required
+def admin_api_status():
+    db = get_db()
+    cur = dict_cursor(db)
+    _admin_ensure_ops_schema(cur, db)
+    return jsonify({
+        "jobs": _admin_job_status(cur),
+        "ei_realtime": _admin_ei_realtime_stats(cur),
+        "weekly_digest": _admin_weekly_digest_stats(cur),
+        "db": _admin_db_stats(cur),
+        "system": _admin_system_stats(),
+        "flags": {
+            "emotional_intelligence_enabled": os.getenv("EMOTIONAL_INTELLIGENCE_ENABLED", "false").strip().lower() == "true",
+            "nudge_feature_enabled": os.getenv("NUDGE_FEATURE_ENABLED", "false").strip().lower() == "true",
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 @app.route("/<path:_any>")

@@ -374,23 +374,61 @@ def _check_weekly_digest(cur) -> list[dict]:
 # Cycle runner + worker
 # ----------------------------------------------------------------------------
 
+def _ensure_ops_schema(cur) -> None:
+    """Idempotent, run every cycle -- same self-migrating convention as
+    real_user_extraction.py's ensure_migration(). Shared with
+    run_daily_ei_pipeline.py and app.py's admin dashboard (the reader),
+    whichever of those runs first creates it."""
+    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops.job_runs (
+            id SERIAL PRIMARY KEY,
+            job_name TEXT NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'running',
+            detail JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
+
+
 def run_nudge_cycle(push_fn, fcm_fn) -> int:
     """Runs one full pass of all three checks and delivers any nudges due.
     push_fn/fcm_fn are app.py's push_notification/send_fcm_to_user,
     injected rather than imported -- see module docstring. Returns the
-    count sent (for the worker's own logging); never raises."""
+    count sent (for the worker's own logging); never raises.
+
+    Only writes an ops.job_runs tracking row for a cycle that actually ran
+    (is_enabled() true) -- a disabled cycle stays the cheap no-op this
+    module's docstring promises; app.py's admin dashboard reads
+    NUDGE_FEATURE_ENABLED directly from its own environment instead, so
+    "off" and "crashing" still read differently there."""
     if not is_enabled():
         return 0
     sent = 0
+    started_at = datetime.now(timezone.utc)
+    candidate_count = 0
+    cycle_error = None
     try:
         conn = _connect()
         try:
             cur = conn.cursor()
+            try:
+                _ensure_ops_schema(cur)
+                conn.commit()
+            except Exception as exc:
+                _log("ensure_ops_schema", exc)
+                conn.rollback()
             candidates = []
             candidates += _check_overdue_tasks(cur)
             candidates += _check_mood_trends(cur)
             candidates += _check_relationship_touchpoints(cur)
             candidates += _check_weekly_digest(cur)
+            candidate_count = len(candidates)
             for c in candidates:
                 try:
                     push_fn(c["user_id"], {"type": c["data"]["type"], **c["data"]})
@@ -402,10 +440,36 @@ def run_nudge_cycle(push_fn, fcm_fn) -> int:
                     sent += 1
                 except Exception as exc:
                     _log(f"delivering {c['nudge_type']} nudge", exc)
+            try:
+                cur.execute(
+                    "INSERT INTO ops.job_runs (job_name, started_at, finished_at, status, detail) "
+                    "VALUES ('nudge_cycle', %s, now(), 'success', %s)",
+                    (started_at, json.dumps({"candidates": candidate_count, "sent": sent})),
+                )
+                conn.commit()
+            except Exception as exc:
+                _log("recording nudge_cycle job_run", exc)
+                conn.rollback()
         finally:
             _release(conn)
     except Exception as exc:
+        cycle_error = repr(exc)
         _log("run_nudge_cycle", exc)
+        try:
+            conn = _connect()
+            try:
+                cur = conn.cursor()
+                _ensure_ops_schema(cur)
+                cur.execute(
+                    "INSERT INTO ops.job_runs (job_name, started_at, finished_at, status, detail) "
+                    "VALUES ('nudge_cycle', %s, now(), 'error', %s)",
+                    (started_at, json.dumps({"candidates": candidate_count, "sent": sent, "error": cycle_error})),
+                )
+                conn.commit()
+            finally:
+                _release(conn)
+        except Exception:
+            pass  # tracking is best-effort -- the real failure is already logged above
     return sent
 
 

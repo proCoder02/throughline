@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Throughline Admin</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0e14; color: #e6e9f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  .meta { font-size: 12px; color: #6b7384; }
+  a.logout { color: #8b93a7; font-size: 13px; text-decoration: none; }
+  a.logout:hover { color: #e6e9f0; }
+  section { margin-bottom: 28px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b93a7; margin: 0 0 12px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .card {
+    background: #141925; border: 1px solid #242b3d; border-radius: 10px; padding: 16px;
+  }
+  .card .title { font-size: 13px; color: #c3c8d4; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .dot.ok { background: #3ddc84; }
+  .dot.warn { background: #ffb020; }
+  .dot.bad { background: #ff5c5c; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; color: #9aa1b2; padding: 3px 0; }
+  .row b { color: #e6e9f0; font-weight: 500; }
+  .bar-track { height: 6px; background: #0f131c; border-radius: 4px; overflow: hidden; margin-top: 10px; }
+  .bar-fill { height: 100%; border-radius: 4px; background: #4a7cff; transition: width 0.3s; }
+  .bar-fill.warn { background: #ffb020; }
+  .bar-fill.bad { background: #ff5c5c; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table th { text-align: left; color: #6b7384; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #242b3d; }
+  table td { padding: 6px 8px; border-bottom: 1px solid #1a2030; color: #c3c8d4; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+  .pill.ok { background: rgba(61,220,132,0.15); color: #3ddc84; }
+  .pill.warn { background: rgba(255,176,32,0.15); color: #ffb020; }
+  .pill.bad { background: rgba(255,92,92,0.15); color: #ff5c5c; }
+  .empty { color: #6b7384; font-size: 13px; padding: 8px 0; }
+  .err { color: #ff5c5c; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Throughline Ops</h1>
+    <div style="display:flex; align-items:center; gap:16px;">
+      <span class="meta" id="generated-at">loading...</span>
+      <a class="logout" href="/admin/logout">Log out</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>Cron / Background Jobs</h2>
+    <div class="grid" id="jobs-grid"><div class="empty">Loading...</div></div>
+  </section>
+
+  <section>
+    <h2>EI Extraction (last 24h)</h2>
+    <div id="ei-table"><div class="empty">Loading...</div></div>
+  </section>
+
+  <section>
+    <h2>Weekly Digest</h2>
+    <div class="grid" id="digest-grid"></div>
+  </section>
+
+  <section>
+    <h2>Database</h2>
+    <div class="grid" id="db-grid"></div>
+  </section>
+
+  <section>
+    <h2>Compute</h2>
+    <div class="grid" id="system-grid"></div>
+  </section>
+</div>
+
+<script>
+const REFRESH_MS = 30000;
+
+function fmtAge(hours) {
+  if (hours === null || hours === undefined) return "never";
+  if (hours < 1) return Math.round(hours * 60) + "m ago";
+  if (hours < 48) return hours.toFixed(1) + "h ago";
+  return (hours / 24).toFixed(1) + "d ago";
+}
+
+function statusDot(job) {
+  if (job.status === "never_run" || job.stale) return "bad";
+  if (job.status === "success") return "ok";
+  if (job.status === "partial") return "warn";
+  return "bad";
+}
+
+function pillClass(status) {
+  if (status === "success") return "ok";
+  if (status === "partial") return "warn";
+  return "bad";
+}
+
+function renderJobs(jobs) {
+  const el = document.getElementById("jobs-grid");
+  if (!jobs || !jobs.length) { el.innerHTML = '<div class="empty">No jobs recorded yet.</div>'; return; }
+  el.innerHTML = jobs.map(j => {
+    const detail = j.detail ? JSON.stringify(j.detail).slice(0, 120) : "";
+    return `
+      <div class="card">
+        <div class="title"><span class="dot ${statusDot(j)}"></span>${j.job_name}</div>
+        <div class="row"><span>Status</span><b>${j.status}</b></div>
+        <div class="row"><span>Last run</span><b>${fmtAge(j.age_hours)}</b></div>
+        ${detail ? `<div class="row" style="font-size:11px; color:#6b7384;">${detail}</div>` : ""}
+      </div>`;
+  }).join("");
+}
+
+function renderEi(ei) {
+  const el = document.getElementById("ei-table");
+  const keys = Object.keys(ei || {});
+  if (!keys.length) { el.innerHTML = '<div class="empty">No extraction activity in the last 24h.</div>'; return; }
+  const rows = keys.map(k => {
+    const v = ei[k];
+    const pill = v.error > 0 ? "warn" : "ok";
+    return `<tr><td>${k}</td><td>${v.success}</td><td><span class="pill ${pill}">${v.error}</span></td><td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td></tr>`;
+  }).join("");
+  el.innerHTML = `<table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table>`;
+}
+
+function renderDigest(d) {
+  const el = document.getElementById("digest-grid");
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Sent (7d)</div>
+      <div class="row"><b style="font-size:22px;">${d.sent_last_7d ?? 0}</b></div>
+    </div>
+    <div class="card">
+      <div class="title">Last sent</div>
+      <div class="row"><b>${d.last_sent_at ? new Date(d.last_sent_at).toLocaleString() : "never"}</b></div>
+    </div>`;
+}
+
+function fmtBytes(b) {
+  if (b === null || b === undefined) return "-";
+  const gb = b / 1e9;
+  if (gb >= 1) return gb.toFixed(2) + " GB";
+  return (b / 1e6).toFixed(1) + " MB";
+}
+
+function renderDb(db) {
+  const el = document.getElementById("db-grid");
+  const tableRows = (db.largest_tables || []).map(t =>
+    `<tr><td>${t.table}</td><td>${fmtBytes(t.bytes)}</td></tr>`
+  ).join("");
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Total DB size</div>
+      <div class="row"><b style="font-size:22px;">${fmtBytes(db.total_bytes)}</b></div>
+    </div>
+    <div class="card" style="grid-column: span 2;">
+      <div class="title">Largest tables</div>
+      <table><tr><th>table</th><th>size</th></tr>${tableRows}</table>
+    </div>`;
+}
+
+function barClass(pct) {
+  if (pct >= 90) return "bad";
+  if (pct >= 70) return "warn";
+  return "";
+}
+
+function renderSystem(sys) {
+  const el = document.getElementById("system-grid");
+  const disk = sys.disk || {};
+  const mem = sys.memory || {};
+  const cpu = sys.cpu || {};
+
+  const diskHtml = disk.error
+    ? `<div class="err">${disk.error}</div>`
+    : `<div class="row"><span>Used</span><b>${disk.used_gb} / ${disk.total_gb} GB</b></div>
+       <div class="bar-track"><div class="bar-fill ${barClass(disk.percent_used)}" style="width:${disk.percent_used}%"></div></div>
+       <div class="row" style="margin-top:6px;"><span>Free</span><b>${disk.free_gb} GB</b></div>`;
+
+  const memHtml = mem.error
+    ? `<div class="err">${mem.error}</div>`
+    : `<div class="row"><span>Used</span><b>${(mem.used_mb/1024).toFixed(1)} / ${(mem.total_mb/1024).toFixed(1)} GB</b></div>
+       <div class="bar-track"><div class="bar-fill ${barClass(mem.percent_used)}" style="width:${mem.percent_used}%"></div></div>`;
+
+  const cpuHtml = cpu.error
+    ? `<div class="err">${cpu.error}</div>`
+    : `<div class="row"><span>Load (1m/5m/15m)</span><b>${cpu.load_1m} / ${cpu.load_5m} / ${cpu.load_15m}</b></div>
+       <div class="row"><span>Cores</span><b>${cpu.core_count}</b></div>`;
+
+  el.innerHTML = `
+    <div class="card"><div class="title">Disk</div>${diskHtml}</div>
+    <div class="card"><div class="title">Memory</div>${memHtml}</div>
+    <div class="card"><div class="title">CPU</div>${cpuHtml}</div>`;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/admin/api/status", { credentials: "same-origin" });
+    if (res.status === 401 || res.redirected) { window.location.href = "/admin/login"; return; }
+    const data = await res.json();
+    renderJobs(data.jobs);
+    renderEi(data.ei_realtime);
+    renderDigest(data.weekly_digest);
+    renderDb(data.db);
+    renderSystem(data.system);
+    document.getElementById("generated-at").textContent =
+      "Updated " + new Date(data.generated_at).toLocaleTimeString() +
+      " · EI " + (data.flags.emotional_intelligence_enabled ? "on" : "off") +
+      " · Nudges " + (data.flags.nudge_feature_enabled ? "on" : "off");
+  } catch (e) {
+    document.getElementById("generated-at").textContent = "Failed to load: " + e;
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
