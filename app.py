@@ -6,9 +6,7 @@ import math
 import json
 import base64
 import hashlib
-import hmac
 import secrets
-import shutil
 import tempfile
 import threading
 import jwt as pyjwt
@@ -38,6 +36,13 @@ from rq import Queue
 import livekit.api as livekit_api
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
+
+# Admin ops dashboard, job tracking, stale-job alerting -- a fully separate
+# package (ops/) with its own DB pool, templates, and auth, specifically so
+# future ops changes never require touching this file. See ops/__init__.py.
+from ops.alerts import ops_alert_worker
+from ops.dashboard import admin_bp
+from ops.tracking import record_fcm_send, record_heartbeat
 
 load_dotenv()
 
@@ -103,6 +108,7 @@ sock = Sock(app)
 # Set a real, stable secret in your .env for anything beyond local POC use:
 # FLASK_SECRET_KEY=<a long random string>
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
+app.register_blueprint(admin_bp)
 
 # Only needed for the Vite dev server (a different origin/port than Flask);
 # the production build is served by Flask itself below, so it's same-origin
@@ -851,7 +857,7 @@ def email_reminder_worker():
                         row["user_id"], title="Reminder sent", body=row["description"],
                         data={"type": "reminder_email_sent", "task_id": row["id"]},
                     )
-            _admin_maybe_heartbeat(cur, conn, "email_reminder_worker", {"reminders_sent_this_tick": len(rows)})
+            record_heartbeat(cur, conn, "email_reminder_worker", {"reminders_sent_this_tick": len(rows)})
             cur.close()
         except Exception as e:
             print(f"[email_reminder_worker] error: {e!r}")
@@ -909,7 +915,7 @@ def call_ring_timeout_worker():
                 caller_name = caller_row["username"] if caller_row else "Someone"
                 to_notify.append((call_id, call["initiator_user_id"], caller_name, missed_user_ids))
             conn.commit()
-            _admin_maybe_heartbeat(cur, conn, "call_ring_timeout_worker", {"calls_timed_out_this_tick": len(timed_out)})
+            record_heartbeat(cur, conn, "call_ring_timeout_worker", {"calls_timed_out_this_tick": len(timed_out)})
             cur.close()
         except Exception as e:
             print(f"[call_ring_timeout_worker] error: {e!r}")
@@ -3037,27 +3043,12 @@ def send_fcm_to_user(user_id, title, body, data=None, include_notification=True)
     conn = get_raw_connection()
     try:
         cur = conn.cursor()
-        # Best-effort tracking for the admin dashboard's FCM Push card --
-        # same idempotent ensure as ops.job_runs, reused here since this is
-        # the first write path for this table. A failure here must never
-        # block the actual push, which is why every call below is its own
-        # try/except rather than one wrapping the whole function.
-        try:
-            _admin_ensure_ops_schema(cur, conn)
-        except Exception as e:
-            print(f"[fcm] ops.fcm_sends ensure failed (tracking only, push still proceeds): {e!r}")
-            conn.rollback()
 
         def _record(status):
-            try:
-                cur.execute(
-                    "INSERT INTO ops.fcm_sends (user_id, status, notification_type) VALUES (%s, %s, %s)",
-                    (user_id, status, notif_type),
-                )
-                conn.commit()
-            except Exception as e:
-                print(f"[fcm] failed to record send status (tracking only): {e!r}")
-                conn.rollback()
+            # Best-effort tracking for the admin dashboard's FCM Push card
+            # (ops/stats.py's fcm_stats) -- a failure here must never block
+            # the actual push, which record_fcm_send already guarantees.
+            record_fcm_send(cur, conn, user_id, status, notif_type)
 
         cur.execute("SELECT token FROM push_tokens WHERE user_id = %s", (user_id,))
         tokens = [r[0] for r in cur.fetchall()]
@@ -6707,509 +6698,6 @@ def update_profile_picture():
     if old_key and old_key != object_key:
         storage.delete_object(old_key)
     return jsonify({"ok": True, "profile_picture_url": url})
-
-
-# ----------------------------------------------------------------------------
-# Admin ops dashboard -- a separate fixed credential (ADMIN_USERNAME/
-# ADMIN_PASSWORD in .env), not tied to the users table at all, since there's
-# no admin/role concept anywhere else in this app and this is a single-
-# operator ops view, not a per-user feature. Session-scoped via its own
-# "is_admin" flag, independent of the normal login's "user_id" flag.
-# ----------------------------------------------------------------------------
-
-def admin_required(view_func):
-    @wraps(view_func)
-    def wrapped(*args, **kwargs):
-        if not session.get("is_admin"):
-            return redirect("/admin/login")
-        return view_func(*args, **kwargs)
-    return wrapped
-
-
-@app.route("/admin/login", methods=["GET"])
-def admin_login_page():
-    if session.get("is_admin"):
-        return redirect("/admin")
-    return render_template("admin_login.html", error=None)
-
-
-@app.route("/admin/login", methods=["POST"])
-def admin_login_submit():
-    username = (request.form.get("username") or "").strip()
-    password = request.form.get("password") or ""
-    expected_user = os.getenv("ADMIN_USERNAME", "")
-    expected_pass = os.getenv("ADMIN_PASSWORD", "")
-    # hmac.compare_digest instead of == -- a naive comparison short-circuits
-    # on the first mismatched character, leaking how many leading
-    # characters matched via response timing.
-    user_ok = bool(expected_user) and hmac.compare_digest(username, expected_user)
-    pass_ok = bool(expected_pass) and hmac.compare_digest(password, expected_pass)
-    if not (user_ok and pass_ok):
-        return render_template("admin_login.html", error="Invalid username or password"), 401
-    session["is_admin"] = True
-    return redirect("/admin")
-
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("is_admin", None)
-    return redirect("/admin/login")
-
-
-@app.route("/admin")
-@admin_required
-def admin_dashboard_page():
-    # Both optional -- an unset URL renders its nav item disabled instead
-    # of a broken/empty link. Infra vs Finance stays two separate external
-    # tools linked from one nav, not merged into this page, per standing
-    # instruction (ops and finance stay apart for now).
-    return render_template(
-        "admin_dashboard.html",
-        grafana_url=os.getenv("GRAFANA_DASHBOARD_URL", "").strip(),
-        costlens_url=os.getenv("COSTLENS_DASHBOARD_URL", "").strip(),
-    )
-
-
-_admin_ops_schema_ensured = False
-
-
-def _admin_ensure_ops_schema(cur, db) -> None:
-    """Idempotent; only actually runs the DDL once per process (module-level
-    flag) since this gets called on every dashboard poll -- same table
-    run_daily_ei_pipeline.py and nudges/nudge_engine.py write to, so
-    whichever of those three runs first creates it in practice."""
-    global _admin_ops_schema_ensured
-    if _admin_ops_schema_ensured:
-        return
-    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.job_runs (
-            id SERIAL PRIMARY KEY,
-            job_name TEXT NOT NULL,
-            started_at TIMESTAMPTZ NOT NULL,
-            finished_at TIMESTAMPTZ,
-            status TEXT NOT NULL DEFAULT 'running',
-            detail JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.fcm_sends (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER,
-            status TEXT NOT NULL,
-            notification_type TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_fcm_sends_created ON ops.fcm_sends (created_at DESC)")
-    db.commit()
-    _admin_ops_schema_ensured = True
-
-
-# Continuous-loop workers (email_reminder_worker, call_ring_timeout_worker)
-# tick every 60s/10s respectively -- logging a real job_runs row on every
-# single tick would be 1440/day and 8640/day of near-identical rows for no
-# real monitoring benefit (the thing actually worth seeing is "is this loop
-# still alive", not every individual pass). Each only logs a heartbeat row
-# at most once per this interval; _ADMIN_JOB_SCHEDULE's own "interval_seconds"
-# for these two matches this throttle, not their real tick rate, so
-# next-run/stale math stays consistent with what's actually recorded.
-_ADMIN_HEARTBEAT_SECONDS = 300
-
-
-def _admin_maybe_heartbeat(cur, conn, job_name: str, detail: dict | None = None) -> None:
-    """Best-effort, throttled -- a failure here must never break the
-    worker loop it's called from. Reuses the caller's own open
-    connection/cursor rather than opening a second one."""
-    try:
-        _admin_ensure_ops_schema(cur, conn)
-        cur.execute("SELECT started_at FROM ops.job_runs WHERE job_name = %s ORDER BY started_at DESC LIMIT 1", (job_name,))
-        row = cur.fetchone()
-        now = datetime.now(timezone.utc)
-        if row and (now - row["started_at"]).total_seconds() < _ADMIN_HEARTBEAT_SECONDS:
-            return
-        cur.execute(
-            "INSERT INTO ops.job_runs (job_name, started_at, finished_at, status, detail) "
-            "VALUES (%s, %s, %s, 'success', %s)",
-            (job_name, now, now, json.dumps(detail or {})),
-        )
-        conn.commit()
-    except Exception as e:
-        print(f"[ops.job_runs] heartbeat failed for {job_name}: {e!r}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-# job_name -> expected max gap between runs before it's flagged stale, in
-# hours. ei_pipeline runs twice daily (cron: 08:00/20:00 UTC -- see
-# emotional_intelligence/run_daily_ei_pipeline.py), nudge_cycle hourly (see
-# nudges/nudge_engine.py's start_nudge_worker); both get a generous buffer
-# over their own schedule so a slightly late run doesn't flash red. The two
-# heartbeat workers get a generous buffer over _ADMIN_HEARTBEAT_SECONDS
-# instead of their real tick rate, for the same reason.
-_ADMIN_JOB_STALE_HOURS = {
-    "ei_pipeline": 15, "nudge_cycle": 3,
-    "email_reminder_worker": 0.2, "call_ring_timeout_worker": 0.2,
-}
-
-# Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
-# just documentation of the real schedule (root's crontab for ei_pipeline,
-# see infra/BASTION_ACCESS.md-adjacent ops notes; nudge_engine.py's
-# start_nudge_worker(interval_seconds=3600) for nudge_cycle, or the two
-# while-True/time.sleep loops below for the heartbeat workers), not read
-# from any of them live -- if a schedule ever changes, this dict has to be
-# updated to match, same as _ADMIN_JOB_STALE_HOURS above it already does.
-_ADMIN_JOB_SCHEDULE = {
-    "ei_pipeline": {
-        "kind": "cron", "hours_utc": [8, 20],
-        "cadence_label": "Daily at 08:00 & 20:00 UTC",
-    },
-    "nudge_cycle": {
-        "kind": "interval", "interval_seconds": 3600,
-        "cadence_label": "Every 1 hour",
-    },
-    "email_reminder_worker": {
-        "kind": "interval", "interval_seconds": _ADMIN_HEARTBEAT_SECONDS,
-        "cadence_label": "Continuous (60s loop; heartbeat every 5 min)",
-    },
-    "call_ring_timeout_worker": {
-        "kind": "interval", "interval_seconds": _ADMIN_HEARTBEAT_SECONDS,
-        "cadence_label": "Continuous (10s loop; heartbeat every 5 min)",
-    },
-}
-
-
-def _admin_next_run_at(job_name: str, last_started_at, now):
-    """cron-kind jobs have a next run independent of history (the next
-    clock time the schedule fires); interval-kind jobs (the in-process
-    nudge worker, not a real cron entry) only have a next run relative to
-    when they last actually started, so None without any history yet."""
-    sched = _ADMIN_JOB_SCHEDULE.get(job_name)
-    if not sched:
-        return None
-    if sched["kind"] == "cron":
-        candidates = []
-        for hour in sched["hours_utc"]:
-            candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-            if candidate <= now:
-                candidate += timedelta(days=1)
-            candidates.append(candidate)
-        return min(candidates)
-    if sched["kind"] == "interval":
-        if last_started_at is None:
-            return None
-        return last_started_at + timedelta(seconds=sched["interval_seconds"])
-    return None
-
-
-_ADMIN_JOB_HISTORY_LIMIT = 5
-
-
-def _admin_job_status(cur) -> list:
-    """Last 5 runs per job, not just the latest -- a job that flips
-    success/fail/success looks identical to a solidly healthy one if only
-    its single latest row is shown; the history list makes a flaky job
-    visible instead of just its current (possibly lucky) state."""
-    cur.execute(
-        """
-        SELECT job_name, started_at, finished_at, status, detail
-        FROM (
-            SELECT job_name, started_at, finished_at, status, detail,
-                   ROW_NUMBER() OVER (PARTITION BY job_name ORDER BY started_at DESC) AS rn
-            FROM ops.job_runs
-        ) ranked
-        WHERE rn <= %s
-        ORDER BY job_name, started_at DESC
-        """,
-        (_ADMIN_JOB_HISTORY_LIMIT,),
-    )
-    rows = cur.fetchall()
-    now = datetime.now(timezone.utc)
-    by_job: dict = {}
-    for r in rows:
-        by_job.setdefault(r["job_name"], []).append(r)
-
-    jobs = []
-    for job_name, runs in by_job.items():
-        latest = runs[0]
-        reference = latest["finished_at"] or latest["started_at"]
-        age_hours = (now - reference).total_seconds() / 3600 if reference else None
-        stale_after = _ADMIN_JOB_STALE_HOURS.get(job_name, 24)
-        duration_seconds = None
-        if latest["started_at"] and latest["finished_at"]:
-            duration_seconds = (latest["finished_at"] - latest["started_at"]).total_seconds()
-        next_run_at = _admin_next_run_at(job_name, latest["started_at"], now)
-        sched = _ADMIN_JOB_SCHEDULE.get(job_name, {})
-        jobs.append({
-            "job_name": job_name,
-            "started_at": latest["started_at"].isoformat() if latest["started_at"] else None,
-            "finished_at": latest["finished_at"].isoformat() if latest["finished_at"] else None,
-            "status": latest["status"],
-            "detail": latest["detail"],
-            "age_hours": round(age_hours, 2) if age_hours is not None else None,
-            "stale": age_hours is not None and age_hours > stale_after,
-            "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
-            "cadence_label": sched.get("cadence_label", "—"),
-            "next_run_at": next_run_at.isoformat() if next_run_at else None,
-            "history": [
-                {
-                    "status": r["status"],
-                    "started_at": r["started_at"].isoformat() if r["started_at"] else None,
-                }
-                for r in runs
-            ],
-        })
-    for job_name in _ADMIN_JOB_STALE_HOURS:
-        if job_name not in by_job:
-            sched = _ADMIN_JOB_SCHEDULE.get(job_name, {})
-            jobs.append({
-                "job_name": job_name, "started_at": None, "finished_at": None,
-                "status": "never_run", "detail": None, "age_hours": None, "stale": True,
-                "duration_seconds": None, "cadence_label": sched.get("cadence_label", "—"),
-                "next_run_at": (lambda n: n.isoformat() if n else None)(_admin_next_run_at(job_name, None, now)),
-                "history": [],
-            })
-    return jobs
-
-
-def _admin_ei_realtime_stats(cur) -> dict:
-    """Derived entirely from existing emotional_intelligence.analysis_runs
-    rows -- no new writes needed, since real_user_extraction.py and
-    chat_feedback_extraction.py (both real-time and batch invocations)
-    already write one there per conversation/message processed."""
-    cur.execute(
-        """
-        SELECT run_type,
-               count(*) FILTER (WHERE status = 'success') AS success,
-               count(*) FILTER (WHERE status != 'success') AS error,
-               max(created_at) AS last_at
-        FROM emotional_intelligence.analysis_runs
-        WHERE created_at > now() - interval '24 hours'
-          AND run_type IN ('chat_feedback_extraction_realtime', 'chat_feedback_extraction',
-                            'real_user_extraction', 'personality_batch', 'relationship_batch', 'fact_dedup')
-        GROUP BY run_type
-        """
-    )
-    return {
-        r["run_type"]: {
-            "success": r["success"], "error": r["error"],
-            "last_at": r["last_at"].isoformat() if r["last_at"] else None,
-        }
-        for r in cur.fetchall()
-    }
-
-
-def _admin_weekly_digest_stats(cur) -> dict:
-    cur.execute(
-        "SELECT count(*) AS n, max(sent_at) AS last_at FROM nudges.sent_log "
-        "WHERE nudge_type = 'weekly_digest' AND sent_at > now() - interval '7 days'"
-    )
-    r = cur.fetchone()
-    return {"sent_last_7d": r["n"], "last_sent_at": r["last_at"].isoformat() if r["last_at"] else None}
-
-
-def _admin_fcm_stats(cur) -> dict:
-    """Derived from ops.fcm_sends, written by send_fcm_to_user itself --
-    'no_token' means the push never reached Firebase at all (no device
-    registered), distinct from 'error' (Firebase rejected or the call
-    itself failed) and 'stale' (a token that's since been deleted)."""
-    cur.execute(
-        """
-        SELECT status, count(*) AS n
-        FROM ops.fcm_sends
-        WHERE created_at > now() - interval '24 hours'
-        GROUP BY status
-        """
-    )
-    by_status = {r["status"]: r["n"] for r in cur.fetchall()}
-    cur.execute("SELECT max(created_at) AS last_at FROM ops.fcm_sends")
-    last_at = cur.fetchone()["last_at"]
-    cur.execute("SELECT count(*) AS n FROM push_tokens")
-    registered_tokens = cur.fetchone()["n"]
-    return {
-        "last_24h": by_status,
-        "last_send_at": last_at.isoformat() if last_at else None,
-        "registered_tokens": registered_tokens,
-    }
-
-
-def _admin_db_stats(cur) -> dict:
-    cur.execute("SELECT pg_database_size(current_database()) AS bytes")
-    db_bytes = cur.fetchone()["bytes"]
-    cur.execute(
-        """
-        SELECT schemaname || '.' || relname AS table_name,
-               pg_total_relation_size(schemaname || '.' || relname) AS bytes
-        FROM pg_catalog.pg_statio_user_tables
-        ORDER BY bytes DESC
-        LIMIT 8
-        """
-    )
-    largest = [{"table": r["table_name"], "bytes": r["bytes"]} for r in cur.fetchall()]
-    return {"total_bytes": db_bytes, "largest_tables": largest}
-
-
-def _admin_system_stats() -> dict:
-    """Linux-only (os.getloadavg(), /proc/meminfo) -- this dashboard only
-    ever runs against the real prod host, the same single Oracle Cloud VM
-    that runs Postgres (DATABASE_URL is localhost), so shutil.disk_usage('/')
-    reports the real volume both the app and the DB live on. Falls back to
-    an "error" field per section rather than failing the whole endpoint if
-    run somewhere these aren't available (e.g. local Windows dev)."""
-    out = {}
-    try:
-        total, used, free = shutil.disk_usage("/")
-        out["disk"] = {
-            "total_gb": round(total / 1e9, 1), "used_gb": round(used / 1e9, 1),
-            "free_gb": round(free / 1e9, 1), "percent_used": round(used / total * 100, 1),
-        }
-    except Exception as e:
-        out["disk"] = {"error": str(e)}
-    try:
-        load1, load5, load15 = os.getloadavg()
-        out["cpu"] = {"load_1m": round(load1, 2), "load_5m": round(load5, 2),
-                      "load_15m": round(load15, 2), "core_count": os.cpu_count()}
-    except Exception as e:
-        out["cpu"] = {"error": str(e)}
-    try:
-        meminfo = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                key, _, rest = line.partition(":")
-                meminfo[key] = int(rest.strip().split()[0])  # kB
-        total_kb = meminfo.get("MemTotal", 0)
-        available_kb = meminfo.get("MemAvailable", 0)
-        used_kb = total_kb - available_kb
-        out["memory"] = {
-            "total_mb": round(total_kb / 1024, 1), "available_mb": round(available_kb / 1024, 1),
-            "used_mb": round(used_kb / 1024, 1),
-            "percent_used": round(used_kb / total_kb * 100, 1) if total_kb else None,
-        }
-    except Exception as e:
-        out["memory"] = {"error": str(e)}
-    return out
-
-
-@app.route("/admin/api/status")
-@admin_required
-def admin_api_status():
-    db = get_db()
-    cur = dict_cursor(db)
-    _admin_ensure_ops_schema(cur, db)
-    return jsonify({
-        "jobs": _admin_job_status(cur),
-        "ei_realtime": _admin_ei_realtime_stats(cur),
-        "weekly_digest": _admin_weekly_digest_stats(cur),
-        "fcm": _admin_fcm_stats(cur),
-        "db": _admin_db_stats(cur),
-        "system": _admin_system_stats(),
-        "flags": {
-            "emotional_intelligence_enabled": os.getenv("EMOTIONAL_INTELLIGENCE_ENABLED", "false").strip().lower() == "true",
-            "nudge_feature_enabled": os.getenv("NUDGE_FEATURE_ENABLED", "false").strip().lower() == "true",
-        },
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-_ADMIN_ALERT_CHECK_INTERVAL_SECONDS = 1800  # 30 min
-_ADMIN_ALERT_COOLDOWN_HOURS = 6  # re-alert while still stale, but not every check
-
-
-def _admin_ensure_alerts_table(cur, conn) -> None:
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.alerts_sent (
-            job_name TEXT PRIMARY KEY,
-            last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    conn.commit()
-
-
-_ADMIN_ALERT_CONFIRM_COUNT = 2  # consecutive stale checks required before actually alerting
-_admin_alert_consecutive_stale: dict = {}  # job_name -> count, in-memory, reset to 0 the moment a job looks healthy
-
-
-def ops_alert_worker():
-    """Runs continuously in a background thread, same pattern as
-    email_reminder_worker above -- this is what turns the admin dashboard
-    from a pull view (only useful if someone opens it) into something that
-    actually catches a job going silently stale overnight. Only fires when
-    ADMIN_ALERT_EMAIL is configured; otherwise this loop is a cheap no-op,
-    same convention as nudge_engine.is_enabled()'s early return.
-
-    Two safeguards against a false alarm right after a deploy restart
-    (confirmed live: the very first check immediately after a restart once
-    reported ei_pipeline as never_run despite a real, hours-old successful
-    row already in ops.job_runs -- some transient visibility/startup race,
-    root cause not pinned down, but a one-off blip is exactly what these
-    two guards are for regardless of its exact cause):
-    1. Sleeps one full interval before its very first check, instead of
-       checking immediately on thread start -- skips the riskiest window
-       (the instant right after this and every other background worker/
-       migration starts concurrently).
-    2. Requires a job to look stale on _ADMIN_ALERT_CONFIRM_COUNT
-       consecutive checks (default 2, i.e. ~30-60 min of confirmed
-       staleness) before sending anything -- a transient one-check blip no
-       longer reaches send_plain_email at all, not just a logging fix."""
-    alert_email = os.getenv("ADMIN_ALERT_EMAIL", "").strip()
-    time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
-    while True:
-        if not alert_email:
-            time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
-            continue
-        conn = None
-        try:
-            conn = get_raw_connection()
-            cur = dict_cursor(conn)
-            _admin_ensure_ops_schema(cur, conn)
-            _admin_ensure_alerts_table(cur, conn)
-            for job in _admin_job_status(cur):
-                job_name = job["job_name"]
-                if not job["stale"]:
-                    _admin_alert_consecutive_stale[job_name] = 0
-                    continue
-                _admin_alert_consecutive_stale[job_name] = _admin_alert_consecutive_stale.get(job_name, 0) + 1
-                if _admin_alert_consecutive_stale[job_name] < _ADMIN_ALERT_CONFIRM_COUNT:
-                    print(f"[ops_alert_worker] {job_name} looks stale "
-                          f"({_admin_alert_consecutive_stale[job_name]}/{_ADMIN_ALERT_CONFIRM_COUNT} checks) -- not yet confirmed", flush=True)
-                    continue
-                cur.execute("SELECT last_alerted_at FROM ops.alerts_sent WHERE job_name = %s", (job_name,))
-                row = cur.fetchone()
-                if row and (datetime.now(timezone.utc) - row["last_alerted_at"]).total_seconds() < _ADMIN_ALERT_COOLDOWN_HOURS * 3600:
-                    continue
-                age_desc = f"{job['age_hours']:.1f}h ago" if job["age_hours"] is not None else "never run"
-                send_plain_email(
-                    alert_email,
-                    f"[Throughline] {job_name} is stale",
-                    f"{job_name} last ran: {age_desc} (status: {job['status']}).\n\n"
-                    f"Check https://129-213-21-239.sslip.io/admin for details.",
-                )
-                cur.execute(
-                    "INSERT INTO ops.alerts_sent (job_name, last_alerted_at) VALUES (%s, now()) "
-                    "ON CONFLICT (job_name) DO UPDATE SET last_alerted_at = now()",
-                    (job_name,),
-                )
-                conn.commit()
-                print(f"[ops_alert_worker] sent stale-job alert for {job_name}", flush=True)
-            cur.close()
-        except Exception as e:
-            print(f"[ops_alert_worker] error: {e!r}", flush=True)
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                release_raw_connection(conn)
-        time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
 
 
 @app.route("/<path:_any>")

@@ -57,7 +57,6 @@ Scheduling (Windows Task Scheduler, twice daily at 8am and 8pm):
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -73,65 +72,15 @@ HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / "logs"
 DB_URL = os.getenv("DATABASE_URL")
 
-
-def _ensure_ops_schema(conn) -> None:
-    """Idempotent, run every invocation -- same self-migrating convention
-    as real_user_extraction.py's ensure_migration(). Shared by this file,
-    nudge_engine.py, and app.py's admin dashboard (the reader), so whichever
-    of those runs first creates it."""
-    cur = conn.cursor()
-    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.job_runs (
-            id SERIAL PRIMARY KEY,
-            job_name TEXT NOT NULL,
-            started_at TIMESTAMPTZ NOT NULL,
-            finished_at TIMESTAMPTZ,
-            status TEXT NOT NULL DEFAULT 'running',
-            detail JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
-    conn.commit()
-    cur.close()
-
-
-def _start_job_run(conn, job_name: str) -> int | None:
-    """Best-effort: a tracking-row failure must never stop the actual
-    pipeline from running, same reasoning as every other optional/additive
-    module in this repo (ei_adapter.py, nudges/nudge_engine.py)."""
-    try:
-        _ensure_ops_schema(conn)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO ops.job_runs (job_name, started_at, status) VALUES (%s, now(), 'running') RETURNING id",
-            (job_name,),
-        )
-        run_id = cur.fetchone()[0]
-        conn.commit()
-        cur.close()
-        return run_id
-    except Exception as e:
-        print(f"[ops.job_runs] failed to start tracking row: {e!r}")
-        return None
-
-
-def _finish_job_run(conn, run_id: int | None, status: str, detail: dict) -> None:
-    if run_id is None:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE ops.job_runs SET finished_at = now(), status = %s, detail = %s WHERE id = %s",
-            (status, json.dumps(detail), run_id),
-        )
-        conn.commit()
-        cur.close()
-    except Exception as e:
-        print(f"[ops.job_runs] failed to finish tracking row: {e!r}")
+# Tracking lives in the standalone ops/ package (repo_root/ops), not
+# duplicated here -- same cross-folder import trick extraction_pipeline.py
+# already uses for costlens_agent, since this script's own folder
+# (emotional_intelligence/) isn't on sys.path by default.
+_repo_root = str(Path(__file__).resolve().parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+from ops.tracking import start_job_run as _start_job_run  # noqa: E402
+from ops.tracking import finish_job_run as _finish_job_run  # noqa: E402
 
 
 def run_stage(name: str, cmd: list[str], log_file) -> dict:
