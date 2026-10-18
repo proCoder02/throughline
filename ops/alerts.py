@@ -97,7 +97,7 @@ def ops_alert_worker():
             cur = ops_db.dict_cursor(conn)
             ensure_ops_schema(cur, conn)
             _ensure_alerts_table(cur, conn)
-            for job in job_status(cur):
+            for job in job_status(cur, conn):
                 job_name = job["job_name"]
                 checked[job_name] = {"stale": job["stale"], "age_hours": job["age_hours"], "status": job["status"]}
                 if not job["stale"]:

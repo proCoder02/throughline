@@ -5,16 +5,32 @@ their own copy of this exact DDL); consolidated here so a future schema
 change happens in one place instead of three."""
 from __future__ import annotations
 
+import threading
+
 _ops_schema_ensured = False
+_ops_schema_lock = threading.Lock()
 
 
 def ensure_ops_schema(cur, conn) -> None:
     """Idempotent; only actually runs the DDL once per process (module-level
-    flag), since callers may invoke this on every request/tick. Safe to call
-    from multiple processes concurrently -- every statement is IF NOT EXISTS."""
+    flag). Safe across separate processes -- every statement is IF NOT
+    EXISTS. Needs the lock for same-process concurrency though: confirmed
+    live that several background threads hitting this for the first time
+    at the same moment can each see the flag False and all issue the DDL
+    concurrently -- CREATE TABLE IF NOT EXISTS is not atomic against that,
+    and the loser gets a real UniqueViolation on the system catalog
+    instead of silently no-op'ing."""
     global _ops_schema_ensured
     if _ops_schema_ensured:
         return
+    with _ops_schema_lock:
+        if _ops_schema_ensured:
+            return
+        _ensure_ops_schema_locked(cur, conn)
+        _ops_schema_ensured = True
+
+
+def _ensure_ops_schema_locked(cur, conn) -> None:
     cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
     cur.execute(
         """
@@ -51,4 +67,3 @@ def ensure_ops_schema(cur, conn) -> None:
         """
     )
     conn.commit()
-    _ops_schema_ensured = True

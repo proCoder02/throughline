@@ -81,6 +81,27 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 from ops.tracking import start_job_run as _start_job_run  # noqa: E402
 from ops.tracking import finish_job_run as _finish_job_run  # noqa: E402
+from ops import db as _ops_db  # noqa: E402
+from ops import job_control as _job_control  # noqa: E402
+
+
+def _check_on_ice() -> bool:
+    """Checked at the very top of main(), before any real work -- the
+    dashboard's "on ice" action for ei_pipeline sets this flag; root's
+    crontab still fires this script on schedule either way (there's no
+    crontab entry to disable), so the gate has to live here. --force
+    (the dashboard's "start now"/"restart" actions use it) bypasses this,
+    same as a manual on-call run should be able to."""
+    try:
+        conn = _ops_db.get_conn()
+        try:
+            cur = _ops_db.dict_cursor(conn)
+            return _job_control.is_on_ice(cur, conn, "ei_pipeline")
+        finally:
+            _ops_db.release_conn(conn)
+    except Exception as e:
+        print(f"[ei_pipeline] on-ice check failed (proceeding as not iced): {e!r}")
+        return False
 
 
 def run_stage(name: str, cmd: list[str], log_file) -> dict:
@@ -107,7 +128,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the full real-user EI pipeline (extraction + personality + relationship) and log the outcome.")
     parser.add_argument("--user-id", type=int, default=None, help="Scope the extraction stage to one user (default: all users).")
     parser.add_argument("--limit", type=int, default=0, help="Max conversations the extraction stage processes (0 = all unprocessed).")
+    parser.add_argument("--force", action="store_true", help="Run even if the dashboard has this job on ice.")
     args = parser.parse_args()
+
+    if not args.force and _check_on_ice():
+        print("[ei_pipeline] on ice -- skipping this run (pass --force to override)")
+        conn = None
+        if DB_URL:
+            try:
+                conn = psycopg2.connect(DB_URL)
+                run_id = _start_job_run(conn, "ei_pipeline")
+                _finish_job_run(conn, run_id, "on_ice", {"reason": "job is on ice"})
+            except Exception as e:
+                print(f"[ops.job_runs] failed to record on-ice skip: {e!r}")
+            finally:
+                if conn is not None:
+                    conn.close()
+        return 0
 
     LOG_DIR.mkdir(exist_ok=True)
     log_path = LOG_DIR / f"ei_pipeline_{datetime.now().strftime('%Y-%m-%d')}.log"

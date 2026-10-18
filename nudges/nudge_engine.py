@@ -43,6 +43,8 @@ _repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 from ops.tracking import record_completed_run  # noqa: E402
+from ops import db as _ops_db  # noqa: E402
+from ops import job_control as _job_control  # noqa: E402
 
 _pool = None
 
@@ -386,18 +388,38 @@ def _check_weekly_digest(cur) -> list[dict]:
 # Cycle runner + worker
 # ----------------------------------------------------------------------------
 
-def run_nudge_cycle(push_fn, fcm_fn) -> int:
+def _is_on_ice() -> bool:
+    try:
+        conn = _ops_db.get_conn()
+        try:
+            cur = _ops_db.dict_cursor(conn)
+            return _job_control.is_on_ice(cur, conn, "nudge_cycle")
+        finally:
+            _ops_db.release_conn(conn)
+    except Exception as e:
+        _log("on-ice check (proceeding as not iced)", e)
+        return False
+
+
+def run_nudge_cycle(push_fn, fcm_fn, force: bool = False) -> int:
     """Runs one full pass of all three checks and delivers any nudges due.
     push_fn/fcm_fn are app.py's push_notification/send_fcm_to_user,
     injected rather than imported -- see module docstring. Returns the
     count sent (for the worker's own logging); never raises.
 
+    force=True bypasses both is_enabled() and the on-ice gate -- the
+    dashboard's "start now" action uses it for an explicit manual trigger,
+    same reasoning run_daily_ei_pipeline.py's own --force flag has.
+
     Only writes an ops.job_runs tracking row for a cycle that actually ran
-    (is_enabled() true) -- a disabled cycle stays the cheap no-op this
-    module's docstring promises; app.py's admin dashboard reads
-    NUDGE_FEATURE_ENABLED directly from its own environment instead, so
-    "off" and "crashing" still read differently there."""
-    if not is_enabled():
+    (is_enabled() true, not on ice) -- a disabled/iced cycle stays the
+    cheap no-op this module's docstring promises; app.py's admin dashboard
+    reads NUDGE_FEATURE_ENABLED directly from its own environment and the
+    on-ice flag from ops.job_control instead, so "off"/"iced"/"crashing"
+    all still read differently there."""
+    if not force and not is_enabled():
+        return 0
+    if not force and _is_on_ice():
         return 0
     sent = 0
     started_at = datetime.now(timezone.utc)

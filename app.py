@@ -40,8 +40,12 @@ from firebase_admin import credentials as firebase_credentials, messaging as fir
 # Admin ops dashboard, job tracking, stale-job alerting -- a fully separate
 # package (ops/) with its own DB pool, templates, and auth, specifically so
 # future ops changes never require touching this file. See ops/__init__.py.
+from ops import db as ops_db
+from ops import job_control as ops_job_control
+from ops.actions import register_nudge_runner
 from ops.alerts import ops_alert_worker
 from ops.dashboard import admin_bp
+from ops.scheduler import custom_job_scheduler
 from ops.tracking import record_fcm_send, record_heartbeat
 
 load_dotenv()
@@ -807,11 +811,30 @@ def send_reminder_email(to_email, description, owner, due_date, reminder_at):
     return _smtp_send(to_email, f"Reminder: {description}", body, ics_content=ics_content)
 
 
+def _ops_is_on_ice(job_name: str) -> bool:
+    """Checked at the top of each continuous-loop worker's own tick --
+    the dashboard's ice/unice actions set this; a failure here defaults to
+    "not iced" so a DB hiccup never silently pauses real work."""
+    try:
+        conn = ops_db.get_conn()
+        try:
+            cur = ops_db.dict_cursor(conn)
+            return ops_job_control.is_on_ice(cur, conn, job_name)
+        finally:
+            ops_db.release_conn(conn)
+    except Exception as e:
+        print(f"[ops] on-ice check for {job_name} failed (proceeding as not iced): {e!r}")
+        return False
+
+
 def email_reminder_worker():
     """Runs continuously in a background thread, independent of any browser
     tab -- this is what makes email reminders work even if the app isn't
     open anywhere, unlike the browser-notification poll."""
     while True:
+        if _ops_is_on_ice("email_reminder_worker"):
+            time.sleep(60)
+            continue
         conn = None
         try:
             conn = get_raw_connection()
@@ -886,6 +909,9 @@ def call_ring_timeout_worker():
     that they missed a call (a visible push, unlike call_ended's silent
     data-only one)."""
     while True:
+        if _ops_is_on_ice("call_ring_timeout_worker"):
+            time.sleep(10)
+            continue
         conn = None
         to_notify = []  # (call_id, initiator_id, caller_name, missed_user_ids)
         try:
@@ -6729,8 +6755,12 @@ def _start_nudge_worker_safely():
     schema not yet applied, etc.) must never prevent the main app from
     starting."""
     try:
-        from nudges.nudge_engine import start_nudge_worker
+        from nudges.nudge_engine import run_nudge_cycle, start_nudge_worker
         start_nudge_worker(push_notification, send_fcm_to_user)
+        # Lets the dashboard's "start now" action on nudge_cycle trigger one
+        # extra cycle immediately (force=True bypasses NUDGE_FEATURE_ENABLED
+        # and the on-ice gate, same as a manual on-call trigger should).
+        register_nudge_runner(lambda: run_nudge_cycle(push_notification, send_fcm_to_user, force=True))
     except Exception as e:
         print(f"[nudges] worker not started: {e!r}")
 
@@ -6744,6 +6774,7 @@ if __name__ != "__main__" and IS_WEB_ROLE:
     threading.Thread(target=email_reminder_worker, daemon=True).start()
     threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
     threading.Thread(target=ops_alert_worker, daemon=True).start()
+    threading.Thread(target=custom_job_scheduler, daemon=True).start()
     _start_nudge_worker_safely()
 
 if __name__ == "__main__":
@@ -6764,6 +6795,7 @@ if __name__ == "__main__":
         threading.Thread(target=email_reminder_worker, daemon=True).start()
         threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
         threading.Thread(target=ops_alert_worker, daemon=True).start()
+        threading.Thread(target=custom_job_scheduler, daemon=True).start()
         _start_nudge_worker_safely()
 
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True, ssl_context=ssl_context)

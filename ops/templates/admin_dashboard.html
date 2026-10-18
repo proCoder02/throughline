@@ -203,6 +203,40 @@
   .job-history-label { font-size: var(--text-xs); color: var(--wa-text-soft); }
   .job-history-dots { display: flex; gap: 4px; }
 
+  /* Job control actions -- on ice/off ice/start/stop/restart, varying by
+     control_kind (see ops/jobs.py's JOB_CONTROL_KIND). Small, secondary-
+     looking buttons since these are occasional admin actions, not the
+     primary thing the card communicates. */
+  .job-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--wa-border); }
+  .job-action-btn {
+    font-family: inherit; font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: var(--radius-pill);
+    border: 1px solid var(--wa-border); background: var(--wa-bg-app); color: var(--wa-text-soft); cursor: pointer;
+  }
+  .job-action-btn:hover { background: var(--wa-hover); color: var(--wa-text); }
+  .job-action-btn:disabled { opacity: 0.4; cursor: default; }
+  .job-action-btn.ice { color: #7ec8e3; border-color: #7ec8e3; }
+  .job-action-btn.danger { color: var(--pill-bad-text); border-color: var(--pill-bad-text); }
+  .job-action-btn.danger:hover { background: var(--pill-bad-bg); }
+  .job-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.03em; padding: 2px 7px; border-radius: var(--radius-pill); }
+  .job-badge.ice { background: rgba(126,200,227,0.18); color: #7ec8e3; }
+  .job-badge.running { background: var(--pill-ok-bg); color: var(--pill-ok-text); }
+  .job-delete-btn { font-size: 11px; color: var(--wa-text-soft); background: none; border: none; cursor: pointer; margin-left: auto; }
+  .job-delete-btn:hover { color: var(--wa-danger); }
+
+  /* Custom job creation form */
+  .custom-job-form { display: flex; flex-direction: column; gap: var(--space-3); max-width: 480px; }
+  .custom-job-form label { font-size: var(--text-xs); color: var(--wa-text-soft); text-transform: uppercase; letter-spacing: 0.03em; display: block; margin-bottom: 4px; }
+  .custom-job-form input, .custom-job-form select {
+    width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--wa-border); border-radius: var(--radius-sm);
+    background: var(--wa-bg-app); color: var(--wa-text); font-size: var(--text-sm); font-family: inherit;
+  }
+  .custom-job-form input:focus, .custom-job-form select:focus { outline: none; border-color: var(--wa-accent); }
+  .custom-job-form-row { display: flex; gap: var(--space-3); }
+  .custom-job-form-row > div { flex: 1; }
+  .form-msg { font-size: var(--text-sm); margin-top: var(--space-2); }
+  .form-msg.error { color: var(--wa-danger); }
+  .form-msg.ok { color: var(--wa-online); }
+
   /* Where to actually look when a card shows an error -- a file path for
      ei_pipeline (it writes a real per-day log file), a journalctl filter
      for everything else (no dedicated file exists; it only ever prints to
@@ -275,6 +309,45 @@
   <section>
     <h2>Cron / Background Jobs</h2>
     <div class="grid jobs-grid" id="jobs-grid"><div class="empty">Loading...</div></div>
+  </section>
+
+  <section>
+    <h2>Schedule a New Job</h2>
+    <div class="card custom-job-form">
+      <div>
+        <label for="cj-name">Job name</label>
+        <input id="cj-name" type="text" placeholder="cleanup_old_logs" maxlength="64">
+      </div>
+      <div>
+        <label for="cj-script">Script path (on the server)</label>
+        <input id="cj-script" type="text" placeholder="/opt/throughline/app/scripts/cleanup.py">
+      </div>
+      <div class="custom-job-form-row">
+        <div>
+          <label for="cj-kind">Schedule</label>
+          <select id="cj-kind" onchange="toggleScheduleFields()">
+            <option value="cron">Daily at specific hour(s) UTC</option>
+            <option value="interval">Every N minutes</option>
+          </select>
+        </div>
+      </div>
+      <div id="cj-cron-fields">
+        <label for="cj-hours">Hour(s) UTC, comma-separated (0-23)</label>
+        <input id="cj-hours" type="text" placeholder="2  or  2,14">
+      </div>
+      <div id="cj-interval-fields" style="display:none;">
+        <label for="cj-interval">Every how many minutes</label>
+        <input id="cj-interval" type="number" min="1" placeholder="60">
+      </div>
+      <div>
+        <label for="cj-logdir">Log directory (optional -- defaults next to the script)</label>
+        <input id="cj-logdir" type="text" placeholder="/opt/throughline/app/scripts/logs">
+      </div>
+      <div>
+        <button class="btn-secondary" onclick="createCustomJob()" id="cj-submit">Create Job</button>
+      </div>
+      <div class="form-msg" id="cj-msg"></div>
+    </div>
   </section>
 
   <section>
@@ -374,12 +447,80 @@ const JOB_LOG_HINTS = {
 };
 
 function logHintForJob(j) {
+  // Any subprocess-kind job (ei_pipeline, every custom job) gets a real
+  // per-run log file via ops/runner.py -- detail.log_file is the exact
+  // file the most recent run actually wrote, when there's been one yet.
+  if (j.detail && j.detail.log_file) return j.detail.log_file;
   if (j.job_name === "ei_pipeline") {
-    const fromRun = j.detail && j.detail.log_file;
     const today = new Date().toISOString().slice(0, 10);
-    return fromRun || `emotional_intelligence/logs/ei_pipeline_${today}.log`;
+    return `emotional_intelligence/logs/ei_pipeline_${today}.log`;
   }
+  if (j.is_custom) return "no runs yet -- log file will appear here after the first run";
   return JOB_LOG_HINTS[j.job_name] || "journalctl -u throughline";
+}
+
+async function callJobAction(jobName, action, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  try {
+    const res = await fetch(`/admin/api/jobs/${encodeURIComponent(jobName)}/${action}`, {
+      method: "POST", credentials: "same-origin",
+    });
+    const data = await res.json();
+    if (!data.ok) { alert(`${action} failed: ${data.error || "unknown error"}`); }
+    refresh();
+  } catch (e) {
+    alert(`${action} failed: ${e}`);
+  }
+}
+
+async function deleteCustomJob(jobName) {
+  if (!confirm(`Delete custom job "${jobName}"? This removes its schedule -- any log files it already wrote are kept.`)) return;
+  try {
+    const res = await fetch(`/admin/api/custom-jobs/${encodeURIComponent(jobName)}`, { method: "DELETE", credentials: "same-origin" });
+    const data = await res.json();
+    if (!data.ok) alert(`delete failed: ${data.error || "unknown error"}`);
+    refresh();
+  } catch (e) {
+    alert(`delete failed: ${e}`);
+  }
+}
+
+// All 4 actions (On Ice/Off Ice, Start, Stop, Restart) always render on
+// every card for consistency -- one that doesn't apply to a given job's
+// control_kind (ops/jobs.py's JOB_CONTROL_KIND) shows disabled with a
+// tooltip explaining why, rather than being omitted outright. Reason:
+// an in-process job (nudge_cycle, the two heartbeat workers) is a thread
+// inside the main app, not a separate OS process -- there is nothing a
+// web request can kill or restart without killing the whole app, so
+// Stop/Restart (and Start, except nudge_cycle specifically) can't
+// actually do anything real for those three.
+function renderJobActions(j) {
+  if (j.control_kind === "none") return "";
+  const canStartStop = j.control_kind === "subprocess";
+  const canStart = canStartStop || j.job_name === "nudge_cycle";
+  const inProcessNote = "This runs as a thread inside the main app process, not a separate process -- it can't be stopped/restarted without stopping the whole app. Use On Ice/Off Ice instead.";
+
+  const iceBtn = j.on_ice
+    ? `<button class="job-action-btn ice" onclick="callJobAction('${j.job_name}','unice')">Off Ice</button>`
+    : `<button class="job-action-btn ice" onclick="callJobAction('${j.job_name}','ice')">On Ice</button>`;
+
+  const startBtn = canStart
+    ? `<button class="job-action-btn" ${j.running ? "disabled" : ""} onclick="callJobAction('${j.job_name}','start')">Start</button>`
+    : `<button class="job-action-btn" disabled title="${inProcessNote}">Start</button>`;
+
+  const stopBtn = canStartStop
+    ? `<button class="job-action-btn danger" ${j.running ? "" : "disabled"} onclick="callJobAction('${j.job_name}','stop','Stop ${j.job_name} now?')">Stop</button>`
+    : `<button class="job-action-btn danger" disabled title="${inProcessNote}">Stop</button>`;
+
+  const restartBtn = canStartStop
+    ? `<button class="job-action-btn" onclick="callJobAction('${j.job_name}','restart','Restart ${j.job_name} now?')">Restart</button>`
+    : `<button class="job-action-btn" disabled title="${inProcessNote}">Restart</button>`;
+
+  const deleteBtn = j.is_custom
+    ? `<button class="job-action-btn danger" onclick="deleteCustomJob('${j.job_name}')">🗑 Delete</button>`
+    : "";
+
+  return `<div class="job-actions">${iceBtn}${startBtn}${stopBtn}${restartBtn}${deleteBtn}</div>`;
 }
 
 // Autosys-style job card: a status badge up top, then a clean label/value
@@ -393,23 +534,27 @@ function renderJobs(jobs) {
     const lastRunValue = j.started_at
       ? `${fmtAge(j.age_hours)} <span class="job-field-value muted">(${j.status})</span>`
       : "never run";
+    const statusBadge = j.on_ice ? `<span class="job-badge ice">ON ICE</span>`
+      : `<span class="pill ${statusPillClass(j)}">${j.stale ? "STALE" : j.status.toUpperCase()}</span>`;
+    const runningBadge = j.running ? `<span class="job-badge running">RUNNING</span>` : "";
     return `
       <div class="card job-card">
         <div class="job-header">
-          <div class="job-name"><span class="dot ${statusDot(j)}"></span>${j.job_name}</div>
-          <span class="pill ${statusPillClass(j)}">${j.stale ? "STALE" : j.status.toUpperCase()}</span>
+          <div class="job-name"><span class="dot ${j.on_ice ? '' : statusDot(j)}" style="${j.on_ice ? 'background:#7ec8e3;' : ''}"></span>${j.job_name}${j.is_custom ? ' <span class="job-field-value muted" style="font-size:10px;">(custom)</span>' : ''}</div>
+          <div style="display:flex; gap:6px;">${runningBadge}${statusBadge}</div>
         </div>
         <div class="job-fields">
           <div class="job-field"><span class="job-field-label">Schedule</span><span class="job-field-value">${j.cadence_label}</span></div>
           <div class="job-field"><span class="job-field-label">Last run</span><span class="job-field-value">${lastRunValue}</span></div>
           <div class="job-field"><span class="job-field-label">Run time</span><span class="job-field-value">${fmtDuration(j.duration_seconds)}</span></div>
-          <div class="job-field"><span class="job-field-label">Next run</span><span class="job-field-value">${fmtNextRun(j.next_run_at)}</span></div>
+          <div class="job-field"><span class="job-field-label">Next run</span><span class="job-field-value">${j.on_ice ? "— (on ice)" : fmtNextRun(j.next_run_at)}</span></div>
         </div>
         <div class="job-history">
           <span class="job-history-label">Last ${(j.history||[]).length || 0} runs</span>
           <span class="job-history-dots">${renderHistoryDots(j.history)}</span>
         </div>
         <div class="log-hint"><b>Log:</b> ${logHintForJob(j)}</div>
+        ${renderJobActions(j)}
       </div>`;
   }).join("");
 }
@@ -596,6 +741,69 @@ function toggleNavGroup(key) {
   try { saved = localStorage.getItem('admin_nav_' + key); } catch (e) { saved = null; }
   if (saved === 'closed') toggleNavGroup(key);
 });
+
+function toggleScheduleFields() {
+  const kind = document.getElementById("cj-kind").value;
+  document.getElementById("cj-cron-fields").style.display = kind === "cron" ? "" : "none";
+  document.getElementById("cj-interval-fields").style.display = kind === "interval" ? "" : "none";
+}
+
+async function createCustomJob() {
+  const msgEl = document.getElementById("cj-msg");
+  const submitBtn = document.getElementById("cj-submit");
+  msgEl.textContent = "";
+  msgEl.className = "form-msg";
+
+  const job_name = document.getElementById("cj-name").value.trim();
+  const script_path = document.getElementById("cj-script").value.trim();
+  const schedule_kind = document.getElementById("cj-kind").value;
+  const log_dir = document.getElementById("cj-logdir").value.trim();
+  const body = { job_name, script_path, schedule_kind, log_dir };
+
+  if (schedule_kind === "cron") {
+    const hoursRaw = document.getElementById("cj-hours").value.trim();
+    body.hours_utc = hoursRaw.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n) && n >= 0 && n <= 23);
+    if (!body.hours_utc.length) { msgEl.textContent = "Enter at least one valid hour (0-23)."; msgEl.className = "form-msg error"; return; }
+  } else {
+    const n = parseInt(document.getElementById("cj-interval").value, 10);
+    if (!n || n < 1) { msgEl.textContent = "Enter a valid interval in minutes."; msgEl.className = "form-msg error"; return; }
+    body.interval_minutes = n;
+  }
+  if (!job_name || !script_path) {
+    msgEl.textContent = "Job name and script path are required.";
+    msgEl.className = "form-msg error";
+    return;
+  }
+
+  submitBtn.disabled = true;
+  try {
+    const res = await fetch("/admin/api/custom-jobs", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      msgEl.textContent = `Created "${job_name}" -- it'll fire automatically within ${SCHEDULER_TICK_NOTE}.`;
+      msgEl.className = "form-msg ok";
+      document.getElementById("cj-name").value = "";
+      document.getElementById("cj-script").value = "";
+      document.getElementById("cj-hours").value = "";
+      document.getElementById("cj-interval").value = "";
+      document.getElementById("cj-logdir").value = "";
+      refresh();
+    } else {
+      msgEl.textContent = data.error || "Failed to create job.";
+      msgEl.className = "form-msg error";
+    }
+  } catch (e) {
+    msgEl.textContent = "Failed to create job: " + e;
+    msgEl.className = "form-msg error";
+  } finally {
+    submitBtn.disabled = false;
+  }
+}
+const SCHEDULER_TICK_NOTE = "30 seconds of its scheduled time";
 
 refresh();
 setInterval(refresh, REFRESH_MS);
