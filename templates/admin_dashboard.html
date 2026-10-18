@@ -367,13 +367,19 @@ function renderHistoryDots(history) {
 // when available, so it's the exact file that run used, not a guess);
 // nudge_cycle never writes a file, only prints to stdout under the
 // throughline systemd unit, so a journalctl filter is the real answer.
+const JOB_LOG_HINTS = {
+  nudge_cycle: 'journalctl -u throughline -g "nudge_engine"',
+  email_reminder_worker: 'journalctl -u throughline -g "email_reminder_worker"',
+  call_ring_timeout_worker: 'journalctl -u throughline -g "call_ring_timeout_worker"',
+};
+
 function logHintForJob(j) {
   if (j.job_name === "ei_pipeline") {
     const fromRun = j.detail && j.detail.log_file;
     const today = new Date().toISOString().slice(0, 10);
     return fromRun || `emotional_intelligence/logs/ei_pipeline_${today}.log`;
   }
-  return 'journalctl -u throughline -g "nudge_engine"';
+  return JOB_LOG_HINTS[j.job_name] || "journalctl -u throughline";
 }
 
 // Autosys-style job card: a status badge up top, then a clean label/value

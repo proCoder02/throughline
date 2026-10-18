@@ -847,10 +847,11 @@ def email_reminder_worker():
                     push_notification(row["user_id"], {
                         "type": "reminder_email_sent", "task_id": row["id"], "description": row["description"],
                     })
-                    _spawn_background(send_fcm_to_user, 
+                    _spawn_background(send_fcm_to_user,
                         row["user_id"], title="Reminder sent", body=row["description"],
                         data={"type": "reminder_email_sent", "task_id": row["id"]},
                     )
+            _admin_maybe_heartbeat(cur, conn, "email_reminder_worker", {"reminders_sent_this_tick": len(rows)})
             cur.close()
         except Exception as e:
             print(f"[email_reminder_worker] error: {e!r}")
@@ -908,6 +909,7 @@ def call_ring_timeout_worker():
                 caller_name = caller_row["username"] if caller_row else "Someone"
                 to_notify.append((call_id, call["initiator_user_id"], caller_name, missed_user_ids))
             conn.commit()
+            _admin_maybe_heartbeat(cur, conn, "call_ring_timeout_worker", {"calls_timed_out_this_tick": len(timed_out)})
             cur.close()
         except Exception as e:
             print(f"[call_ring_timeout_worker] error: {e!r}")
@@ -6810,18 +6812,60 @@ def _admin_ensure_ops_schema(cur, db) -> None:
     _admin_ops_schema_ensured = True
 
 
+# Continuous-loop workers (email_reminder_worker, call_ring_timeout_worker)
+# tick every 60s/10s respectively -- logging a real job_runs row on every
+# single tick would be 1440/day and 8640/day of near-identical rows for no
+# real monitoring benefit (the thing actually worth seeing is "is this loop
+# still alive", not every individual pass). Each only logs a heartbeat row
+# at most once per this interval; _ADMIN_JOB_SCHEDULE's own "interval_seconds"
+# for these two matches this throttle, not their real tick rate, so
+# next-run/stale math stays consistent with what's actually recorded.
+_ADMIN_HEARTBEAT_SECONDS = 300
+
+
+def _admin_maybe_heartbeat(cur, conn, job_name: str, detail: dict | None = None) -> None:
+    """Best-effort, throttled -- a failure here must never break the
+    worker loop it's called from. Reuses the caller's own open
+    connection/cursor rather than opening a second one."""
+    try:
+        _admin_ensure_ops_schema(cur, conn)
+        cur.execute("SELECT started_at FROM ops.job_runs WHERE job_name = %s ORDER BY started_at DESC LIMIT 1", (job_name,))
+        row = cur.fetchone()
+        now = datetime.now(timezone.utc)
+        if row and (now - row["started_at"]).total_seconds() < _ADMIN_HEARTBEAT_SECONDS:
+            return
+        cur.execute(
+            "INSERT INTO ops.job_runs (job_name, started_at, finished_at, status, detail) "
+            "VALUES (%s, %s, %s, 'success', %s)",
+            (job_name, now, now, json.dumps(detail or {})),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[ops.job_runs] heartbeat failed for {job_name}: {e!r}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 # job_name -> expected max gap between runs before it's flagged stale, in
 # hours. ei_pipeline runs twice daily (cron: 08:00/20:00 UTC -- see
 # emotional_intelligence/run_daily_ei_pipeline.py), nudge_cycle hourly (see
 # nudges/nudge_engine.py's start_nudge_worker); both get a generous buffer
-# over their own schedule so a slightly late run doesn't flash red.
-_ADMIN_JOB_STALE_HOURS = {"ei_pipeline": 15, "nudge_cycle": 3}
+# over their own schedule so a slightly late run doesn't flash red. The two
+# heartbeat workers get a generous buffer over _ADMIN_HEARTBEAT_SECONDS
+# instead of their real tick rate, for the same reason.
+_ADMIN_JOB_STALE_HOURS = {
+    "ei_pipeline": 15, "nudge_cycle": 3,
+    "email_reminder_worker": 0.2, "call_ring_timeout_worker": 0.2,
+}
 
 # Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
 # just documentation of the real schedule (root's crontab for ei_pipeline,
 # see infra/BASTION_ACCESS.md-adjacent ops notes; nudge_engine.py's
-# start_nudge_worker(interval_seconds=3600) for nudge_cycle), not read from
-# either live -- if either schedule ever changes, this dict has to be
+# start_nudge_worker(interval_seconds=3600) for nudge_cycle, or the two
+# while-True/time.sleep loops below for the heartbeat workers), not read
+# from any of them live -- if a schedule ever changes, this dict has to be
 # updated to match, same as _ADMIN_JOB_STALE_HOURS above it already does.
 _ADMIN_JOB_SCHEDULE = {
     "ei_pipeline": {
@@ -6831,6 +6875,14 @@ _ADMIN_JOB_SCHEDULE = {
     "nudge_cycle": {
         "kind": "interval", "interval_seconds": 3600,
         "cadence_label": "Every 1 hour",
+    },
+    "email_reminder_worker": {
+        "kind": "interval", "interval_seconds": _ADMIN_HEARTBEAT_SECONDS,
+        "cadence_label": "Continuous (60s loop; heartbeat every 5 min)",
+    },
+    "call_ring_timeout_worker": {
+        "kind": "interval", "interval_seconds": _ADMIN_HEARTBEAT_SECONDS,
+        "cadence_label": "Continuous (10s loop; heartbeat every 5 min)",
     },
 }
 
