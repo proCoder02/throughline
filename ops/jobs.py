@@ -18,6 +18,7 @@ from .tracking import HEARTBEAT_SECONDS
 JOB_STALE_HOURS = {
     "ei_pipeline": 15, "nudge_cycle": 3,
     "email_reminder_worker": 0.2, "call_ring_timeout_worker": 0.2,
+    "ops_alert_check": 1,  # diagnostic heartbeat -- see alerts.py's record_completed_run call
 }
 
 # Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
@@ -43,6 +44,10 @@ JOB_SCHEDULE = {
     "call_ring_timeout_worker": {
         "kind": "interval", "interval_seconds": HEARTBEAT_SECONDS,
         "cadence_label": "Continuous (10s loop; heartbeat every 5 min)",
+    },
+    "ops_alert_check": {
+        "kind": "interval", "interval_seconds": 1800,
+        "cadence_label": "Every 30 min (diagnostic -- see ops/alerts.py)",
     },
 }
 

@@ -17,6 +17,7 @@ from email.utils import formataddr
 from . import db as ops_db
 from .jobs import job_status
 from .schema import ensure_ops_schema
+from .tracking import record_completed_run
 
 ALERT_CHECK_INTERVAL_SECONDS = 1800  # 30 min
 ALERT_COOLDOWN_HOURS = 6  # re-alert while still stale, but not every check
@@ -89,6 +90,8 @@ def ops_alert_worker():
             time.sleep(ALERT_CHECK_INTERVAL_SECONDS)
             continue
         conn = None
+        cycle_started_at = datetime.now(timezone.utc)
+        checked = {}
         try:
             conn = ops_db.get_conn()
             cur = ops_db.dict_cursor(conn)
@@ -96,10 +99,12 @@ def ops_alert_worker():
             _ensure_alerts_table(cur, conn)
             for job in job_status(cur):
                 job_name = job["job_name"]
+                checked[job_name] = {"stale": job["stale"], "age_hours": job["age_hours"], "status": job["status"]}
                 if not job["stale"]:
                     _consecutive_stale[job_name] = 0
                     continue
                 _consecutive_stale[job_name] = _consecutive_stale.get(job_name, 0) + 1
+                checked[job_name]["consecutive"] = _consecutive_stale[job_name]
                 if _consecutive_stale[job_name] < ALERT_CONFIRM_COUNT:
                     print(f"[ops_alert_worker] {job_name} looks stale "
                           f"({_consecutive_stale[job_name]}/{ALERT_CONFIRM_COUNT} checks) -- not yet confirmed", flush=True)
@@ -107,14 +112,16 @@ def ops_alert_worker():
                 cur.execute("SELECT last_alerted_at FROM ops.alerts_sent WHERE job_name = %s", (job_name,))
                 row = cur.fetchone()
                 if row and (datetime.now(timezone.utc) - row["last_alerted_at"]).total_seconds() < ALERT_COOLDOWN_HOURS * 3600:
+                    checked[job_name]["skipped_cooldown"] = True
                     continue
                 age_desc = f"{job['age_hours']:.1f}h ago" if job["age_hours"] is not None else "never run"
-                _send_alert_email(
+                email_ok = _send_alert_email(
                     alert_email,
                     f"[Throughline] {job_name} is stale",
                     f"{job_name} last ran: {age_desc} (status: {job['status']}).\n\n"
                     f"Check https://129-213-21-239.sslip.io/admin for details.",
                 )
+                checked[job_name]["email_sent"] = email_ok
                 cur.execute(
                     "INSERT INTO ops.alerts_sent (job_name, last_alerted_at) VALUES (%s, now()) "
                     "ON CONFLICT (job_name) DO UPDATE SET last_alerted_at = now()",
@@ -122,6 +129,14 @@ def ops_alert_worker():
                 )
                 conn.commit()
                 print(f"[ops_alert_worker] sent stale-job alert for {job_name}", flush=True)
+            # Diagnostic heartbeat on every cycle, not just when something's
+            # stale -- confirmed live twice now that an alert email can
+            # arrive with zero trace anywhere (ops.alerts_sent, journalctl)
+            # of the check that supposedly sent it; this gives positive,
+            # permanent proof of every single check's timing and findings,
+            # so a third occurrence (if the problem is real and ongoing,
+            # not stale mail delivery) is actually diagnosable.
+            record_completed_run(cur, conn, "ops_alert_check", cycle_started_at, "success", {"checked": checked})
             cur.close()
         except Exception as e:
             print(f"[ops_alert_worker] error: {e!r}", flush=True)
