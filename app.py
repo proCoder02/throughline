@@ -514,6 +514,102 @@ def compute_compiled_mood(cur, user_id, bucket_start, bucket_end):
     return {"mood_label": label, "emoji": MOOD_EMOJI.get((label or "").lower(), DEFAULT_MOOD_EMOJI)}
 
 
+def _normalize_category(category):
+    """'food', 'Food', 'FOOD' all collapse to one bucket -- otherwise
+    compute_monthly_spending_summary's GROUP BY treats them as distinct
+    categories and silently fragments the spending totals. The LLM still
+    decides what the category IS (no fixed taxonomy); this only makes
+    repeated mentions of the same word aggregate together. Capitalize()
+    rather than title() so a multi-word category ('food delivery') reads
+    naturally ('Food delivery') instead of ('Food Delivery')."""
+    if not category:
+        return None
+    return category.strip().capitalize() or None
+
+
+# A small known set for UPI apps specifically -- there are only so many of
+# them, and their real names don't follow simple capitalize() rules
+# ("GPay", not "Gpay"; "PhonePe", not "Phonepe"). Keyed on a lowercased,
+# space-stripped form so "Google Pay", "GPay", and "google pay" all land on
+# the one canonical label. Also covers the generic (bank-less) rail names
+# for non-UPI payments -- "credit card"/"creditcard" both land on "Credit
+# Card" the same way. Unlike category, the fallback for anything NOT in
+# this map is the model's OWN capitalization, not .title() -- a credit
+# card receipt's payment_method is typically "<Bank> Credit Card" (e.g.
+# "HDFC Credit Card"), and .title() would mangle the bank's own acronym
+# (HDFC -> Hdfc), undoing a reading the model already got right.
+_PAYMENT_METHOD_CANONICAL = {
+    "googlepay": "Google Pay", "gpay": "Google Pay",
+    "phonepe": "PhonePe",
+    "paytm": "Paytm",
+    "amazonpay": "Amazon Pay",
+    "bhim": "BHIM",
+    "cred": "CRED",
+    "whatsapppay": "WhatsApp Pay",
+    "mobikwik": "MobiKwik",
+    "creditcard": "Credit Card",
+    "debitcard": "Debit Card",
+    "netbanking": "Net Banking",
+    "banktransfer": "Bank Transfer",
+    "upi": "UPI",
+}
+
+
+def _normalize_payment_method(payment_method):
+    if not payment_method:
+        return None
+    stripped = payment_method.strip()
+    if not stripped:
+        return None
+    key = re.sub(r"[^a-z0-9]", "", stripped.lower())
+    return _PAYMENT_METHOD_CANONICAL.get(key, stripped)
+
+
+def compute_monthly_spending_summary(cur, user_id, start, end):
+    """Category-level spending totals for user_id in [start, end), computed
+    on read same as compute_compiled_mood above (no cron needed for a
+    GROUP BY this cheap). Returns a list of {category, total, count} rows,
+    highest-spend first; empty list if nothing logged in that window."""
+    cur.execute(
+        "SELECT COALESCE(category, 'Uncategorized') AS category, SUM(amount) AS total, COUNT(*) AS n "
+        "FROM transactions WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "GROUP BY COALESCE(category, 'Uncategorized') ORDER BY total DESC",
+        (user_id, start, end),
+    )
+    return [{"category": r["category"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
+
+
+def compute_monthly_payment_method_summary(cur, user_id, start, end):
+    """Same shape as compute_monthly_spending_summary, grouped by
+    payment_method instead -- a separate dimension (which UPI app a payment
+    went through) from category (what it was for), see transactions table's
+    own comment in schema.sql."""
+    cur.execute(
+        "SELECT COALESCE(payment_method, 'Unknown') AS payment_method, SUM(amount) AS total, COUNT(*) AS n "
+        "FROM transactions WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "GROUP BY COALESCE(payment_method, 'Unknown') ORDER BY total DESC",
+        (user_id, start, end),
+    )
+    return [{"payment_method": r["payment_method"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
+
+
+def compute_recent_transactions(cur, user_id, start, end, limit=25):
+    """Individual transactions (not aggregated), newest first -- the
+    category/payment-method summaries above answer "where am I spending
+    the most", but have nothing to offer a request like "send today's
+    purchases to a friend", which needs to name WHAT was actually bought.
+    Confirmed missing live: composing that message from the category
+    summary alone produced "Blinkit purchase: Rs 1,317" instead of naming
+    the item, since a SUM-by-category row has no item field at all."""
+    cur.execute(
+        "SELECT item, payee, category, payment_method, amount, created_at FROM transactions "
+        "WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, start, end, limit),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
 # Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) --
 # collapses the 8 raw mood_label values into the 4 coarse buckets the
 # Flutter client's MotionProfile table actually branches on. A label this
@@ -724,7 +820,7 @@ def build_ics(summary, description, start_utc, duration_minutes=30):
     return "\r\n".join(lines)
 
 
-def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None):
+def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None, attachments=None):
     """Shared send for send_reminder_email/send_plain_email below, over a
     real hosted mailbox (throughline@zoomxcom.com, Hostinger) rather than a
     personal Gmail account -- Gmail SMTP hit a real account-level Google
@@ -747,7 +843,12 @@ def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, r
     name (e.g. "Amit via Throughline <throughline@zoomxcom.com>" -- still
     the same authenticated address, just a recognizable label) and
     reply_to points replies at the sending user's own registered email
-    instead of the shared mailbox, so a reply reaches them directly."""
+    instead of the shared mailbox, so a reply reaches them directly.
+
+    attachments: optional list of {"filename", "content_type", "data"}
+    dicts (e.g. a vehicle insurance claim's supporting photos/FIR -- see
+    confirm_email_draft) -- attached the same way the .ics branch below
+    already does, just generalized from one hardcoded file to a list."""
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_username = os.getenv("SMTP_USERNAME")
@@ -770,6 +871,14 @@ def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, r
         encoders.encode_base64(ics_part)
         ics_part.add_header("Content-Disposition", "attachment", filename="reminder.ics")
         msg.attach(ics_part)
+
+    for attachment in (attachments or []):
+        main_type, _, sub_type = (attachment.get("content_type") or "application/octet-stream").partition("/")
+        part = MIMEBase(main_type or "application", sub_type or "octet-stream")
+        part.set_payload(attachment["data"])
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=attachment["filename"])
+        msg.attach(part)
 
     try:
         smtp_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
@@ -1606,6 +1715,17 @@ def call_llm(messages):
         "model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"),
         "messages": messages,
         "stream": False,
+        # Confirmed live: the SAME dense-table degenerate-repetition
+        # failure call_groq_vision hit (see its own comment) also hit this
+        # function, processing a PDF-extracted policy document's premium
+        # table as plain text -- repeat_penalty/num_predict are Ollama's
+        # own names for frequency_penalty/max_tokens there. num_predict
+        # was briefly 3000, but that truncated legitimate long multi-page
+        # documents mid-section (confirmed live on a real 4-page policy
+        # PDF) before ever reaching SUMMARY/POLICY -- _looks_degenerate is
+        # the real backstop against repetition regardless of the cap, so
+        # this just needs to be generous enough for genuine long content.
+        "options": {"repeat_penalty": 1.3, "num_predict": 6000},
     }
     result = _post_ollama_chat(payload)
     return result.get("message", {}).get("content", "")
@@ -1661,7 +1781,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "message_friend",
-            "description": "Send a direct message to one of the user's friends inside the app. Use when the user asks to tell/message/let someone know something.",
+            "description": "Send a direct message to one of the user's friends inside the app. Use when the user asks to tell/message/let someone know something. Sends immediately -- tell them it's been sent.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1669,6 +1789,37 @@ AGENT_TOOLS = [
                     "content": {"type": "string", "description": "The message to send."},
                 },
                 "required": ["friend_name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_expense",
+            "description": (
+                "Record a payment/purchase the user just stated in conversation (e.g. 'I spent 270 on "
+                "chai today', 'paid 2000 for groceries'). Use this whenever the user mentions spending "
+                "money, NOT when they share a receipt photo (that's extracted separately). Never invent "
+                "amounts or details not actually said. This always comes back as a pending card the user "
+                "must still tap Save on -- tell them it's ready to review/save, don't say it's been "
+                "logged/saved yet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "description": "The amount spent, as stated."},
+                    "payee": {"type": "string", "description": "Who/what it was paid to, if mentioned."},
+                    "category": {
+                        "type": "string",
+                        "description": "One or two words, e.g. Food, Travel, Shopping, Bills -- infer from context if not stated.",
+                    },
+                    "payment_method": {
+                        "type": "string",
+                        "description": "How it was paid, only if the user actually said (e.g. 'UPI', 'credit card', 'cash') -- omit if not mentioned, never guess.",
+                    },
+                    "item": {"type": "string", "description": "What was bought, if mentioned, e.g. 'chai', 'groceries'."},
+                },
+                "required": ["amount"],
             },
         },
     },
@@ -1718,6 +1869,85 @@ AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_vehicle_insurance_claim",
+            "description": (
+                "File an insurance claim for a vehicle (bike/car) accident, theft, or damage the user "
+                "describes. Only two things actually gate this: WHEN it happened and WHAT happened -- "
+                "if either is missing or vague (e.g. 'my bike broke'), ask the user for the specific "
+                "date and a real description BEFORE calling this, don't call it with guessed or "
+                "placeholder details. Location, third-party details, FIR number, and estimated amount "
+                "are all optional extras -- call this as soon as you have the date and description even "
+                "if the user never mentioned them; don't hold up drafting the claim to ask for them, the "
+                "insurer's own claim form will ask again anyway. Drafts an email to the insurer; nothing "
+                "is sent until the user reviews and confirms it -- tell them it's drafted and ready to "
+                "review, don't say the claim has been filed. If the user has more than one vehicle on "
+                "file and vehicle_hint doesn't clearly pick one, this will come back with a question "
+                "listing the vehicles on file -- relay it to the user rather than guessing which vehicle "
+                "they meant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vehicle_hint": {
+                        "type": "string",
+                        "description": "Which vehicle/policy, as the user referred to it (e.g. 'bike', 'Activa', a registration number, or the insurer name).",
+                    },
+                    "incident_date": {
+                        "type": "string",
+                        "description": "ISO 8601 date the incident happened. Required -- never guess if not stated.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What actually happened, in the user's own words. Required -- never invent specifics.",
+                    },
+                    "claim_type": {
+                        "type": "string",
+                        "enum": ["own_damage", "third_party"],
+                        "description": (
+                            "Only matters when the vehicle has BOTH an own-damage and a third-party policy "
+                            "(common in India -- they're often different insurers). Infer it from the "
+                            "description when you can: the user's OWN vehicle got damaged/stolen/caught "
+                            "fire etc. -> 'own_damage'; the user damaged someone ELSE's vehicle/property or "
+                            "injured someone -> 'third_party'. Omit if you can't tell -- if it turns out to "
+                            "matter (the vehicle really does have both), this will come back asking you to "
+                            "clarify with the user and call again. Never ask the user about this up front "
+                            "if their description already makes it obvious, and never ask at all for a "
+                            "vehicle that only has one policy to begin with."
+                        ),
+                    },
+                    "location": {"type": "string", "description": "Where it happened. Optional -- omit if not mentioned, never ask just for this."},
+                    "third_party_involved": {
+                        "type": "string",
+                        "description": "Details of any other person/vehicle involved. Optional -- omit if not mentioned, never ask just for this.",
+                    },
+                    "fir_number": {"type": "string", "description": "Police FIR number. Optional -- omit if not mentioned, never ask just for this."},
+                    "estimated_amount": {
+                        "type": "number",
+                        "description": "Estimated repair/loss amount. Optional -- omit if not mentioned, never ask just for this.",
+                    },
+                },
+                "required": ["vehicle_hint", "incident_date", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_latest_draft",
+            "description": (
+                "Look up the exact, real text of the user's most recent pending email draft (from "
+                "send_email or file_vehicle_insurance_claim). Call this whenever the user asks to see, "
+                "confirm, re-read, or check the exact content of something you just drafted -- never "
+                "reconstruct or guess the content from your own earlier summary of it. You do not "
+                "actually remember the literal text of a draft after describing it, and guessing will "
+                "get real details wrong (recipient, policy numbers, dates) -- always call this instead."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -1739,11 +1969,11 @@ def _resolve_friend_by_name(cur, user_id, name):
     return None
 
 
-def send_plain_email(to_email, subject, body, from_name=None, reply_to=None):
+def send_plain_email(to_email, subject, body, from_name=None, reply_to=None, attachments=None):
     """General-purpose counterpart to send_reminder_email, above -- no .ics
     attachment, arbitrary recipient instead of always the authenticated
-    user's own address."""
-    return _smtp_send(to_email, subject, body, from_name=from_name, reply_to=reply_to)
+    user's own address. attachments: see _smtp_send's own doc comment."""
+    return _smtp_send(to_email, subject, body, from_name=from_name, reply_to=reply_to, attachments=attachments)
 
 
 def _tool_create_task(cur, db, user_id, args):
@@ -1761,6 +1991,13 @@ def _tool_create_task(cur, db, user_id, args):
 
 
 def _tool_message_friend(cur, db, user_id, args):
+    """Sends immediately -- unlike send_email's arbitrary-address case,
+    there's no misjudgment-of-recipient risk here (friend_name always
+    resolves to someone already in the user's trust graph), so a draft
+    step only added friction without catching anything real. The
+    log_expense tool above is what actually prevents a stale/wrong detail
+    from going out, by making sure the data it's reporting is accurate in
+    the first place."""
     friend = _resolve_friend_by_name(cur, user_id, args.get("friend_name"))
     content = (args.get("content") or "").strip()
     if not friend:
@@ -1782,11 +2019,39 @@ def _tool_message_friend(cur, db, user_id, args):
         "message": {"id": message_id, "sender_id": user_id, "recipient_id": friend["id"], "content": content},
         "sender_username": sender_name,
     })
-    _spawn_background(send_fcm_to_user, 
+    _spawn_background(send_fcm_to_user,
         friend["id"], title=sender_name, body=content,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message_id)},
     )
     return {"ok": True, "friend_name": friend["name"], "message_id": message_id}
+
+
+def _tool_log_expense(cur, db, user_id, args):
+    """No DB write here -- the proposed expense lives entirely in the
+    action_card JSON until confirmed, and 'confirm' is just a normal call
+    to the already-existing POST /transactions (which already dedupes by
+    amount+payee within 10 minutes). Mirrors chat_global_image's own
+    normalization so a voice-logged expense and a photographed receipt
+    end up with identically-shaped categories/payment methods."""
+    amount = args.get("amount")
+    if amount is None:
+        return {"error": "amount is required"}
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return {"error": "amount must be a number"}
+
+    return {
+        "ok": True, "pending": True,
+        "_action_card": {
+            "type": "expense_confirm",
+            "amount": amount,
+            "payee": (args.get("payee") or "").strip() or None,
+            "category": _normalize_category(args.get("category")),
+            "payment_method": _normalize_payment_method(args.get("payment_method")),
+            "item": (args.get("item") or "").strip() or None,
+        },
+    }
 
 
 def _tool_make_call(cur, db, user_id, args):
@@ -1890,11 +2155,204 @@ def _tool_send_email(cur, db, user_id, args):
     }
 
 
+def _vehicle_group_key(row):
+    """Identity for grouping policy rows into one vehicle -- vehicle_registration
+    when present (the real-world identity of a vehicle), falling back to
+    label for a policy saved without one."""
+    return row["vehicle_registration"] or row["label"] or f"policy #{row['id']}"
+
+
+def _vehicle_group_label(rows):
+    """Human-readable name for a vehicle group, for disambiguation
+    messages -- e.g. 'Bike (KA53JF2057)'."""
+    sample = rows[0]
+    label, reg = sample["label"], sample["vehicle_registration"]
+    if label and reg:
+        return f"{label} ({reg})"
+    return label or reg or f"policy #{sample['id']}"
+
+
+def _tool_file_vehicle_insurance_claim(cur, db, user_id, args):
+    """Drafts a claim email the same way send_email's arbitrary-address
+    branch does -- an insurer's claims address is exactly that case (an
+    untrusted recipient, where a wrong detail can't be unsent), so this
+    reuses email_drafts/EmailDraftCard as-is rather than a new mechanism.
+    The only new state is vehicle_insurance_claims, which exists purely so
+    the user can later ask about a claim's status; confirm_email_draft/
+    dismiss_email_draft (below) flip its status in lockstep with the
+    underlying email draft.
+
+    Three-tier resolution, each tier using the same "return an error, let
+    the model relay it as a natural follow-up" mechanism as the hard-
+    required-fields check below:
+    1. Resolve a VEHICLE from vehicle_hint. A hint matching rows across
+       more than one vehicle, or matching none while the user has other
+       policies on file, returns a disambiguation listing grouped by
+       vehicle (so a split own_damage+third_party pair shows as ONE
+       vehicle, not two confusing entries) instead of a flat not-found.
+    2. Resolve COVERAGE within that vehicle. One policy row -> just use
+       it, claim_type is irrelevant and never asked about. Two rows (a
+       real own_damage/third_party split, e.g. two different insurers) ->
+       use claim_type if given and it matches one of the rows; otherwise
+       prefer a 'comprehensive' row if one exists (it covers either case);
+       otherwise ask the one clarifying question needed."""
+    vehicle_hint = (args.get("vehicle_hint") or "").strip()
+    incident_date = (args.get("incident_date") or "").strip()
+    description = (args.get("description") or "").strip()
+    if not vehicle_hint:
+        return {"error": "vehicle_hint is required -- which vehicle/policy is this for?"}
+    if not incident_date:
+        return {"error": "incident_date is required -- ask the user exactly when this happened"}
+    if not description:
+        return {"error": "description is required -- ask the user what actually happened"}
+    try:
+        datetime.fromisoformat(incident_date)
+    except ValueError:
+        return {"error": f"'{incident_date}' isn't a valid date -- ask the user for the actual date"}
+
+    cur.execute(
+        "SELECT * FROM vehicle_insurance_policies WHERE user_id = %s AND "
+        "(label ILIKE %s OR insurer_name ILIKE %s OR vehicle_registration ILIKE %s)",
+        (user_id, f"%{vehicle_hint}%", f"%{vehicle_hint}%", f"%{vehicle_hint}%"),
+    )
+    hint_matches = cur.fetchall()
+
+    if not hint_matches:
+        cur.execute("SELECT * FROM vehicle_insurance_policies WHERE user_id = %s", (user_id,))
+        all_policies = cur.fetchall()
+        if not all_policies:
+            return {"error": f"No vehicle insurance policy found matching '{vehicle_hint}' -- share a photo of the policy first."}
+        groups = {}
+        for row in all_policies:
+            groups.setdefault(_vehicle_group_key(row), []).append(row)
+        labels = ", ".join(_vehicle_group_label(rows) for rows in groups.values())
+        return {"error": f"'{vehicle_hint}' doesn't match any vehicle on file -- which one did you mean: {labels}?"}
+
+    groups = {}
+    for row in hint_matches:
+        groups.setdefault(_vehicle_group_key(row), []).append(row)
+    if len(groups) > 1:
+        labels = ", ".join(_vehicle_group_label(rows) for rows in groups.values())
+        return {"error": f"Found more than one matching vehicle -- which one did you mean: {labels}?"}
+
+    # Pull every policy row for the resolved vehicle, not just whichever
+    # ones the hint happened to textually match -- a hint like an insurer
+    # name might only match the own_damage leg of a split policy, but the
+    # coverage decision below needs to see the third_party leg too.
+    vehicle_key = next(iter(groups))
+    cur.execute(
+        "SELECT * FROM vehicle_insurance_policies WHERE user_id = %s AND "
+        "(vehicle_registration = %s OR (vehicle_registration IS NULL AND label = %s))",
+        (user_id, vehicle_key, vehicle_key),
+    )
+    vehicle_policies = cur.fetchall() or groups[vehicle_key]
+
+    if len(vehicle_policies) == 1:
+        policy = vehicle_policies[0]
+    else:
+        comprehensive = next((p for p in vehicle_policies if p["coverage_type"] == "comprehensive"), None)
+        claim_type = (args.get("claim_type") or "").strip().lower()
+        policy = None
+        if claim_type in ("own_damage", "third_party"):
+            policy = next((p for p in vehicle_policies if p["coverage_type"] == claim_type), None)
+        if not policy:
+            policy = comprehensive
+        if not policy:
+            return {
+                "error": (
+                    "This vehicle has separate own-damage and third-party policies -- ask the user: was "
+                    "your own vehicle damaged, or did this involve someone else's vehicle/property? Then "
+                    "call this again with claim_type set to 'own_damage' or 'third_party'."
+                )
+            }
+
+    location = (args.get("location") or "").strip() or None
+    third_party = (args.get("third_party_involved") or "").strip() or None
+    fir_number = (args.get("fir_number") or "").strip() or None
+    estimated_amount = args.get("estimated_amount")
+    estimated_amount = float(estimated_amount) if isinstance(estimated_amount, (int, float)) else None
+
+    cur.execute("SELECT username, email FROM users WHERE id = %s", (user_id,))
+    sender = cur.fetchone()
+
+    body_lines = [
+        f"Dear {policy['insurer_name']},",
+        "",
+        f"I would like to file a claim under policy number {policy['policy_number']}"
+        + (f" (vehicle {policy['vehicle_registration']})" if policy["vehicle_registration"] else "") + ".",
+        "",
+        f"Date of incident: {incident_date}",
+        f"Description: {description}",
+    ]
+    if location:
+        body_lines.append(f"Location: {location}")
+    if third_party:
+        body_lines.append(f"Third party involved: {third_party}")
+    if fir_number:
+        body_lines.append(f"Police FIR number: {fir_number}")
+    if estimated_amount is not None:
+        body_lines.append(f"Estimated loss/repair amount: {estimated_amount}")
+    body_lines += ["", "Please let me know the next steps and any documents required.", "", "Regards,", sender["username"] if sender else ""]
+    body = "\n".join(body_lines)
+    subject = f"Insurance Claim - Policy {policy['policy_number']}"
+
+    cur.execute(
+        "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (user_id, policy["claims_email"], subject, body, sender["username"] if sender else None,
+         sender["email"] if sender and sender.get("email") else None),
+    )
+    draft_id = cur.fetchone()["id"]
+    cur.execute(
+        "INSERT INTO vehicle_insurance_claims "
+        "(user_id, policy_id, email_draft_id, incident_date, description, location, "
+        "third_party_involved, fir_number, estimated_amount) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (user_id, policy["id"], draft_id, incident_date, description, location,
+         third_party, fir_number, estimated_amount),
+    )
+    db.commit()
+    return {
+        "ok": True, "pending": True, "draft_id": draft_id,
+        "_action_card": {
+            "type": "email_draft", "draft_id": draft_id,
+            "to_email": policy["claims_email"], "subject": subject, "body": body,
+        },
+    }
+
+
+def _tool_get_latest_draft(cur, db, user_id, args):
+    """Read-only lookup for the user's most recent still-pending email
+    draft (from send_email's arbitrary-address branch or
+    file_vehicle_insurance_claim) -- gives the model real text to quote
+    verbatim when asked to show/confirm exact drafted content, instead of
+    reconstructing it from memory. Confirmed live that a prompt-only
+    instruction NOT to fabricate wasn't enough on its own -- the model
+    kept inventing a plausible-but-wrong email, complete with placeholder
+    text like "[insert policy number]", even when told explicitly not to.
+    Giving it an actual tool that returns ground truth is the real fix."""
+    cur.execute(
+        "SELECT to_email, subject, body, created_at FROM email_drafts "
+        "WHERE user_id = %s AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    )
+    draft = cur.fetchone()
+    if not draft:
+        return {"ok": True, "found": False, "message": "No pending draft right now."}
+    return {
+        "ok": True, "found": True,
+        "to_email": draft["to_email"], "subject": draft["subject"], "body": draft["body"],
+    }
+
+
 AGENT_TOOL_DISPATCH = {
     "create_task": lambda cur, db, user_id, args: _tool_create_task(cur, db, user_id, args),
     "message_friend": lambda cur, db, user_id, args: _tool_message_friend(cur, db, user_id, args),
+    "log_expense": lambda cur, db, user_id, args: _tool_log_expense(cur, db, user_id, args),
     "make_call": lambda cur, db, user_id, args: _tool_make_call(cur, db, user_id, args),
     "send_email": lambda cur, db, user_id, args: _tool_send_email(cur, db, user_id, args),
+    "file_vehicle_insurance_claim": lambda cur, db, user_id, args: _tool_file_vehicle_insurance_claim(cur, db, user_id, args),
+    "get_latest_draft": lambda cur, db, user_id, args: _tool_get_latest_draft(cur, db, user_id, args),
 }
 
 AGENT_LOOP_MAX_TURNS = 4
@@ -1905,14 +2363,21 @@ def run_agent_tool_loop(cur, db, user_id, messages):
     call_llm_with_tools: dispatches every tool_call the model returns,
     feeds each result back as a `tool` message, and stops as soon as a
     turn comes back with no tool_calls (that message's content is the
-    final reply). Returns (reply_text, action_card, created_task).
+    final reply). Returns (reply_text, action_cards, created_task).
+
+    action_cards is a list, not a single card -- one request can
+    legitimately trigger several staged actions at once (e.g. "log this
+    expense AND message Kunal about it AND email the same update"), each
+    with its own card. Collecting only the last one silently dropped every
+    earlier action's card, so there was nothing on screen to confirm/send
+    for anything but the final tool call.
 
     created_task is surfaced so the caller can skip the separate
     trigger_reminder_extraction background pass for this same message --
     without it, a single "remind me to..." could create two tasks: one
     from this loop's create_task call, one from that older regex-triggered
     extraction path."""
-    action_card = None
+    action_cards = []
     created_task = False
     messages = list(messages)
 
@@ -1920,7 +2385,7 @@ def run_agent_tool_loop(cur, db, user_id, messages):
         message = call_llm_with_tools(messages, AGENT_TOOLS)
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            return message.get("content") or "", action_card, created_task
+            return message.get("content") or "", action_cards, created_task
 
         messages.append(message)
         for call in tool_calls:
@@ -1949,14 +2414,14 @@ def run_agent_tool_loop(cur, db, user_id, messages):
                 created_task = True
             card = result.pop("_action_card", None)
             if card:
-                action_card = card
+                action_cards.append(card)
 
             messages.append({"role": "tool", "content": json.dumps(result)})
 
     # Ran out of turns -- fall back to a plain call so the user still gets
     # a reply instead of an empty response.
     final = call_llm(messages)
-    return final, action_card, created_task
+    return final, action_cards, created_task
 
 
 # Strips a leading <think>...</think> reasoning block some models (e.g. Groq's
@@ -2001,6 +2466,17 @@ def call_groq_vision(image_bytes, mimetype, instruction):
             ],
         }],
         "temperature": 0.2,
+        # Confirmed live: a dense table (a real insurance policy's premium
+        # breakdown) sent the model into a degenerate loop, repeating one
+        # line dozens of times and never reaching the SUMMARY/TRANSACTION/
+        # POLICY sections at all. frequency_penalty discourages exactly
+        # this. max_tokens was briefly 3000 as a hard backstop, but that
+        # truncated legitimate long multi-page documents mid-section before
+        # ever reaching SUMMARY/POLICY (confirmed live) -- _looks_degenerate
+        # is the real backstop against a runaway loop regardless of the cap,
+        # so this just needs enough room for genuine long content.
+        "frequency_penalty": 0.4,
+        "max_tokens": 6000,
     }
     response = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -2560,6 +3036,11 @@ _AGENT_ACTION_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# See the deterministic-backstop comment at its one call site in
+# chat_global below -- catches the literal tell of fabricated drafted
+# content (template placeholder brackets), regardless of why it happened.
+_FABRICATED_PLACEHOLDER_RE = re.compile(r"\[(insert|your)\b", re.IGNORECASE)
+
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
 
 The user just said this in chat. Determine whether they're asking to be reminded of one or more things (tasks, events, commitments, deadlines) -- not just using the word "remind" in passing. There can be MORE than one -- e.g. a list of exams/classes/bills where they asked for a reminder for each -- extract one entry per distinct thing to remind about, never one combined summary covering several of them.
@@ -2669,6 +3150,16 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
 
 _NEARBY_INTENT_RE = re.compile(
     r"\bnear(?:by)?\s+me\b|\bnear\s+here\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\bin\s+my\s+area\b",
+    re.IGNORECASE,
+)
+
+# Spending-habit questions ("where am I spending the most", "show my
+# purchasing habits") -- see compute_monthly_spending_summary below and its
+# splice into chat_global's context. Same hand-picked-regex approach as
+# _NEARBY_INTENT_RE above rather than a full intent classifier.
+_FINANCE_INTENT_RE = re.compile(
+    r"\bspending\b|\bspent\b|\bexpenses?\b|\bpurchas(?:e|ing|es)\b|\bwhere.*money.*go\b|"
+    r"\bhow\s+much.*(?:spend|spent)\b|\btransactions?\b",
     re.IGNORECASE,
 )
 
@@ -4004,15 +4495,37 @@ def confirm_email_draft(draft_id):
     if not draft:
         return jsonify({"error": "No pending draft with that id"}), 404
 
+    import storage
+    cur.execute(
+        "SELECT object_key, filename, content_type FROM email_draft_attachments WHERE draft_id = %s",
+        (draft_id,),
+    )
+    attachments = []
+    for row in cur.fetchall():
+        data = storage.download_object(row["object_key"])
+        if data is None:
+            # Best-effort, same as every other storage.download_object
+            # caller -- one bad/expired object shouldn't block the whole
+            # claim from going out with whatever attachments did come through.
+            continue
+        attachments.append({"filename": row["filename"], "content_type": row["content_type"], "data": data})
+
     sent = send_plain_email(
         draft["to_email"], draft["subject"], draft["body"],
-        from_name=draft["from_name"], reply_to=draft["reply_to"],
+        from_name=draft["from_name"], reply_to=draft["reply_to"], attachments=attachments,
     )
     if not sent:
         return jsonify({"error": f"Failed to send email to {draft['to_email']}"}), 502
 
     cur.execute(
         "UPDATE email_drafts SET status = 'sent', resolved_at = now() WHERE id = %s",
+        (draft_id,),
+    )
+    # No-op unless this draft came from file_vehicle_insurance_claim --
+    # keeps the claim's own status in lockstep with its email draft instead
+    # of tracking it independently.
+    cur.execute(
+        "UPDATE vehicle_insurance_claims SET status = 'filed', resolved_at = now() WHERE email_draft_id = %s",
         (draft_id,),
     )
     db.commit()
@@ -4028,6 +4541,147 @@ def dismiss_email_draft(draft_id):
     cur = dict_cursor(db)
     cur.execute(
         "UPDATE email_drafts SET status = 'dismissed', resolved_at = now() "
+        "WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING id",
+        (draft_id, user_id),
+    )
+    updated = cur.fetchone()
+    # No-op unless this draft came from file_vehicle_insurance_claim.
+    cur.execute(
+        "UPDATE vehicle_insurance_claims SET status = 'dismissed', resolved_at = now() WHERE email_draft_id = %s",
+        (draft_id,),
+    )
+    db.commit()
+    if not updated:
+        return jsonify({"error": "No pending draft with that id"}), 404
+    return jsonify({"ok": True, "status": "dismissed"})
+
+
+def _email_draft_attachments_list(cur, draft_id):
+    cur.execute(
+        "SELECT id, filename, content_type, created_at FROM email_draft_attachments "
+        "WHERE draft_id = %s ORDER BY created_at",
+        (draft_id,),
+    )
+    return [
+        {"id": r["id"], "filename": r["filename"], "content_type": r["content_type"]}
+        for r in cur.fetchall()
+    ]
+
+
+@app.route("/email-drafts/<int:draft_id>/attachments", methods=["POST"])
+@login_required
+def attach_email_draft_file(draft_id):
+    """User tapped Attach on a still-pending EmailDraftCard -- object_key
+    already exists in R2 (the client already did presign+PUT+confirm via
+    the same /uploads/* flow chat/DM attachments use, see upload_service.dart),
+    this just records which draft it belongs to. confirm_email_draft
+    downloads the real bytes from R2 at send time; nothing is fetched or
+    duplicated here. Returns the draft's full attachment list so the
+    client can update its card from this response alone."""
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    object_key = (data.get("object_key") or "").strip()
+    filename = (data.get("filename") or "").strip()
+    content_type = (data.get("content_type") or "").strip() or None
+    if not object_key or not filename:
+        return jsonify({"error": "object_key and filename are required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute("SELECT id FROM email_drafts WHERE id = %s AND user_id = %s AND status = 'pending'", (draft_id, user_id))
+    if not cur.fetchone():
+        return jsonify({"error": "No pending draft with that id"}), 404
+
+    cur.execute(
+        "INSERT INTO email_draft_attachments (draft_id, object_key, filename, content_type) "
+        "VALUES (%s, %s, %s, %s)",
+        (draft_id, object_key, filename, content_type),
+    )
+    db.commit()
+    return jsonify({"ok": True, "attachments": _email_draft_attachments_list(cur, draft_id)})
+
+
+@app.route("/email-drafts/<int:draft_id>/attachments/<int:attachment_id>", methods=["DELETE"])
+@login_required
+def remove_email_draft_attachment(draft_id, attachment_id):
+    """User tapped the '×' on an attachment chip before sending -- same
+    reversibility every other draft/card action already has."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT a.object_key FROM email_draft_attachments a JOIN email_drafts d ON d.id = a.draft_id "
+        "WHERE a.id = %s AND a.draft_id = %s AND d.user_id = %s AND d.status = 'pending'",
+        (attachment_id, draft_id, user_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "No matching attachment on a pending draft with that id"}), 404
+
+    cur.execute("DELETE FROM email_draft_attachments WHERE id = %s", (attachment_id,))
+    db.commit()
+    import storage
+    storage.delete_object(row["object_key"])
+    return jsonify({"ok": True, "attachments": _email_draft_attachments_list(cur, draft_id)})
+
+
+@app.route("/message-drafts/<int:draft_id>/confirm", methods=["POST"])
+@login_required
+def confirm_message_draft(draft_id):
+    """User tapped Send on a MessageDraftCard (see _tool_message_friend) --
+    the one point where a drafted direct message actually goes out. Does
+    the INSERT INTO direct_messages + push/FCM that _tool_message_friend
+    used to do immediately, same shape as confirm_email_draft above."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT friend_id, content FROM message_drafts "
+        "WHERE id = %s AND user_id = %s AND status = 'pending'",
+        (draft_id, user_id),
+    )
+    draft = cur.fetchone()
+    if not draft:
+        return jsonify({"error": "No pending draft with that id"}), 404
+
+    cur.execute(
+        "INSERT INTO direct_messages (sender_id, recipient_id, content) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, draft["friend_id"], draft["content"]),
+    )
+    message_id = cur.fetchone()["id"]
+    cur.execute(
+        "UPDATE message_drafts SET status = 'sent', resolved_at = now() WHERE id = %s",
+        (draft_id,),
+    )
+    db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    sender_name = cur.fetchone()["username"]
+    push_notification(draft["friend_id"], {
+        "type": "direct_message",
+        "message": {"id": message_id, "sender_id": user_id, "recipient_id": draft["friend_id"], "content": draft["content"]},
+        "sender_username": sender_name,
+    })
+    _spawn_background(send_fcm_to_user,
+        draft["friend_id"], title=sender_name, body=draft["content"],
+        data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message_id)},
+    )
+    return jsonify({"ok": True, "status": "sent"})
+
+
+@app.route("/message-drafts/<int:draft_id>/dismiss", methods=["POST"])
+@login_required
+def dismiss_message_draft(draft_id):
+    """User tapped Cancel -- nothing is ever sent for a dismissed draft."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "UPDATE message_drafts SET status = 'dismissed', resolved_at = now() "
         "WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING id",
         (draft_id, user_id),
     )
@@ -4308,6 +4962,49 @@ def list_friends():
             f["friends_since"] = f["friends_since"].isoformat()
 
     return jsonify(friends)
+
+
+@app.route("/friends/search", methods=["GET"])
+@login_required
+def search_extended_network():
+    """Friends-of-friends matching `q` by username -- the discovery half of
+    the Friends screen's search box (the direct-friends half is a client-
+    side filter over the already-loaded GET /friends list, no backend call
+    needed for that part). Two-hop join over the same bidirectional
+    friendships table GET /friends already uses: for each of the caller's
+    own friends, find THEIR friends who aren't the caller and aren't
+    already a direct friend of the caller. mutual_via names which of the
+    caller's own friends connects them (their nickname if the caller has
+    set one, matching Friend.displayName's own fallback) -- can be more
+    than one name if several of the caller's friends all know this person.
+
+    Matched on username only, never nickname -- a nickname is the caller's
+    own private label for a DIRECT friend (see Friend.displayName's doc
+    comment); the caller has no such label for someone two hops away."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT u.id, u.username, u.profile_picture_url, "
+        "array_agg(DISTINCT COALESCE(mf.nickname, mu.username)) AS mutual_via "
+        "FROM friendships f1 "
+        "JOIN friendships f2 ON f2.user_id = f1.friend_id "
+        "JOIN users u ON u.id = f2.friend_id "
+        "JOIN friendships mf ON mf.user_id = %(me)s AND mf.friend_id = f1.friend_id "
+        "JOIN users mu ON mu.id = f1.friend_id "
+        "WHERE f1.user_id = %(me)s "
+        "AND f2.friend_id != %(me)s "
+        "AND f2.friend_id NOT IN (SELECT friend_id FROM friendships WHERE user_id = %(me)s) "
+        "AND u.username ILIKE %(pattern)s "
+        "GROUP BY u.id, u.username, u.profile_picture_url "
+        "ORDER BY u.username LIMIT 20",
+        {"me": user_id, "pattern": f"%{q}%"},
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
 
 
 @app.route("/friends/<int:friend_id>/calls", methods=["GET"])
@@ -5544,7 +6241,47 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
     base += _commerce_safety_guardrail()
+    base += _agent_continuation_guardrail()
     return base + (f" {persona_context}" if persona_context else "")
+
+
+def _agent_continuation_guardrail() -> str:
+    """Always-on, same reasoning as _commerce_safety_guardrail above: a
+    real production conversation showed this failing twice in one
+    exchange. (1) The assistant asked "what date did the accident
+    happen?", the user replied with just a bare date, and the model
+    treated that terse reply as a brand-new standalone question -- the
+    retrieval block above (unfiltered, just "most recent N conversations")
+    happened to include other same-dated material (a receipt, a policy
+    upload) and the model answered a "what happened on this date" question
+    nobody asked, derailing an in-progress claim instead of continuing it.
+    (2) Asked afterward to show the exact drafted claim email, the model
+    had no access to the literal stored text (only its own prior summary
+    of it) and fabricated a plausible-looking one from scratch, complete
+    with placeholder text like "[insert policy number]" in place of the
+    real one it had actually used when drafting. Both are the same root
+    failure as the commerce hallucination above -- answering from a
+    plausible guess instead of admitting a gap -- just not commerce-
+    specific, so this must apply to every turn, not just one gated by an
+    intent regex.
+
+    For (2), telling the model to just decline wasn't enough on its own in
+    testing -- it kept fabricating anyway. get_latest_draft (a real tool,
+    see AGENT_TOOLS) gives it actual ground truth to call instead, which
+    is what this now points it at."""
+    return (
+        " If your own immediately preceding reply asked the user a specific question (a date, a "
+        "name, a missing detail for something you were drafting or filing), and their current "
+        "message looks like a short, direct answer to it, treat it as continuing that exact "
+        "flow and act on it accordingly -- do not treat it as a new standalone question, even if "
+        "the excerpts above happen to contain other material that is loosely related to the words "
+        "in their reply. You have no way to read back the literal, exact text of an email, "
+        "message, or claim you already drafted from memory -- only your own prior summary of it. "
+        "If asked to show, repeat, or confirm the exact content of something already drafted, call "
+        "the get_latest_draft tool and quote its real result -- never reconstruct or guess the "
+        "content yourself, and never use placeholder/bracket text like \"[insert policy number]\" in "
+        "anything you say, ever."
+    )
 
 
 def _commerce_safety_guardrail() -> str:
@@ -6150,6 +6887,47 @@ def chat_global():
     except Exception:
         commerce_context, action_card = "", None  # optional and additive, never affects this endpoint otherwise
 
+    # Spending-habit questions -- "where am I spending the most", "show my
+    # purchasing habits this month". Cheap (one indexed GROUP BY), so just
+    # gated on the intent regex, no flag needed.
+    finance_context = ""
+    if _FINANCE_INTENT_RE.search(prompt_lower):
+        month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_end = datetime.now(timezone.utc)
+        spending_rows = compute_monthly_spending_summary(cur, user_id, month_start, month_end)
+        if spending_rows:
+            lines = [f"Real spending data for {month_start.strftime('%B %Y')} so far, by category (highest first):"]
+            for r in spending_rows:
+                lines.append(f"- {r['category']}: Rs {r['total']:.2f} across {r['count']} transaction{'s' if r['count'] != 1 else ''}")
+            # Second breakdown, same data but grouped by which UPI app was
+            # used -- a different question ("which app do I pay through
+            # most") than category, so both are handed to the LLM rather
+            # than guessing which one the user meant from the wording alone.
+            method_rows = compute_monthly_payment_method_summary(cur, user_id, month_start, month_end)
+            if method_rows:
+                lines.append("\nSame period, by payment app instead:")
+                for r in method_rows:
+                    lines.append(f"- {r['payment_method']}: Rs {r['total']:.2f} across {r['count']} transaction{'s' if r['count'] != 1 else ''}")
+            # Individual transactions too, not just the aggregates above --
+            # needed any time the user wants specifics named (e.g. "send
+            # today's purchases to Kunal"), which a SUM-by-category row
+            # can't answer since it has no item field. Capped list, newest
+            # first; "today" is judged by the LLM from each timestamp.
+            recent_rows = compute_recent_transactions(cur, user_id, month_start, month_end)
+            if recent_rows:
+                lines.append("\nIndividual transactions this period, newest first (use these to name what was actually bought, not just totals):")
+                for r in recent_rows:
+                    what = r["item"] or r["payee"] or r["category"] or "Unspecified"
+                    when = r["created_at"].strftime("%Y-%m-%d %H:%M") if isinstance(r["created_at"], datetime) else str(r["created_at"])
+                    via = f" via {r['payee']}" if r["item"] and r["payee"] else ""
+                    lines.append(f"- {when}: {what}{via} -- Rs {float(r['amount']):.2f} ({r['category'] or 'Uncategorized'}, {r['payment_method'] or 'unknown app'})")
+            finance_context = "\n".join(lines)
+        else:
+            finance_context = (
+                "The user asked about their spending, but no transactions have been recorded this "
+                "month -- say so plainly rather than inventing numbers."
+            )
+
     if matched:
         cur.execute(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
@@ -6166,7 +6944,8 @@ def chat_global():
     conversations = cur.fetchall()
 
     if (not conversations and not ei_context and not personal_notes_context and not direct_messages_context
-            and not nearby_context and not commerce_context and not _AGENT_ACTION_INTENT_RE.search(prompt_lower)):
+            and not nearby_context and not commerce_context and not finance_context
+            and not _AGENT_ACTION_INTENT_RE.search(prompt_lower)):
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -6208,6 +6987,8 @@ def chat_global():
         transcripts_section = _prepend(transcripts_section, nearby_context)
     if commerce_context:
         transcripts_section = _prepend(transcripts_section, commerce_context)
+    if finance_context:
+        transcripts_section = _prepend(transcripts_section, finance_context)
     if not transcripts_section:
         transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
@@ -6220,7 +7001,7 @@ def chat_global():
     messages.append({"role": "user", "content": user_content})
 
     try:
-        reply, tool_action_card, created_task_this_turn = run_agent_tool_loop(cur, db, user_id, messages)
+        reply, tool_action_cards, created_task_this_turn = run_agent_tool_loop(cur, db, user_id, messages)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 500
         if status == 429:
@@ -6239,8 +7020,28 @@ def chat_global():
             "reply": "The assistant is taking too long to respond right now. Please try again in a moment."
         })
 
-    if tool_action_card:
-        action_card = tool_action_card
+    # A single request can trigger several staged actions at once (e.g.
+    # "log this expense AND message Kunal AND email the same update") --
+    # every one of them needs its own card, not just whichever ran last.
+    action_cards = ([action_card] if action_card else []) + tool_action_cards
+
+    # Deterministic backstop, not just a prompt instruction -- confirmed
+    # live that telling the model not to fabricate drafted content (and
+    # even giving it get_latest_draft, a real tool to fetch the ground
+    # truth) was NOT reliably enough; it kept composing a fake email from
+    # scratch anyway, with placeholder text standing in for details it
+    # didn't actually have. Every observed failure (skipping the real
+    # tool call and inventing one outright, or being asked to re-show
+    # already-drafted content and inventing a different version) shares
+    # one unmistakable tell: literal template placeholder brackets like
+    # "[insert policy number]". This can't fix the model's choice not to
+    # call a tool, but it reliably stops the fabricated text from ever
+    # reaching the user, regardless of why it happened.
+    if reply and _FABRICATED_PLACEHOLDER_RE.search(reply):
+        reply = (
+            "I don't have a reliable way to show exact drafted content here -- please review it "
+            "directly on the card, or tell me what you'd like changed and I'll redo it properly."
+        )
 
     if reply:
         # Store the clean question/reply, not the retrieval blob -- that
@@ -6264,7 +7065,7 @@ def chat_global():
         "reply": reply,
         "matched_speaker": matched["name"] if matched else None,
         "conversations_used": len(conversations),
-        "action_card": action_card,
+        "action_cards": action_cards,
     })
 
 
@@ -6524,6 +7325,216 @@ def swiggy_track_order():
 
 
 IMAGE_UPLOAD_PLACEHOLDER = "[Image uploaded]"
+PDF_UPLOAD_PLACEHOLDER = "[PDF document uploaded]"
+
+
+_VALID_COVERAGE_TYPES = {"own_damage", "third_party", "comprehensive"}
+
+
+def _build_vehicle_policy_dict(parsed):
+    """Shared shape for a POLICY extraction result -- used by both
+    chat_global_image's POLICY section (photo path) and
+    extract_vehicle_policy_pdf (PDF path) below, so the two sources
+    produce identical fields for PolicyConfirmSheet. coverage_type falls
+    back to 'comprehensive' when missing or not one of the three
+    recognized values, rather than failing the whole extraction over it."""
+    coverage_type = (parsed.get("coverage_type") or "").strip().lower()
+    if coverage_type not in _VALID_COVERAGE_TYPES:
+        coverage_type = "comprehensive"
+    return {
+        "insurer_name": str(parsed["insurer_name"]).strip(),
+        "policy_number": str(parsed["policy_number"]).strip(),
+        "vehicle_registration": (parsed.get("vehicle_registration") or "").strip() or None,
+        "insured_name": (parsed.get("insured_name") or "").strip() or None,
+        "issue_date": parsed.get("issue_date") or None,
+        "expiry_date": parsed.get("expiry_date") or None,
+        "sum_insured": float(parsed["sum_insured"]) if isinstance(parsed.get("sum_insured"), (int, float)) else None,
+        "coverage_type": coverage_type,
+        "claims_email": (parsed.get("claims_email") or "").strip() or None,
+    }
+
+
+_COVERAGE_TYPE_LABELS = {
+    "own_damage": "an Own Damage",
+    "third_party": "a Third Party",
+    "comprehensive": "a Comprehensive",
+}
+
+
+def _format_policy_summary(policy):
+    """Deterministic, server-built overview of an extracted vehicle
+    policy -- NOT left to the model's own prose. Confirmed live that
+    asking the model to conditionally write a rich summary only for
+    policy documents (vs. a generic one-liner for everything else, in
+    chat_global_image's shared vision prompt) wasn't reliable -- the
+    photo and PDF paths ended up sounding noticeably different from each
+    other, since each prompted for it independently and the photo path's
+    conditional branch didn't always get picked. One shared formatter
+    used by BOTH upload paths guarantees identical wording regardless of
+    source, and the closing line can never accidentally turn into a
+    yes/no question since it isn't generated at all."""
+    coverage_label = _COVERAGE_TYPE_LABELS.get(policy["coverage_type"], "a Comprehensive")
+    lines = [f"This is {coverage_label} motor insurance policy" + (
+        f" for vehicle {policy['vehicle_registration']}." if policy.get("vehicle_registration") else "."
+    )]
+    lines.append(f"Underwritten by {policy['insurer_name']} (policy number {policy['policy_number']}).")
+    if policy.get("issue_date") and policy.get("expiry_date"):
+        lines.append(f"Coverage runs {policy['issue_date']} to {policy['expiry_date']}.")
+    elif policy.get("expiry_date"):
+        lines.append(f"Coverage valid until {policy['expiry_date']}.")
+    if policy.get("sum_insured"):
+        lines.append(f"Sum insured (IDV): Rs {policy['sum_insured']:,.0f}.")
+    lines.append("You can ask me to file a claim for this anytime.")
+    return " ".join(lines)
+
+
+def _build_transaction_dict(parsed):
+    """Shared shape for a TRANSACTION extraction result -- used by both
+    chat_global_image (photo path) and the PDF upload path below,
+    mirroring _build_vehicle_policy_dict's role for POLICY."""
+    return {
+        "amount": float(parsed["amount"]),
+        "payee": (parsed.get("payee") or "").strip() or None,
+        "category": _normalize_category(parsed.get("category")),
+        "payment_method": _normalize_payment_method(parsed.get("payment_method")),
+        "item": (parsed.get("item") or "").strip() or None,
+    }
+
+
+def _build_content_extraction_instruction(subject, description):
+    """Shared EXTRACTED/SUMMARY/TRANSACTION/POLICY instruction -- used by
+    both chat_global_image (a photo, sent to a vision model) and the PDF
+    upload path below (already-extracted text, appended after this
+    instruction, sent to a plain text model) -- so a receipt, a vehicle
+    insurance policy, or neither is recognized and described identically
+    regardless of which form the user shared it in. The model decides
+    from the actual content every time; nothing upstream hardcodes which
+    of the three a given upload is. `subject` slots into the opening
+    sentence ('This image', 'This document'); `description` is the
+    user's own caption, or '' for an upload flow with no caption step
+    (e.g. the PDF path, which has none)."""
+    return (
+        f"{subject} was shared in a personal chat assistant. Extract ALL text and structured "
+        "information visible in it, thoroughly and literally (amounts, dates, merchant/sender names, "
+        "line items if it's a bill/receipt; the full text if it's a handwritten note) -- this will be "
+        "stored as searchable text, not shown directly to the user, so be exhaustive rather than "
+        "concise. EXCEPTION: for a table with many similar or repeated rows (e.g. a premium/fee "
+        "breakdown where most line items are zero or blank), describe the structure once and list "
+        "only the non-zero/meaningfully different rows -- never transcribe the same or a near-"
+        "identical line over and over. The user's own description: "
+        f"{description or '(none given)'}\n\n"
+        "Reply with exactly four labeled sections, nothing else, IN THIS ORDER -- SUMMARY/TRANSACTION/"
+        "POLICY first because they're short and functionally critical, EXTRACTED last because it's the "
+        "longest section: if you run low on room, it's fine for EXTRACTED to be cut short or incomplete, "
+        "but never skip or shorten SUMMARY/TRANSACTION/POLICY to make room for it.\n"
+        "SUMMARY: <a brief, natural 1-2 sentence acknowledgment of what this is, for a chat reply -- "
+        "don't repeat the extraction verbatim. If this turns out to be a vehicle insurance policy "
+        "document (see POLICY below), this text is replaced automatically with a proper overview, so "
+        "just keep this one brief either way.>\n"
+        "TRANSACTION: <if this is a payment receipt or confirmation of ANY kind -- a UPI app (GPay, PhonePe, "
+        "Paytm, or similar), a credit/debit card transaction alert, a net-banking or bank-transfer "
+        "confirmation, or similar -- a single-line JSON object {\"amount\": <number>, \"payee\": "
+        "\"<merchant or person paid>\", \"category\": \"<one or two words, e.g. Food, Travel, Shopping, "
+        "Bills, Entertainment>\", \"payment_method\": \"<the actual payment rail used, read literally from "
+        "the receipt, never guessed -- for UPI, the app name (Google Pay, PhonePe, Paytm, Amazon Pay, BHIM, "
+        "CRED); otherwise the rail plus issuer if shown, e.g. 'HDFC Credit Card', 'ICICI Debit Card', 'SBI "
+        "Net Banking', 'Axis Bank Transfer' -- preserve the bank's own capitalization (HDFC, ICICI, SBI are "
+        "acronyms, not words) rather than rewriting it. In India small everyday payments are usually UPI "
+        "while larger ones (insurance, big-ticket purchases, bills) are often credit card or net banking -- "
+        "read what's actually on the receipt rather than assuming either>\", \"item\": \"<a short 2-5 word "
+        "description of what was actually bought, e.g. 'Power bank', 'Grocery items' -- most payment "
+        "confirmations show no line items at all, so this is very often NOT on the receipt itself: use the "
+        "user's own description above when it names what they bought (e.g. they wrote 'bought a power bank "
+        "from blinkit' -> item is 'Power bank'), falling back to the receipt's line items if it has any, "
+        "and null only if neither source says what it was for>\"} -- amount and payee must be literally "
+        "visible on the receipt; if category isn't explicitly printed, infer the single best-fitting one "
+        "from the merchant name, any line items, and the item above. If this is NOT a payment "
+        "receipt/confirmation, or no amount is readable, reply with exactly: NONE>\n"
+        "POLICY: <if this is a vehicle (two-wheeler or four-wheeler) insurance policy document or "
+        "insurance card -- a single-line JSON object {\"insurer_name\": \"<the insurance company that "
+        "actually underwrites the policy, e.g. 'Tata AIG', 'ICICI Lombard' -- not a broker's name if a "
+        "broker is also shown>\", \"policy_number\": \"<exactly as printed>\", "
+        "\"vehicle_registration\": \"<the vehicle's registration number, e.g. 'KA01AB1234', or null if not "
+        "shown>\", \"insured_name\": \"<the policyholder's name, or null>\", \"issue_date\": \"<YYYY-MM-DD, "
+        "or null>\", \"expiry_date\": \"<YYYY-MM-DD, or null -- the actual coverage/validity period's end "
+        "date, not an administrative 'issued on' timestamp if the two differ>\", \"sum_insured\": <the "
+        "insured declared value/sum insured/IDV as a number, or null>, \"coverage_type\": \"<one of "
+        "'own_damage', 'third_party', or 'comprehensive' -- 'own_damage' if the document explicitly says "
+        "Own Damage/Standalone OD/OD only, 'third_party' if it explicitly says Third Party/Liability "
+        "Only/Act Policy, otherwise (a bundled/package policy, or unclear) 'comprehensive'>\", "
+        "\"claims_email\": \"<the INSURER's own literal support/claims email if printed -- prefer the "
+        "underwriting insurer's address over a broker's if both appear, or null if none is printed>\"} -- "
+        "insurer_name and policy_number must be literally visible; dates read exactly as printed, not "
+        "guessed. If this is NOT a vehicle insurance policy/card (e.g. it's a receipt, handled above, "
+        "or anything else), reply with exactly: NONE>\n"
+        "EXTRACTED: <the thorough, literal extraction described above>"
+    )
+
+
+_DEGENERATE_MIN_LINE_REPEATS = 8
+
+
+def _looks_degenerate(text):
+    """Detects a classic LLM repetition-loop failure -- confirmed live on
+    a real policy photo with a dense premium table: the vision model
+    repeated a single line dozens of times and never reached the later
+    SUMMARY/TRANSACTION/POLICY sections at all, so the raw EXTRACTED-
+    prefixed blob leaked straight into the user-facing reply. A cheap
+    line-frequency check catches this reliably; call_groq_vision's
+    frequency_penalty/max_tokens reduce how often it happens in the first
+    place, but aren't a guarantee, so this is the actual backstop."""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return False
+    counts = {}
+    for ln in lines:
+        counts[ln] = counts.get(ln, 0) + 1
+    return max(counts.values()) >= _DEGENERATE_MIN_LINE_REPEATS
+
+
+def _parse_content_extraction_reply(raw_text):
+    """Splits a raw EXTRACTED/SUMMARY/TRANSACTION/POLICY reply (produced
+    from _build_content_extraction_instruction, via vision for a photo or
+    a plain text call for PDF-extracted text) into (extracted_text,
+    reply, transaction, policy) -- shared by chat_global_image and the
+    PDF upload path so a receipt/policy/neither is recognized the same
+    way regardless of upload form. `reply` is overridden to a
+    deterministic summary when a policy is found (see
+    _format_policy_summary)."""
+    if _looks_degenerate(raw_text):
+        return (
+            "(extraction failed -- the model got stuck repeating itself on a dense table)",
+            "I had trouble reading that clearly -- it looked like a dense table and I got stuck on "
+            "part of it. Could you try again, maybe with a clearer photo, better lighting, or just "
+            "the page with the key details cropped in?",
+            None, None,
+        )
+
+    summary_match = re.search(r"SUMMARY:\s*(.*?)(?=\nTRANSACTION:|\Z)", raw_text, re.DOTALL)
+    transaction_match = re.search(r"TRANSACTION:\s*(.*?)(?=\nPOLICY:|\Z)", raw_text, re.DOTALL)
+    policy_match = re.search(r"POLICY:\s*(.*?)(?=\nEXTRACTED:|\Z)", raw_text, re.DOTALL)
+    extracted_match = re.search(r"EXTRACTED:\s*(.*)", raw_text, re.DOTALL)
+    extracted_text = (extracted_match.group(1) if extracted_match else raw_text).strip()
+    reply = (summary_match.group(1) if summary_match else raw_text).strip()
+
+    transaction = None
+    if transaction_match:
+        transaction_raw = transaction_match.group(1).strip()
+        if transaction_raw and transaction_raw.upper() != "NONE":
+            parsed = extract_json(transaction_raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("amount"), (int, float)):
+                transaction = _build_transaction_dict(parsed)
+
+    policy = None
+    if policy_match:
+        policy_raw = policy_match.group(1).strip()
+        if policy_raw and policy_raw.upper() != "NONE":
+            parsed = extract_json(policy_raw)
+            if isinstance(parsed, dict) and parsed.get("insurer_name") and parsed.get("policy_number"):
+                policy = _build_vehicle_policy_dict(parsed)
+                reply = _format_policy_summary(policy)
+
+    return extracted_text, reply, transaction, policy
 
 
 @app.route("/chat/global/image", methods=["POST"])
@@ -6560,18 +7571,7 @@ def chat_global_image():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    instruction = (
-        "This image was shared in a personal chat assistant. Extract ALL text and structured "
-        "information visible in it, thoroughly and literally (amounts, dates, merchant/sender names, "
-        "line items if it's a bill/receipt; the full text if it's a handwritten note) -- this will be "
-        "stored as searchable text, not shown directly to the user, so be exhaustive rather than "
-        "concise. The user's own description of the image: "
-        f"{description or '(none given)'}\n\n"
-        "Reply with exactly two labeled sections, nothing else:\n"
-        "EXTRACTED: <the thorough, literal extraction described above>\n"
-        "SUMMARY: <a brief, natural 1-2 sentence acknowledgment of what this image is, for a chat reply "
-        "-- don't repeat the extraction verbatim>"
-    )
+    instruction = _build_content_extraction_instruction("This image", description)
     try:
         vision_reply = call_groq_vision(image_bytes, mimetype, instruction)
     except requests.HTTPError as e:
@@ -6584,11 +7584,7 @@ def chat_global_image():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
 
-    extracted_match = re.search(r"EXTRACTED:\s*(.*?)(?=\nSUMMARY:|\Z)", vision_reply, re.DOTALL)
-    summary_match = re.search(r"SUMMARY:\s*(.*)", vision_reply, re.DOTALL)
-    extracted_text = (extracted_match.group(1) if extracted_match else vision_reply).strip()
-    reply = (summary_match.group(1) if summary_match else vision_reply).strip()
-
+    extracted_text, reply, transaction, policy = _parse_content_extraction_reply(vision_reply)
     if not extracted_text:
         return jsonify({"error": "Could not extract any text from that image"}), 422
 
@@ -6628,6 +7624,227 @@ def chat_global_image():
         "conversation_id": conversation_id,
         "title": title,
         "category": category,
+        "transaction": transaction,
+        "policy": policy,
+    })
+
+
+@app.route("/transactions", methods=["POST"])
+@login_required
+def save_transaction():
+    """Confirm-card save step for a transaction extracted by chat_global_image
+    above -- the user may have edited amount/payee/category before this is
+    called, so this never re-derives them from the image itself, only
+    persists whatever the client sends. conversation_id links back to the
+    chat message the receipt was shared as, but is optional (ON DELETE SET
+    NULL in schema.sql) since a transaction should outlive its source
+    conversation being deleted.
+
+    Dedupes against the same (user, amount, payee) saved in the last 10
+    minutes -- catches the real accidental-duplicate case (the same receipt
+    shared twice, or a double-tapped Save) without blocking a genuine
+    second purchase from the same payee later the same day. Returns the
+    EXISTING row with duplicate:true rather than erroring, so the client's
+    confirm-card flow doesn't need special-case handling -- it already
+    treats a 200 as "saved"."""
+    data = request.get_json(silent=True) or {}
+    amount = data.get("amount")
+    if not isinstance(amount, (int, float)):
+        return jsonify({"error": "amount is required and must be a number"}), 400
+
+    conversation_id = data.get("conversation_id")
+    payee = (data.get("payee") or "").strip() or None
+    category = _normalize_category(data.get("category"))
+    payment_method = _normalize_payment_method(data.get("payment_method"))
+    item = (data.get("item") or "").strip() or None
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    cur.execute(
+        "SELECT id, amount, payee, category, payment_method, item, created_at FROM transactions "
+        "WHERE user_id = %s AND amount = %s AND payee IS NOT DISTINCT FROM %s "
+        "AND created_at >= now() - INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1",
+        (user_id, float(amount), payee),
+    )
+    existing = cur.fetchone()
+    if existing:
+        return jsonify({
+            "id": existing["id"],
+            "amount": float(existing["amount"]),
+            "payee": existing["payee"],
+            "category": existing["category"],
+            "payment_method": existing["payment_method"],
+            "item": existing["item"],
+            "created_at": existing["created_at"].isoformat(),
+            "duplicate": True,
+        })
+
+    cur.execute(
+        "INSERT INTO transactions (user_id, conversation_id, amount, payee, category, payment_method, item) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at",
+        (user_id, conversation_id, float(amount), payee, category, payment_method, item),
+    )
+    row = cur.fetchone()
+    db.commit()
+    return jsonify({
+        "id": row["id"],
+        "amount": float(amount),
+        "payee": payee,
+        "category": category,
+        "payment_method": payment_method,
+        "item": item,
+        "created_at": row["created_at"].isoformat(),
+        "duplicate": False,
+    })
+
+
+@app.route("/vehicle-policies", methods=["POST"])
+@login_required
+def save_vehicle_policy():
+    """Confirm-card save step for a policy extracted by chat_global_image's
+    POLICY section (or extract_vehicle_policy_pdf below) -- same shape as
+    save_transaction, but the "duplicate" question here is really "is this
+    a renewal of a policy already on file", not "was this exact receipt
+    shared twice". A renewed policy keeps the same vehicle but gets a NEW
+    policy number, so without this, re-uploading a renewal would leave two
+    rows for one vehicle and make file_vehicle_insurance_claim's lookup
+    ambiguous ("found more than one matching policy") for a vehicle that
+    only ever has one *active* policy of that coverage type. Matches on
+    (vehicle_registration, coverage_type) first (the renewal case -- a
+    vehicle can legitimately have two active rows at once, an own_damage
+    and a third_party policy, often from different insurers, so the match
+    key includes coverage_type to avoid one renewal clobbering the other),
+    falling back to an exact policy_number match (re-uploading the same
+    document) -- either way, REPLACES the existing row in place rather
+    than inserting a second one. claims_email is always required server-
+    side: the PolicyConfirmSheet pre-fills it when the extraction found one
+    printed on the document, but always leaves it editable and never saves
+    a blank one, since a missing claims_email means
+    file_vehicle_insurance_claim has nowhere to send a claim."""
+    data = request.get_json(silent=True) or {}
+    insurer_name = (data.get("insurer_name") or "").strip()
+    policy_number = (data.get("policy_number") or "").strip()
+    claims_email = (data.get("claims_email") or "").strip()
+    if not insurer_name or not policy_number:
+        return jsonify({"error": "insurer_name and policy_number are required"}), 400
+    if not claims_email:
+        return jsonify({"error": "claims_email is required"}), 400
+
+    label = (data.get("label") or "").strip() or None
+    vehicle_registration = (data.get("vehicle_registration") or "").strip() or None
+    insured_name = (data.get("insured_name") or "").strip() or None
+    issue_date = data.get("issue_date") or None
+    expiry_date = data.get("expiry_date") or None
+    sum_insured = data.get("sum_insured") if isinstance(data.get("sum_insured"), (int, float)) else None
+    coverage_type = (data.get("coverage_type") or "").strip().lower()
+    if coverage_type not in _VALID_COVERAGE_TYPES:
+        coverage_type = "comprehensive"
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    # Matched on (vehicle_registration, coverage_type), not vehicle_registration
+    # alone -- a vehicle can legitimately carry two active rows at once (a
+    # split own_damage + third_party policy, often from different insurers),
+    # so renewing just the OD leg must not touch the TP row and vice versa.
+    existing = None
+    if vehicle_registration:
+        cur.execute(
+            "SELECT id FROM vehicle_insurance_policies WHERE user_id = %s AND "
+            "vehicle_registration = %s AND coverage_type = %s",
+            (user_id, vehicle_registration, coverage_type),
+        )
+        existing = cur.fetchone()
+    if not existing:
+        cur.execute(
+            "SELECT id FROM vehicle_insurance_policies WHERE user_id = %s AND policy_number = %s",
+            (user_id, policy_number),
+        )
+        existing = cur.fetchone()
+
+    if existing:
+        cur.execute(
+            "UPDATE vehicle_insurance_policies SET label = %s, insurer_name = %s, policy_number = %s, "
+            "vehicle_registration = %s, insured_name = %s, issue_date = %s, expiry_date = %s, "
+            "sum_insured = %s, claims_email = %s, coverage_type = %s WHERE id = %s RETURNING id, created_at",
+            (label, insurer_name, policy_number, vehicle_registration, insured_name,
+             issue_date, expiry_date, sum_insured, claims_email, coverage_type, existing["id"]),
+        )
+        row = cur.fetchone()
+        db.commit()
+        return jsonify({"id": row["id"], "created_at": row["created_at"].isoformat(), "replaced": True})
+
+    cur.execute(
+        "INSERT INTO vehicle_insurance_policies "
+        "(user_id, label, insurer_name, policy_number, vehicle_registration, insured_name, "
+        "issue_date, expiry_date, sum_insured, claims_email, coverage_type) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at",
+        (user_id, label, insurer_name, policy_number, vehicle_registration, insured_name,
+         issue_date, expiry_date, sum_insured, claims_email, coverage_type),
+    )
+    row = cur.fetchone()
+    db.commit()
+    return jsonify({"id": row["id"], "created_at": row["created_at"].isoformat(), "replaced": False})
+
+
+@app.route("/vehicle-policies/extract-pdf", methods=["POST"])
+@login_required
+def extract_vehicle_policy_pdf():
+    """PDF counterpart to chat_global_image -- an insurer-issued policy
+    document is almost always a text-based PDF (unlike a photo of a
+    physical card, which genuinely needs vision OCR), so this extracts
+    text via _extract_document_text (the same helper the Cognitive
+    Sharing attachment-summary feature already uses for PDF attachments)
+    and runs one plain-text LLM call through the exact same
+    _build_content_extraction_instruction/_parse_content_extraction_reply
+    chat_global_image uses for photos. Despite the route's name (kept
+    as-is -- the Flutter client already calls it, and renaming the URL
+    buys nothing), this is NOT policy-only: the model decides from the
+    extracted text whether it's a receipt, a vehicle insurance policy, or
+    neither, same as a photo. A PDF that's neither still succeeds (stored
+    as a normal searchable conversation, same as a photo of a random
+    note) -- it just carries neither a transaction nor a policy."""
+    if "document" not in request.files:
+        return jsonify({"error": "No PDF file uploaded"}), 400
+    doc_file = request.files["document"]
+    content_length = request.content_length or 0
+    if content_length > IMAGE_MAX_UPLOAD_BYTES:
+        return jsonify({"error": "File is too large (max 10MB)"}), 400
+
+    file_bytes = doc_file.read()
+    text = _extract_document_text(file_bytes, "application/pdf")
+    if not text or not text.strip():
+        return jsonify({"error": "Could not extract any text from that PDF"}), 422
+
+    instruction = (
+        _build_content_extraction_instruction("This document, extracted from a PDF a user shared,", "")
+        + f"\n\n---\n{text[:20000]}\n---"
+    )
+    raw_reply = call_llm([{"role": "user", "content": instruction}])
+    extracted_text, reply, transaction, policy = _parse_content_extraction_reply(raw_reply)
+    if not extracted_text:
+        return jsonify({"error": "Could not extract any text from that PDF"}), 422
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    category = get_user_personalization(cur, user_id)
+    title = generate_conversation_title(extracted_text)
+    cur.execute(
+        "INSERT INTO conversations (user_id, title, raw_transcript, category) "
+        "VALUES (%s, %s, %s, %s) RETURNING id",
+        (user_id, title, extracted_text, category),
+    )
+    conversation_id = cur.fetchone()["id"]
+    append_chat_messages(cur, user_id, None, PDF_UPLOAD_PLACEHOLDER, reply)
+    db.commit()
+
+    return jsonify({
+        "reply": reply, "conversation_id": conversation_id, "title": title, "category": category,
+        "transaction": transaction, "policy": policy,
     })
 
 

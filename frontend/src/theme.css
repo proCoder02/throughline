@@ -29,12 +29,19 @@
   --wa-text-soft: #a0a2a7;
   --wa-rail-icon: #96989d;
 
-  /* -- color: brand -- */
-  --wa-accent: #1FC8B4;
-  --wa-accent-dark: #16A192;
-  --wa-accent-solid: #128176;
-  --wa-accent-solid-hover: #107066;
+  /* -- color: brand -- matches the Flutter app's AppColors.accent/
+     accentDark (lib/theme.dart) so the web app reads as the same product,
+     not a differently-branded client. */
+  --wa-accent: #E8A565;
+  --wa-accent-dark: #D98E4A;
+  --wa-accent-solid: #D98E4A;
+  --wa-accent-solid-hover: #B06B2E;
   --wa-rail-icon-active: var(--wa-accent);
+
+  /* AppColors.dmGradient (dark) -- the warm-wallpaper background the
+     Flutter client's drawer and main-tab screens use. */
+  --wa-drawer-grad-1: #1A1410;
+  --wa-drawer-grad-2: #2B1B12;
 
   /* -- color: status -- */
   --wa-danger: #da373c;
@@ -65,10 +72,14 @@
   --wa-text-soft: #5c5e66;
   --wa-rail-icon: #4e5058;
 
-  --wa-accent: #0F9C8C;
-  --wa-accent-dark: #0C7E72;
-  --wa-accent-solid: #0e816f;
-  --wa-accent-solid-hover: #0c6e5f;
+  --wa-accent: #B06B2E;
+  --wa-accent-dark: #8A5423;
+  --wa-accent-solid: #D98E4A;
+  --wa-accent-solid-hover: #B06B2E;
+
+  /* AppColors.dmGradient (light) -- see the dark block's identical comment. */
+  --wa-drawer-grad-1: #FDF8F1;
+  --wa-drawer-grad-2: #F3E6D3;
 
   --wa-danger: #da373c;
   --wa-danger-solid-hover: #c22f34;
@@ -131,6 +142,10 @@
   --duration-slow: 240ms;
   --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
   --ease-out: cubic-bezier(0, 0, 0.2, 1);
+
+  /* Matches the Flutter app's appHeadlineFont (lib/theme.dart) -- used for
+     the same spots it uses it for: screen titles/headlines, not body text. */
+  --font-display: "Archivo Black", -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
 /* ============================================================
@@ -288,7 +303,7 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
   padding: var(--space-3) var(--space-4); display: flex; align-items: center; justify-content: space-between;
   background: var(--wa-bg-app);
 }
-.list-header h1 { font-size: var(--text-2xl); font-weight: 600; margin: 0; }
+.list-header h1 { font-family: var(--font-display); font-size: var(--text-2xl); font-weight: 900; letter-spacing: -0.01em; margin: 0; }
 .list-header button { color: var(--wa-rail-icon); width: 36px; height: 36px; border-radius: var(--radius-round); display: flex; align-items: center; justify-content: center; }
 .list-header button:hover { background: var(--wa-hover); }
 .list-header svg { width: 20px; height: 20px; }
@@ -485,6 +500,180 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
 .action-card-progress { height: 6px; border-radius: var(--radius-xs); background: var(--wa-hover); margin-top: var(--space-2); overflow: hidden; }
 .action-card-progress-fill { height: 100%; background: var(--wa-accent); transition: width 0.4s var(--ease-standard); }
 
+/* Phone-only side drawer -- matches the Flutter client's _AppDrawer
+   (home_shell.dart): warm-gradient surface, Home/Chats/Tasks/Profiles/
+   Friends/Settings + a Recent Conversations list below. Desktop never
+   renders this (see App.jsx) -- IconRail is untouched there. */
+.app-drawer-overlay {
+  position: fixed; inset: 0; z-index: 90; background: rgba(0,0,0,0.5);
+  opacity: 0; pointer-events: none; transition: opacity var(--duration-base) var(--ease-standard);
+}
+.app-drawer-overlay.open { opacity: 1; pointer-events: auto; }
+.app-drawer {
+  position: fixed; top: 0; bottom: 0; left: 0; z-index: 91; width: 300px; max-width: 85vw;
+  transform: translateX(-100%); transition: transform var(--duration-slow) var(--ease-standard);
+  background: linear-gradient(135deg, var(--wa-drawer-grad-1), var(--wa-drawer-grad-2) 55%, var(--wa-drawer-grad-1));
+  padding: calc(var(--space-4) + env(safe-area-inset-top)) 0 calc(var(--space-4) + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; overflow-y: auto; box-shadow: var(--shadow-xl);
+}
+.app-drawer.open { transform: translateX(0); }
+.app-drawer-close {
+  align-self: flex-end; margin: 0 var(--space-3) var(--space-2); width: 36px; height: 36px;
+  border-radius: var(--radius-round); display: flex; align-items: center; justify-content: center;
+  color: var(--wa-text-soft); flex-shrink: 0;
+}
+.app-drawer-close:hover { background: var(--wa-hover); }
+.app-drawer-items { display: flex; flex-direction: column; padding: 0 var(--space-2); }
+.app-drawer-item {
+  position: relative; display: flex; align-items: center; gap: var(--space-4);
+  padding: 12px var(--space-4); border-radius: var(--radius-lg); font-size: var(--text-md);
+  font-weight: 500; color: var(--wa-text);
+}
+.app-drawer-item svg { color: var(--wa-text-soft); }
+.app-drawer-item.active { background: var(--wa-accent-tint, color-mix(in srgb, var(--wa-accent) 16%, transparent)); color: var(--wa-accent-dark); font-weight: 700; }
+.app-drawer-item.active svg { color: var(--wa-accent-dark); }
+.app-drawer-badge {
+  margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px; border-radius: var(--radius-pill);
+  background: var(--wa-accent-dark); color: #fff; font-size: var(--text-2xs); font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+.app-drawer-section-title {
+  display: flex; align-items: center; gap: var(--space-2); margin: var(--space-5) var(--space-4) var(--space-2);
+  font-size: var(--text-xs); font-weight: 700; color: var(--wa-text-soft);
+}
+.app-drawer-section-title svg { width: 14px; height: 14px; }
+.app-drawer-recent { display: flex; flex-direction: column; padding: 0 var(--space-2); }
+.app-drawer-recent-item {
+  display: flex; align-items: center; gap: var(--space-3); padding: 9px var(--space-4);
+  border-radius: var(--radius-lg); font-size: var(--text-sm); color: var(--wa-text); text-align: left;
+}
+.app-drawer-recent-item:hover { background: var(--wa-hover); }
+.app-drawer-recent-item svg { width: 16px; height: 16px; color: var(--wa-text-soft); flex-shrink: 0; }
+.app-drawer-recent-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Phone-only top app bar -- every screen gets the same hamburger-opens-
+   drawer pattern the Flutter client's AppBars use (see each *_screen.dart's
+   onOpenDrawer). Hidden whenever a list screen has swapped to its detail/
+   thread view (body.has-active), since that view already has its own
+   back-button header -- same single-app-bar-at-a-time model as Flutter's
+   push navigation. */
+.phone-topbar {
+  display: none;
+  align-items: center; gap: var(--space-2); padding: 10px var(--space-3);
+  padding-top: calc(10px + env(safe-area-inset-top));
+  background: var(--wa-panel); border-bottom: 1px solid var(--wa-border); flex-shrink: 0;
+}
+.phone-topbar button {
+  width: 40px; height: 40px; border-radius: var(--radius-round); display: flex;
+  align-items: center; justify-content: center; color: var(--wa-text); flex-shrink: 0;
+}
+.phone-topbar button:hover { background: var(--wa-hover); }
+.phone-topbar-title { font-family: var(--font-display); font-weight: 900; font-size: var(--text-xl); letter-spacing: -0.01em; }
+
+/* Phone-only Home screen -- see HomeSection.jsx. Same warm-gradient
+   wallpaper as the drawer/every Flutter main-tab screen, and the same
+   component set: greeting, insight card, Your World teaser, Quick Actions,
+   Reminders + Recent Activity, Weekly Insight, and the bottom Ask bar. */
+.home-section {
+  flex: 1; overflow-y: auto; padding: var(--space-5) var(--space-4) var(--space-4);
+  background: linear-gradient(135deg, var(--wa-drawer-grad-1), var(--wa-drawer-grad-2) 55%, var(--wa-drawer-grad-1));
+  display: flex; flex-direction: column;
+}
+.home-greeting-title { font-family: var(--font-display); font-weight: 900; font-size: 20px; letter-spacing: -0.01em; margin-bottom: 2px; }
+.home-card {
+  background: var(--wa-panel); border: 1px solid var(--wa-border); border-radius: var(--radius-xl);
+  padding: var(--space-4); margin-top: var(--space-4); text-align: left; width: 100%;
+}
+.home-insight-card { border-color: color-mix(in srgb, var(--wa-accent) 35%, transparent); position: relative; padding-left: 17px; overflow: hidden; }
+.home-insight-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--wa-accent); }
+.home-insight-badge {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px 4px 7px; border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--wa-accent) 14%, transparent); border: 1px solid color-mix(in srgb, var(--wa-accent) 35%, transparent);
+  color: var(--wa-accent-dark); font-size: 10px; font-weight: 800; letter-spacing: 0.5px;
+}
+.home-rainbow-text {
+  background: linear-gradient(90deg, #FF3B30, #FF9500, #FFCC00, #34C759, #32ADE6, #5E5CE6, #AF52DE);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.home-insight-headline { margin-top: 10px; font-size: 19px; font-weight: 800; line-height: 1.25; }
+.home-insight-body { margin-top: 5px; font-size: 12.5px; color: var(--wa-text-soft); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+.home-world-teaser { display: flex; align-items: center; gap: 12px; text-align: left; }
+.home-world-avatars { position: relative; height: 32px; flex-shrink: 0; }
+.home-world-avatar {
+  position: absolute; top: 0; width: 32px; height: 32px; border-radius: var(--radius-round);
+  background: color-mix(in srgb, var(--wa-accent) 20%, var(--wa-panel)); color: var(--wa-accent);
+  display: flex; align-items: center; justify-content: center; border: 2px solid var(--wa-panel);
+}
+.home-world-avatar svg { width: 17px; height: 17px; }
+.home-world-avatar-extra { font-size: 10px; font-weight: 700; color: var(--wa-text-soft); }
+
+.home-quick-actions { display: flex; gap: 10px; overflow-x: auto; margin-top: 10px; padding-bottom: 2px; }
+.home-quick-tile {
+  flex-shrink: 0; width: 92px; padding: 10px; border-radius: var(--radius-xl);
+  background: var(--wa-panel); border: 1px solid var(--wa-border); text-align: left;
+}
+.home-quick-tile-icon {
+  width: 32px; height: 32px; border-radius: 9px; background: var(--wa-hover);
+  display: flex; align-items: center; justify-content: center; margin-bottom: 6px;
+}
+.home-quick-tile-icon svg { width: 17px; height: 17px; }
+.home-quick-tile-label { display: block; font-size: 12px; font-weight: 700; }
+.home-quick-tile-sub { display: block; font-size: 9.5px; color: var(--wa-text-soft); margin-top: 1px; }
+
+.home-pair-row { display: flex; gap: 12px; margin-top: var(--space-4); align-items: flex-start; }
+.home-reminder-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; cursor: pointer; }
+.home-reminder-row input[type="checkbox"] { margin-top: 2px; accent-color: var(--wa-accent); flex-shrink: 0; }
+.home-reminder-desc { display: block; font-size: 12.5px; font-weight: 600; }
+.home-reminder-due { display: block; font-size: 10.5px; color: var(--wa-text-soft); margin-top: 1px; }
+
+.home-activity-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 0; text-align: left; }
+.home-activity-title { display: block; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-activity-meta { display: block; font-size: 10px; color: var(--wa-text-soft); margin-top: 1px; }
+
+.home-ask-bar {
+  display: flex; align-items: center; gap: 6px; margin-top: var(--space-4);
+  padding: 6px 6px 6px 14px; border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--wa-panel) 70%, transparent); border: 1px solid var(--wa-border);
+  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); cursor: pointer;
+}
+.home-ask-bar-icon { display: flex; color: var(--wa-text-soft); }
+.home-ask-bar-text { flex: 1; font-size: 13px; color: var(--wa-text-soft); }
+.home-ask-bar-send {
+  width: 34px; height: 34px; border-radius: var(--radius-round); background: var(--wa-accent-solid);
+  color: #fff; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.home-ask-bar-send svg { width: 16px; height: 16px; }
+
+/* Attach menu -- matches the Flutter client's _showAttachMenu bottom sheet
+   exactly (rounded card, two centered icon tiles with a colored circle
+   behind each icon, label below) rather than a web-native dropdown, per
+   explicit instruction to keep the phone layout the same as the app. */
+.attach-menu-overlay {
+  position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.55);
+  display: flex; align-items: flex-end; justify-content: center; padding: var(--space-3);
+}
+@media (min-width: 640px) {
+  .attach-menu-overlay { align-items: center; }
+}
+.attach-menu-sheet {
+  width: 100%; max-width: 420px; background: var(--wa-panel); border: 1px solid var(--wa-border);
+  border-radius: var(--radius-2xl); padding: var(--space-5) var(--space-4);
+  padding-bottom: calc(var(--space-5) + env(safe-area-inset-bottom));
+  display: flex; justify-content: space-evenly; animation: cardIn var(--duration-base) var(--ease-out);
+}
+.attach-tile {
+  display: flex; flex-direction: column; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-3); border-radius: var(--radius-xl);
+}
+.attach-tile:hover { background: var(--wa-hover); }
+.attach-tile-icon {
+  width: 56px; height: 56px; border-radius: var(--radius-round);
+  display: flex; align-items: center; justify-content: center;
+}
+.attach-tile-icon svg { width: 26px; height: 26px; }
+.attach-tile-label { font-size: 12.5px; color: var(--wa-text); }
+
 .composer {
   display: flex; align-items: flex-end; gap: var(--space-2); padding: var(--space-3) var(--space-4);
   background: var(--wa-bg-app); flex-shrink: 0;
@@ -594,7 +783,7 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
 .detail-card:nth-of-type(3) { animation-delay: 80ms; }
 .detail-card:nth-of-type(4) { animation-delay: 120ms; }
 .detail-card:nth-of-type(n+5) { animation-delay: 160ms; }
-.detail-title { font-size: var(--text-lg); font-weight: 600; margin: 0 0 6px; }
+.detail-title { font-family: var(--font-display); font-weight: 900; letter-spacing: -0.01em; font-size: var(--text-lg); margin: 0 0 6px; }
 .detail-meta { font-size: var(--text-sm); color: var(--wa-text-soft); margin-bottom: var(--space-1); }
 .mood-compiled { text-align: center; padding: var(--space-6) 0 var(--space-3); }
 .mood-compiled-emoji { font-size: var(--text-display); line-height: 1; margin-bottom: var(--space-2); }
@@ -739,7 +928,7 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
 /* ---------- Auth screen ---------- */
 .auth-screen { height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--wa-bg-app); }
 .auth-card { background: var(--wa-panel); border-radius: var(--radius-lg); padding: var(--space-8); width: 360px; box-shadow: var(--shadow-sm); }
-.auth-card h1 { font-size: var(--text-3xl); margin: 0 0 4px; color: var(--wa-accent-dark); }
+.auth-card h1 { font-family: var(--font-display); font-weight: 900; letter-spacing: -0.01em; font-size: var(--text-3xl); margin: 0 0 4px; color: var(--wa-accent-dark); }
 .auth-card p.hint { margin-bottom: var(--space-5); }
 .auth-error { color: var(--wa-danger); font-size: var(--text-sm); min-height: 16px; margin-top: 10px; }
 .auth-switch { text-align: center; margin-top: 14px; font-size: var(--text-sm); color: var(--wa-accent-dark); }
@@ -828,6 +1017,13 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
   body.has-active .chat-panel { display: flex; }
   body.has-active .detail-view { display: block; }
   .back-btn { display: flex; }
+
+  /* Phone-only app bar (hamburger -> AppDrawer, see App.jsx) -- hidden once
+     a list screen has swapped to its own detail/thread view, which already
+     has its own back-button header (ChatThread/FriendsSection's detail
+     pane etc.), matching Flutter's one-app-bar-per-screen push navigation. */
+  .phone-topbar { display: flex; }
+  body.has-active .phone-topbar { display: none; }
 
   /* Icon rail becomes a bottom tab bar (native mobile nav convention)
      instead of staying a vertical sidebar pinned to the left edge, which

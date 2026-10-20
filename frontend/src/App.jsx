@@ -4,14 +4,22 @@ import { useAuth } from './hooks/useAuth.js';
 import { useNotifications } from './hooks/useNotifications.js';
 import { useCall } from './hooks/useCall.js';
 import { useTheme } from './hooks/useTheme.js';
+import { useIsPhone } from './hooks/useIsPhone.js';
 import { apiJson } from './api.js';
 import { showToast } from './lib/notify.js';
 import AuthScreen from './components/AuthScreen.jsx';
 import PersonaOnboarding from './components/PersonaOnboarding.jsx';
 import CallOverlay from './components/CallOverlay.jsx';
 import NotificationHost from './components/NotificationHost.jsx';
+import AppDrawer from './components/AppDrawer.jsx';
 import { startRingtone, stopRingtone, unlockAudio } from './ringtone.js';
 import IconRail from './components/IconRail.jsx';
+import { MenuIcon } from './icons.jsx';
+
+const SECTION_TITLES = {
+  home: 'Home', chats: 'Chats', tasks: 'Tasks', profiles: 'Profiles',
+  friends: 'Friends', settings: 'Settings', os: 'Throughline',
+};
 
 /// Root layout route (see router.jsx) -- rendered once and never unmounted
 /// by navigation between sections, which is exactly what auth/notify/call
@@ -26,6 +34,8 @@ export default function App() {
   const { theme, toggleTheme } = useTheme();
   const location = useLocation();
   const navigate = useNavigate();
+  const isPhone = useIsPhone();
+  const [drawerOpen, setDrawerOpen] = useState(false);
   // Owned here (not per-section) so the socket survives switching tabs --
   // a badge from a section you're not currently viewing should still count.
   const notify = useNotifications(!!auth.user);
@@ -35,6 +45,11 @@ export default function App() {
   // Set by Tasks/Profiles "view source conversation" links, consumed once
   // by ChatsSection then cleared -- see openConversationInChats below.
   const [pendingConversationId, setPendingConversationId] = useState(null);
+  // Set by Home's Ask bar/Quick Actions (see HomeSection.jsx), consumed once
+  // by ChatsSection to open its global "Ask" thread immediately on arrival --
+  // same open-once-then-clear shape as pendingConversationId above, mirrors
+  // the Flutter Home screen's _openChat() opening the chat in place.
+  const [pendingOpenGlobalChat, setPendingOpenGlobalChat] = useState(false);
   // null = not checked yet, true/false once checked. Gates the app shell
   // behind a one-time persona form for any account that hasn't submitted
   // one -- covers brand-new signups and pre-existing accounts alike.
@@ -91,6 +106,11 @@ export default function App() {
     navigate('/app/chats');
   };
 
+  const openGlobalChatInChats = () => {
+    setPendingOpenGlobalChat(true);
+    navigate('/app/chats');
+  };
+
   const acceptIncomingCall = async () => {
     const incoming = notify.incomingCall;
     notify.clearIncomingCall();
@@ -110,17 +130,39 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      {/* The "os" screen renders its own full sidebar (see os/OsApp.jsx) --
-          showing IconRail alongside it would double up navigation. */}
-      {section !== 'os' && (
-        <IconRail
-          active={section}
-          onSelect={(s) => navigate('/app/' + s)}
-          username={auth.user.username}
-          profilePictureUrl={auth.user.profile_picture_url}
-          badges={{ tasks: notify.taskCount, chats: notify.unreadChatIds.size }}
-          online={notify.connected}
-        />
+      {/* Phone: hamburger-opens-drawer nav matching the Flutter client's
+          HomeShell exactly (bottom nav retired there in favor of _AppDrawer
+          -- see home_shell.dart's own comment on _showBottomNav). Desktop:
+          IconRail, completely unchanged -- the "os" screen renders its own
+          full sidebar there (see os/OsApp.jsx), so IconRail stays hidden
+          for it same as before. */}
+      {isPhone ? (
+        <>
+          <div className="phone-topbar">
+            <button onClick={() => setDrawerOpen(true)} aria-label="Open menu" aria-haspopup="true">
+              <MenuIcon />
+            </button>
+            <span className="phone-topbar-title">{SECTION_TITLES[section] || 'Throughline'}</span>
+          </div>
+          <AppDrawer
+            open={drawerOpen}
+            onClose={() => setDrawerOpen(false)}
+            active={section}
+            notify={notify}
+            onOpenConversation={openConversationInChats}
+          />
+        </>
+      ) : (
+        section !== 'os' && (
+          <IconRail
+            active={section}
+            onSelect={(s) => navigate('/app/' + s)}
+            username={auth.user.username}
+            profilePictureUrl={auth.user.profile_picture_url}
+            badges={{ tasks: notify.taskCount, chats: notify.unreadChatIds.size }}
+            online={notify.connected}
+          />
+        )
       )}
       <Outlet
         context={{
@@ -128,6 +170,9 @@ export default function App() {
           pendingConversationId,
           openConversationInChats,
           consumePendingConversationId: () => setPendingConversationId(null),
+          pendingOpenGlobalChat,
+          openGlobalChatInChats,
+          consumePendingOpenGlobalChat: () => setPendingOpenGlobalChat(false),
         }}
       />
       <CallOverlay

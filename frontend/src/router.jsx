@@ -1,7 +1,9 @@
-import { lazy, Suspense } from 'react';
-import { createBrowserRouter, Navigate, useOutletContext } from 'react-router-dom';
+import { lazy, Suspense, useEffect } from 'react';
+import { createBrowserRouter, useNavigate, useOutletContext } from 'react-router-dom';
 import App from './App.jsx';
 import ChatsSection from './components/ChatsSection.jsx';
+import HomeSection from './components/HomeSection.jsx';
+import { PHONE_BREAKPOINT_PX } from './hooks/useIsPhone.js';
 
 // Phase 1 of the frontend rewrite (see the approved plan): map every route
 // 1:1 to today's five sections with zero visual/behavioral change. Route
@@ -52,12 +54,17 @@ const OsApp = lazy(() => import('./os/OsApp.jsx'));
 const LAZY_FALLBACK = <div className="detail-pane" style={{ flex: 1 }} />;
 
 function ChatsRoute() {
-  const { notify, pendingConversationId, consumePendingConversationId } = useOutletContext();
+  const {
+    notify, pendingConversationId, consumePendingConversationId,
+    pendingOpenGlobalChat, consumePendingOpenGlobalChat,
+  } = useOutletContext();
   return (
     <ChatsSection
       notify={notify}
       openConversationId={pendingConversationId}
       onConsumeOpenConversationId={consumePendingConversationId}
+      autoOpenGlobalChat={pendingOpenGlobalChat}
+      onConsumeAutoOpenGlobalChat={consumePendingOpenGlobalChat}
     />
   );
 }
@@ -101,6 +108,36 @@ function SettingsRoute() {
   );
 }
 
+function HomeRoute() {
+  const { auth, openConversationInChats, openGlobalChatInChats } = useOutletContext();
+  const navigate = useNavigate();
+  return (
+    <HomeSection
+      username={auth.user.username}
+      onOpenConversation={openConversationInChats}
+      onOpenGlobalChat={openGlobalChatInChats}
+      onNavigate={(path) => navigate(path)}
+    />
+  );
+}
+
+// Picks the default landing section once at load -- phone gets the Flutter-
+// matching Home/drawer shell (see App.jsx/AppDrawer.jsx), desktop keeps the
+// existing "os" dashboard exactly as it already was. A one-time check (not
+// a live media-query subscription like useIsPhone) is enough here: which
+// section a user LANDS on only needs to be decided once, whichever section
+// they're actually on already reacts live to a resize via App.jsx's own
+// isPhone.
+function DefaultRedirect() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const isPhone = window.innerWidth < PHONE_BREAKPOINT_PX;
+    navigate(isPhone ? '/app/home' : '/app/os', { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return null;
+}
+
 function OsRoute() {
   const ctx = useOutletContext();
   return (
@@ -111,12 +148,13 @@ function OsRoute() {
 }
 
 export const router = createBrowserRouter([
-  { path: '/', element: <Navigate to="/app/os" replace /> },
+  { path: '/', element: <DefaultRedirect /> },
   {
     path: '/app',
     element: <App />,
     children: [
-      { index: true, element: <Navigate to="/app/os" replace /> },
+      { index: true, element: <DefaultRedirect /> },
+      { path: 'home', element: <HomeRoute /> },
       { path: 'chats', element: <ChatsRoute /> },
       { path: 'tasks', element: <TasksRoute /> },
       { path: 'profiles', element: <ProfilesRoute /> },
@@ -126,11 +164,11 @@ export const router = createBrowserRouter([
       // Anything unrecognized under /app (including a stale bookmark to a
       // future IA path not built yet) falls back to the default section
       // rather than a blank/error screen.
-      { path: '*', element: <Navigate to="/app/os" replace /> },
+      { path: '*', element: <DefaultRedirect /> },
     ],
   },
   // Anything outside /app entirely (not a route this SPA owns at all) also
   // lands on the default section rather than relying on the Flask fallback
   // alone to guess -- see app.py's spa_fallback for why /app exists.
-  { path: '*', element: <Navigate to="/app/os" replace /> },
+  { path: '*', element: <DefaultRedirect /> },
 ]);

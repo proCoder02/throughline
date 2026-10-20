@@ -1,10 +1,26 @@
 import { useEffect, useRef, useState } from 'react';
 import { FoodOrderIcon } from '../icons.jsx';
 import { apiJson, post } from '../api.js';
+import ExpenseConfirmCard from './ExpenseConfirmCard.jsx';
+import EmailDraftCard from './EmailDraftCard.jsx';
 
 const PAYMENT_POLL_INTERVAL_MS = 10000; // matches Swiggy's own docs' polling guidance (no faster than every 10s)
 const DEFAULT_TRACK_POLL_INTERVAL_MS = 30000; // fallback when Swiggy's own pollingDuration hint is missing/unparseable
 const MAX_TRACK_POLLS = 60; // ~30min+ at the default interval -- stop background polling eventually even if the order never reaches a state we recognize as final
+
+// Dispatches on the backend's `_action_card.type` discriminator (see
+// app.py's _tool_log_expense/_tool_send_email/_tool_file_vehicle_insurance_claim).
+// A Swiggy commerce card carries no `type` at all (see commerce/swiggy_adapter.py),
+// so that's the implicit default case, handled by FoodOrderActionCard below
+// exactly as before. Any other explicit type this client doesn't know about
+// (e.g. 'call', LiveKit voice calling -- not built on web) renders nothing
+// rather than being force-fit through the Swiggy card's shape.
+export default function ActionCard({ card, onResolved }) {
+  if (card.type === 'expense_confirm') return <ExpenseConfirmCard card={card} onResolved={onResolved} />;
+  if (card.type === 'email_draft') return <EmailDraftCard card={card} onResolved={onResolved} />;
+  if (card.type) return null;
+  return <FoodOrderActionCard card={card} onResolved={onResolved} />;
+}
 
 // Cognitive Commerce (Swiggy MCP): renders the "would you like me to order
 // this?" card the backend attaches to a chat reply as action_card. Purely
@@ -13,7 +29,7 @@ const MAX_TRACK_POLLS = 60; // ~30min+ at the default interval -- stop backgroun
 // follow-up message. Never calls anything on mount: nothing happens here
 // until the user taps a button, matching the "recommend -> ask -> act"
 // rule this feature is built around.
-export default function ActionCard({ card, onResolved }) {
+function FoodOrderActionCard({ card, onResolved }) {
   // 'where is my order'-style messages attach a card already in tracking
   // mode (see swiggy_adapter.py's build_tracking_context) -- it skips the
   // usual pending/confirm flow entirely, since there's nothing to confirm.

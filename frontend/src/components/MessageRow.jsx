@@ -67,7 +67,7 @@ function Attachment({ url, type, thumbnail, summary }) {
 export default function MessageRow({
   mine, timestamp, content, formatted = false, imageUrl,
   attachmentUrl, attachmentType, thumbnailDataUrl, attachmentSummary,
-  actionCard, onActionResolved, trailingIcon,
+  actionCards, onActionResolved, trailingIcon,
 }) {
   const time = formatTime(timestamp);
   const [menu, setMenu] = useState(null);
@@ -105,7 +105,9 @@ export default function MessageRow({
             {trailingIcon}
           </span>
         )}
-        {actionCard && <ActionCard card={actionCard} onResolved={onActionResolved} />}
+        {actionCards?.map((card, i) => (
+          <ActionCard key={card.draft_id ?? card.id ?? i} card={card} onResolved={onActionResolved} />
+        ))}
       </div>
     </div>
   );

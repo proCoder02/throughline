@@ -10,7 +10,7 @@ export default function ChatThread({
   pendingSpeakerIndex = null, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
   tags, onTagClick, onDismissTag,
   messages, onSend, sending, onDelete, onListen, onStopListen, onBack,
-  subtitle, placeholder, emptyHint, onSendImage, onActionResolved,
+  subtitle, placeholder, emptyHint, onSendImage, onSendPdf, onActionResolved,
 }) {
   const scrollRef = useRef(null);
   // Only relevant when onSendImage is provided (global chat today) -- a
@@ -74,7 +74,7 @@ export default function ChatThread({
             content={m.content}
             formatted={m.role !== 'user'}
             imageUrl={m.imageUrl}
-            actionCard={m.actionCard}
+            actionCards={m.actionCards}
             onActionResolved={onActionResolved}
           />
         ))}
@@ -114,6 +114,9 @@ export default function ChatThread({
           disabled={sending}
           placeholder={placeholder || 'Ask about this conversation...'}
           onImageSelected={onSendImage ? setPendingImage : undefined}
+          onPdfSelected={onSendPdf}
+          attachAccept={onSendPdf ? 'image/*,application/pdf' : undefined}
+          attachLabel={onSendPdf ? 'Attach a photo or PDF' : undefined}
           extraButton={onListen && (
             <button
               className="send-btn"

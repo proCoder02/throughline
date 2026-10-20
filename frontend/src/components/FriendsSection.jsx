@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useState } from 'react';
 import UseAnimations from 'react-useanimations';
 import userPlus from 'react-useanimations/lib/userPlus';
 import ListPane from './ListPane.jsx';
@@ -266,7 +266,7 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
       ) : !selected ? (
         <div className="chat-panel empty">
           <div className="empty-state">
-            <UseAnimations animation={userPlus} size={110} autoplay loop strokeColor="#1FC8B4" />
+            <UseAnimations animation={userPlus} size={110} autoplay loop strokeColor="#D98E4A" />
             <div className="empty-state-text">Select a friend to see their profile.</div>
           </div>
         </div>
@@ -387,7 +387,7 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
                   <div className="detail-meta" style={{ textTransform: 'capitalize' }}>{mood.mood_label}</div>
                   <div className="hint">
                     As of {new Date(mood.window_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    {'–'}{new Date(mood.window_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {'â€“'}{new Date(mood.window_end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </div>
                 </div>
               ) : <div className="hint" style={{ marginTop: 0 }}>No mood data logged yet today.</div>}
@@ -403,7 +403,7 @@ export default function FriendsSection({ onStartCall, notify, myUserId }) {
                     <span>{c.outgoing ? 'Outgoing' : 'Incoming'}</span>
                     <span className="hint" style={{ margin: 0 }}>
                       {formatCallTimestamp(c.created_at)}
-                      {c.ended_at && ` · ${Math.max(1, Math.round((new Date(c.ended_at) - new Date(c.created_at)) / 1000))}s`}
+                      {c.ended_at && ` Â· ${Math.max(1, Math.round((new Date(c.ended_at) - new Date(c.created_at)) / 1000))}s`}
                     </span>
                   </div>
                 ))

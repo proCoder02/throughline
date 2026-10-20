@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useState } from 'react';
 import UseAnimations from 'react-useanimations';
 import mail from 'react-useanimations/lib/mail';
 import ListPane from './ListPane.jsx';
 import ChatThread from './ChatThread.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import ContextMenu from './ContextMenu.jsx';
+import TransactionConfirmModal from './TransactionConfirmModal.jsx';
+import PolicyConfirmModal from './PolicyConfirmModal.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
 import { useLongPress } from '../hooks/useLongPress.js';
@@ -37,7 +39,10 @@ function maybeGetLocation(text) {
   });
 }
 
-export default function ChatsSection({ notify, openConversationId, onConsumeOpenConversationId }) {
+export default function ChatsSection({
+  notify, openConversationId, onConsumeOpenConversationId,
+  autoOpenGlobalChat, onConsumeAutoOpenGlobalChat,
+}) {
   const conv = useConversations();
   const [selectedId, setSelectedId] = useState(null);
   const [selectedTranscript, setSelectedTranscript] = useState('');
@@ -52,6 +57,14 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   const [globalChatOpen, setGlobalChatOpen] = useState(false);
   const [globalMessages, setGlobalMessages] = useState([]);
   const [globalSending, setGlobalSending] = useState(false);
+  // A policy document can legitimately ALSO be a receipt for the premium
+  // paid (confirmed live on the Flutter client: a real policy PDF's own
+  // "Gross Premium Paid" section extracted as a genuine transaction) -- both
+  // confirm modals are queued and shown one after another here, rather than
+  // an if/else that would silently drop whichever one didn't go first. Same
+  // "don't let one surfaced outcome hide another" principle as the
+  // action_cards list itself. Each entry is {type: 'transaction'|'policy', data, conversationId}.
+  const [confirmQueue, setConfirmQueue] = useState([]);
 
   // Persisted server-side (chat_messages, conversation_id NULL) -- loads
   // once per visit to this tab so the thread survives closing the panel,
@@ -94,6 +107,17 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Home's Ask bar/Quick Actions (see HomeSection.jsx) -- opens the global
+  // Ask thread immediately on arrival, same open-once-then-clear shape as
+  // openConversationId above, matching the Flutter Home screen's _openChat()
+  // opening the chat in place rather than requiring a second tap here.
+  useEffect(() => {
+    if (autoOpenGlobalChat) {
+      openGlobalChat();
+      onConsumeAutoOpenGlobalChat?.();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Below the mobile breakpoint, the list and the open chat can't share the
   // screen -- body.has-active swaps from the list to the full-screen thread
   // (see theme.css's @media block). No-op above that width, where the CSS
@@ -115,15 +139,28 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
       const location = await maybeGetLocation(prompt);
       const data = await post('/chat/global', { prompt, ...(location || {}) });
       const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      // Cognitive Commerce (Swiggy MCP) -- present only when the backend
-      // actually found real, orderable results; absent (undefined/null) for
-      // every other message, which MessageRow already treats as "no card".
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply, actionCard: data.action_card || null }]);
+      // A single request can trigger several staged actions at once (e.g.
+      // "log this expense AND email the same update") -- action_cards is
+      // always a list, one card per triggered action (Swiggy's "would you
+      // like me to order this?", an expense to confirm, an email/claim
+      // draft to review), never just the last one.
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply, actionCards: data.action_cards || [] }]);
     } catch (e) {
       setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
     } finally {
       setGlobalSending(false);
     }
+  };
+
+  // Queues whichever of transaction/policy the extraction actually found
+  // (see _build_content_extraction_instruction in app.py -- a photo/PDF can
+  // legitimately carry either, both, or neither) for the confirm-modal
+  // sequence below, instead of silently dropping one.
+  const queueExtractionConfirmations = (data) => {
+    const entries = [];
+    if (data.transaction) entries.push({ type: 'transaction', data: data.transaction, conversationId: data.conversation_id });
+    if (data.policy) entries.push({ type: 'policy', data: data.policy, conversationId: data.conversation_id });
+    if (entries.length) setConfirmQueue((q) => [...q, ...entries]);
   };
 
   const sendGlobalImageMessage = async (file, description) => {
@@ -137,10 +174,50 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
       const data = await postForm('/chat/global/image', form);
       const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
       setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
+      queueExtractionConfirmations(data);
     } catch (e) {
       setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
     } finally {
       setGlobalSending(false);
+    }
+  };
+
+  // PDF counterpart of sendGlobalImageMessage -- no caption step (matches
+  // the Flutter client's _sendPdf), same extraction response shape either
+  // way (see extract_vehicle_policy_pdf in app.py).
+  const sendGlobalPdfMessage = async (file) => {
+    setGlobalMessages((m) => [...m, { role: 'user', content: '[PDF document uploaded]' }]);
+    setGlobalSending(true);
+    try {
+      const form = new FormData();
+      form.append('document', file);
+      const data = await postForm('/vehicle-policies/extract-pdf', form);
+      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
+      queueExtractionConfirmations(data);
+    } catch (e) {
+      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Could not read that PDF.' }]);
+    } finally {
+      setGlobalSending(false);
+    }
+  };
+
+  const activeConfirmation = confirmQueue[0] || null;
+
+  const resolveActiveConfirmation = async (edited) => {
+    const entry = activeConfirmation;
+    setConfirmQueue((q) => q.slice(1));
+    if (!entry || !edited) return;
+    try {
+      if (entry.type === 'transaction') {
+        const data = await post('/transactions', { ...edited, conversation_id: entry.conversationId });
+        if (data.duplicate) showToast('Already saved -- looks like the same payment was shared again.', 'info');
+      } else {
+        const data = await post('/vehicle-policies', edited);
+        showToast(data.replaced ? 'Policy updated.' : 'Policy saved.', 'success');
+      }
+    } catch (e) {
+      showToast(entry.type === 'transaction' ? 'Could not save that transaction. Try again from the chat.' : 'Could not save that policy. Try again from the chat.', 'error');
     }
   };
 
@@ -283,16 +360,32 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           messages={globalMessages}
           onSend={sendGlobalMessage}
           onSendImage={sendGlobalImageMessage}
+          onSendPdf={sendGlobalPdfMessage}
           sending={globalSending}
           onBack={() => setGlobalChatOpen(false)}
         />
       ) : (
         <div className="chat-panel empty">
           <div className="empty-state">
-            <UseAnimations animation={mail} size={110} autoplay loop strokeColor="#1FC8B4" />
+            <UseAnimations animation={mail} size={110} autoplay loop strokeColor="#D98E4A" />
             <div className="empty-state-text">Select a conversation, or click Listen to start one.</div>
           </div>
         </div>
+      )}
+
+      {activeConfirmation?.type === 'transaction' && (
+        <TransactionConfirmModal
+          transaction={activeConfirmation.data}
+          onSave={resolveActiveConfirmation}
+          onCancel={() => resolveActiveConfirmation(null)}
+        />
+      )}
+      {activeConfirmation?.type === 'policy' && (
+        <PolicyConfirmModal
+          policy={activeConfirmation.data}
+          onSave={resolveActiveConfirmation}
+          onCancel={() => resolveActiveConfirmation(null)}
+        />
       )}
     </>
   );

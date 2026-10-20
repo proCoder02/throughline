@@ -120,7 +120,12 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
     apiJson('/profiles').then(setProfiles).catch(() => setProfiles({}));
     apiJson('/friends').then(setFriends).catch(() => setFriends([]));
     apiJson('/mood/history?days=56').then((d) => { setMoodDays(d.days || []); setMoodStreak(d.streak || 0); }).catch(() => {});
-    apiJson('/insights/digest').then((d) => setDigest(d.digest || null)).catch(() => setDigest(null));
+    // Real shape is {digest: {cards: [...]}} (or {digest: null}), not a
+    // bare array -- digest.length/.[0] below were silently always
+    // null/wrong against the raw {cards:[...]} object (confirmed live;
+    // never crashed here only because nothing on this page calls an array
+    // method directly on it).
+    apiJson('/insights/digest').then((d) => setDigest((d.digest && d.digest.cards) || null)).catch(() => setDigest(null));
     apiJson('/settings').then(setSettings).catch(() => {});
     apiJson('/settings/nudges').then(setNudgeSettings).catch(() => {});
   }, []);
@@ -475,7 +480,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
   }, [moodByDate]);
 
   const recentConversations = (conversations || []).slice(0, 3);
-  const digestHeadline = digest && digest.length ? (digest[0].text || digest[0].title || digest[0].summary || digest[0].description) : null;
+  const digestHeadline = digest && digest.length ? digest[0].headline : null;
 
   // Screens whose content should fill the remaining viewport height exactly
   // (own internal scrollbars, like a real chat app) instead of growing the

@@ -120,6 +120,43 @@ CREATE TABLE IF NOT EXISTS tv_activity_sessions (
 CREATE INDEX IF NOT EXISTS idx_tv_activity_sessions_user_started
     ON tv_activity_sessions (user_id, started_at);
 
+-- UPI payment receipts shared into global chat (chat_global_image) --
+-- amount/payee/category extracted by the same vision call that produces
+-- the conversation's searchable text, confirmed/edited by the user before
+-- being saved here (see POST /transactions). Optional per-feature table,
+-- same convention as heart_rate_sessions/tv_activity_sessions above --
+-- deliberately NOT in verify_db_connection's hard `required` set.
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    payee TEXT,
+    category TEXT,
+    -- Which UPI app processed the payment (GPay/PhonePe/Paytm/...) -- a
+    -- separate dimension from category (what was bought): a user pays the
+    -- same merchant through different apps, and the two questions ("where
+    -- am I spending" vs "which app do I pay through") shouldn't collapse
+    -- into one field.
+    payment_method TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Added after the table already existed in some installs -- ADD COLUMN IF
+-- NOT EXISTS, same migration-path convention as users.personalization above.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT;
+-- What was actually bought ("Power bank"), distinct from payee (who was
+-- paid, "Blinkit") and category ("Shopping") -- confirmed missing live: a
+-- "send today's purchases to a friend" message had nothing but the payee
+-- to fall back on ("Blinkit purchase: Rs 1,317") since neither amount,
+-- payee, nor category alone says WHAT was bought. Null for receipts with
+-- no readable line item (e.g. a generic bill/insurance payment, where
+-- payee + category already say enough).
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS item TEXT;
+CREATE INDEX IF NOT EXISTS idx_transactions_user_created
+    ON transactions (user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_transactions_user_category
+    ON transactions (user_id, category);
+
 -- Global-chat send_email tool, arbitrary-recipient path only (a known
 -- friend still sends immediately, see _tool_send_email) -- a draft held
 -- here until the user taps Send/Cancel on its action_card, same
@@ -139,6 +176,91 @@ CREATE TABLE IF NOT EXISTS email_drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_email_drafts_user_status
     ON email_drafts (user_id, status);
+
+-- Files the user attached to a still-pending draft (e.g. photos of
+-- accident damage, a police FIR, for a vehicle insurance claim) --
+-- object_key points at the R2 object (see storage.py's 'chat_file'
+-- purpose, already built for an arbitrary-type upload like this).
+-- confirm_email_draft downloads each one and attaches it to the real
+-- outgoing email; dismiss_email_draft leaves them for ON DELETE CASCADE.
+CREATE TABLE IF NOT EXISTS email_draft_attachments (
+    id SERIAL PRIMARY KEY,
+    draft_id INTEGER NOT NULL REFERENCES email_drafts (id) ON DELETE CASCADE,
+    object_key TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content_type TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_email_draft_attachments_draft
+    ON email_draft_attachments (draft_id);
+
+-- Same shape as email_drafts above -- message_friend always drafts instead
+-- of sending immediately, so a stale/wrong detail gets caught in the UI.
+CREATE TABLE IF NOT EXISTS message_drafts (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    friend_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | dismissed
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_message_drafts_user_status
+    ON message_drafts (user_id, status);
+
+-- Vehicle insurance: a policy extracted from a shared photo/PDF (see
+-- chat_global_image's POLICY section), confirmed/edited by the user before
+-- saving (same confirm-before-trust shape as transactions above).
+CREATE TABLE IF NOT EXISTS vehicle_insurance_policies (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- User-facing short name ("Bike", "Activa") -- matched against when
+    -- resolving a claim by voice/chat, same role as friendships.nickname.
+    label TEXT,
+    insurer_name TEXT NOT NULL,
+    policy_number TEXT NOT NULL,
+    vehicle_registration TEXT,
+    insured_name TEXT,
+    issue_date DATE,
+    expiry_date DATE,
+    sum_insured NUMERIC(12,2),
+    -- Always confirmed by the user in the save sheet, never
+    -- auto-extracted-and-trusted -- a wrong claims address is a silently
+    -- undeliverable claim, not just a cosmetic mistake.
+    claims_email TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Indian motor insurance routinely splits Own Damage and Third Party
+-- liability across TWO DIFFERENT INSURERS with different policy numbers
+-- and validity periods (confirmed from a real user's policy document) --
+-- one row per coverage type for the same vehicle, rather than cramming
+-- OD+TP sub-fields onto a single row, so claim routing just picks the
+-- right policy_id and the claims table needs no changes at all.
+ALTER TABLE vehicle_insurance_policies ADD COLUMN IF NOT EXISTS coverage_type TEXT NOT NULL DEFAULT 'comprehensive';
+CREATE INDEX IF NOT EXISTS idx_vehicle_policies_user
+    ON vehicle_insurance_policies (user_id);
+
+-- A filed (or drafted/dismissed) claim against one of the policies above.
+-- Its lifecycle is tied to the email_drafts row it creates (email_draft_id)
+-- -- confirm_email_draft/dismiss_email_draft update this table's status in
+-- lockstep, so there is no separate confirm/dismiss path to keep in sync.
+CREATE TABLE IF NOT EXISTS vehicle_insurance_claims (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    policy_id INTEGER NOT NULL REFERENCES vehicle_insurance_policies (id) ON DELETE CASCADE,
+    email_draft_id INTEGER REFERENCES email_drafts (id) ON DELETE SET NULL,
+    incident_date DATE NOT NULL,
+    description TEXT NOT NULL,
+    location TEXT,
+    third_party_involved TEXT,
+    fir_number TEXT,
+    estimated_amount NUMERIC(12,2),
+    status TEXT NOT NULL DEFAULT 'draft',  -- draft | filed | dismissed
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_vehicle_claims_user_status
+    ON vehicle_insurance_claims (user_id, status);
 
 -- Mutual friendship: adding a friend by code inserts both directions, so a
 -- friend list is always a plain "WHERE user_id = ?" with no OR/self-join.
