@@ -132,7 +132,9 @@ function DefaultRedirect() {
   const navigate = useNavigate();
   useEffect(() => {
     const isPhone = window.innerWidth < PHONE_BREAKPOINT_PX;
-    navigate(isPhone ? '/app/home' : '/app/os', { replace: true });
+    // Keeps the query string -- the Outlook OAuth callback lands on
+    // /app?outlook=connected and App.jsx reads it after this redirect.
+    navigate((isPhone ? '/app/home' : '/app/os') + window.location.search, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return null;

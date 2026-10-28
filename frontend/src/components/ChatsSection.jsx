@@ -5,39 +5,15 @@ import ListPane from './ListPane.jsx';
 import ChatThread from './ChatThread.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import ContextMenu from './ContextMenu.jsx';
-import TransactionConfirmModal from './TransactionConfirmModal.jsx';
-import PolicyConfirmModal from './PolicyConfirmModal.jsx';
+import AssistantChat from './assistant/AssistantChat.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
 import { useLongPress } from '../hooks/useLongPress.js';
-import { apiJson, post, postForm } from '../api.js';
+import { post } from '../api.js';
 import { backfillConversationContent } from '../db.js';
 import { showToast, confirmDialog } from '../lib/notify.js';
 import { onEnterOrSpace } from '../lib/a11y.js';
 import { MicIcon, ChatIcon, TrashIcon } from '../icons.jsx';
-
-// Best-effort, silent, and fast on purpose -- must never turn a normal text
-// message into a permission-prompt interruption or a multi-second stall.
-// Only actually asks the browser for location when the message looks like
-// it wants one at all; every other message skips this with zero delay or
-// prompt. A denied/unavailable/slow fix just means the backend gets no
-// lat/lon and asks the user to share location or name a place instead --
-// mirrors the Flutter client's _maybeGetLocation exactly.
-const LOCATION_KEYWORD_RE = /\bnear(?:by)?\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\btrek\b|\bhik(?:e|ing)\b|\btrail\b|\bshop(?:ping)?\b|\brestaurant\b|\bcafe\b|\bcoffee\b|\bpark\b/i;
-
-function maybeGetLocation(text) {
-  return new Promise((resolve) => {
-    if (!LOCATION_KEYWORD_RE.test(text) || !navigator.geolocation) {
-      resolve(null);
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-      () => resolve(null), // denied, unavailable, or timed out -- send proceeds without location
-      { enableHighAccuracy: false, timeout: 4000, maximumAge: 60000 },
-    );
-  });
-}
 
 export default function ChatsSection({
   notify, openConversationId, onConsumeOpenConversationId,
@@ -52,28 +28,10 @@ export default function ChatsSection({
   const [rowMenu, setRowMenu] = useState(null); // {x, y, chat} for the long-press quick-action menu
   const bindLongPress = useLongPress();
   // Cross-session Q&A ("What did I discuss with Rahul last week?") -- not
-  // tied to one conversation_id, so it's kept entirely separate from the
-  // per-conversation selectedId/messages state above.
+  // tied to one conversation_id. Its whole thread (history, sending,
+  // attachments, confirm sheets) lives in AssistantChat; this only tracks
+  // whether it's the open pane.
   const [globalChatOpen, setGlobalChatOpen] = useState(false);
-  const [globalMessages, setGlobalMessages] = useState([]);
-  const [globalSending, setGlobalSending] = useState(false);
-  // A policy document can legitimately ALSO be a receipt for the premium
-  // paid (confirmed live on the Flutter client: a real policy PDF's own
-  // "Gross Premium Paid" section extracted as a genuine transaction) -- both
-  // confirm modals are queued and shown one after another here, rather than
-  // an if/else that would silently drop whichever one didn't go first. Same
-  // "don't let one surfaced outcome hide another" principle as the
-  // action_cards list itself. Each entry is {type: 'transaction'|'policy', data, conversationId}.
-  const [confirmQueue, setConfirmQueue] = useState([]);
-
-  // Persisted server-side (chat_messages, conversation_id NULL) -- loads
-  // once per visit to this tab so the thread survives closing the panel,
-  // reloading the page, or logging out entirely.
-  useEffect(() => {
-    apiJson('/chat/global')
-      .then((rows) => setGlobalMessages(rows.map((r) => ({ role: r.role, content: r.content }))))
-      .catch(() => {});
-  }, []);
 
   const visibleChats = categoryFilter === 'all'
     ? conv.list
@@ -130,95 +88,6 @@ export default function ChatsSection({
   const openGlobalChat = () => {
     setSelectedId(null);
     setGlobalChatOpen(true);
-  };
-
-  const sendGlobalMessage = async (prompt) => {
-    setGlobalMessages((m) => [...m, { role: 'user', content: prompt }]);
-    setGlobalSending(true);
-    try {
-      const location = await maybeGetLocation(prompt);
-      const data = await post('/chat/global', { prompt, ...(location || {}) });
-      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      // A single request can trigger several staged actions at once (e.g.
-      // "log this expense AND email the same update") -- action_cards is
-      // always a list, one card per triggered action (Swiggy's "would you
-      // like me to order this?", an expense to confirm, an email/claim
-      // draft to review), never just the last one.
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply, actionCards: data.action_cards || [] }]);
-    } catch (e) {
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
-    } finally {
-      setGlobalSending(false);
-    }
-  };
-
-  // Queues whichever of transaction/policy the extraction actually found
-  // (see _build_content_extraction_instruction in app.py -- a photo/PDF can
-  // legitimately carry either, both, or neither) for the confirm-modal
-  // sequence below, instead of silently dropping one.
-  const queueExtractionConfirmations = (data) => {
-    const entries = [];
-    if (data.transaction) entries.push({ type: 'transaction', data: data.transaction, conversationId: data.conversation_id });
-    if (data.policy) entries.push({ type: 'policy', data: data.policy, conversationId: data.conversation_id });
-    if (entries.length) setConfirmQueue((q) => [...q, ...entries]);
-  };
-
-  const sendGlobalImageMessage = async (file, description) => {
-    const previewUrl = URL.createObjectURL(file);
-    setGlobalMessages((m) => [...m, { role: 'user', content: description, imageUrl: previewUrl }]);
-    setGlobalSending(true);
-    try {
-      const form = new FormData();
-      form.append('image', file);
-      form.append('description', description);
-      const data = await postForm('/chat/global/image', form);
-      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
-      queueExtractionConfirmations(data);
-    } catch (e) {
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
-    } finally {
-      setGlobalSending(false);
-    }
-  };
-
-  // PDF counterpart of sendGlobalImageMessage -- no caption step (matches
-  // the Flutter client's _sendPdf), same extraction response shape either
-  // way (see extract_vehicle_policy_pdf in app.py).
-  const sendGlobalPdfMessage = async (file) => {
-    setGlobalMessages((m) => [...m, { role: 'user', content: '[PDF document uploaded]' }]);
-    setGlobalSending(true);
-    try {
-      const form = new FormData();
-      form.append('document', file);
-      const data = await postForm('/vehicle-policies/extract-pdf', form);
-      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
-      queueExtractionConfirmations(data);
-    } catch (e) {
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Could not read that PDF.' }]);
-    } finally {
-      setGlobalSending(false);
-    }
-  };
-
-  const activeConfirmation = confirmQueue[0] || null;
-
-  const resolveActiveConfirmation = async (edited) => {
-    const entry = activeConfirmation;
-    setConfirmQueue((q) => q.slice(1));
-    if (!entry || !edited) return;
-    try {
-      if (entry.type === 'transaction') {
-        const data = await post('/transactions', { ...edited, conversation_id: entry.conversationId });
-        if (data.duplicate) showToast('Already saved -- looks like the same payment was shared again.', 'info');
-      } else {
-        const data = await post('/vehicle-policies', edited);
-        showToast(data.replaced ? 'Policy updated.' : 'Policy saved.', 'success');
-      }
-    } catch (e) {
-      showToast(entry.type === 'transaction' ? 'Could not save that transaction. Try again from the chat.' : 'Could not save that policy. Try again from the chat.', 'error');
-    }
   };
 
   // Global "Listen" button: always visible, starts a brand-new conversation.
@@ -352,18 +221,16 @@ export default function ChatsSection({
           onBack={() => setSelectedId(null)}
         />
       ) : globalChatOpen ? (
-        <ChatThread
-          title="Ask about your people & conversations"
-          subtitle="Ask across everything you've recorded"
-          placeholder='e.g. "What did I discuss with Rahul last week?"'
-          emptyHint="Ask about a person or a past topic -- I'll pull in whichever conversations are relevant."
-          messages={globalMessages}
-          onSend={sendGlobalMessage}
-          onSendImage={sendGlobalImageMessage}
-          onSendPdf={sendGlobalPdfMessage}
-          sending={globalSending}
-          onBack={() => setGlobalChatOpen(false)}
-        />
+        // Shared ChatGPT-style assistant (same component as the desktop
+        // OS screen's Ask tab) -- owns its own history/send/attach/confirm
+        // state; this section only decides when it's open.
+        <div className="chat-panel">
+          <AssistantChat
+            title="Ask Throughline"
+            subtitle="Across your conversations, people, tasks and email"
+            onBack={() => setGlobalChatOpen(false)}
+          />
+        </div>
       ) : (
         <div className="chat-panel empty">
           <div className="empty-state">
@@ -371,21 +238,6 @@ export default function ChatsSection({
             <div className="empty-state-text">Select a conversation, or click Listen to start one.</div>
           </div>
         </div>
-      )}
-
-      {activeConfirmation?.type === 'transaction' && (
-        <TransactionConfirmModal
-          transaction={activeConfirmation.data}
-          onSave={resolveActiveConfirmation}
-          onCancel={() => resolveActiveConfirmation(null)}
-        />
-      )}
-      {activeConfirmation?.type === 'policy' && (
-        <PolicyConfirmModal
-          policy={activeConfirmation.data}
-          onSave={resolveActiveConfirmation}
-          onCancel={() => resolveActiveConfirmation(null)}
-        />
       )}
     </>
   );

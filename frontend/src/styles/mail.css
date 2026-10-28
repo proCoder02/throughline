@@ -1,0 +1,186 @@
+/* Outlook mail UI (MailReplyMeta, OutlookSettingsCard, mail suggestion
+   chips). Used inside both design systems -- the classic --wa-* theme and
+   the "os" screen's (.tl-os) palette -- so every color goes through local
+   --mail-* tokens, set once per system below. */
+
+.mail-ui {
+  --mail-text: var(--wa-text);
+  --mail-soft: var(--wa-text-soft);
+  --mail-surface: var(--wa-hover);
+  --mail-border: var(--wa-border);
+  --mail-accent: var(--wa-accent);
+  --mail-warn-bg: var(--wa-warn-bg);
+  --mail-warn-text: var(--wa-warn-text);
+  --mail-danger: var(--wa-danger);
+  --mail-ok: var(--wa-online);
+}
+
+.tl-os .mail-ui {
+  --mail-text: var(--text);
+  --mail-soft: var(--muted);
+  --mail-surface: var(--surface);
+  --mail-border: var(--border);
+  --mail-accent: var(--accent);
+  --mail-warn-bg: rgba(245, 158, 11, .14);
+  --mail-warn-text: var(--text);
+  --mail-danger: var(--danger);
+  --mail-ok: #22c55e;
+}
+
+/* ---- Reply metadata: activity lines + source chips ---- */
+.mail-reply-meta {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--mail-border);
+  font-size: 12px;
+}
+.mail-activity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--mail-soft);
+  line-height: 1.4;
+  margin-bottom: 4px;
+}
+.mail-activity.error { color: var(--mail-danger); }
+.mail-activity-action {
+  margin-left: 4px;
+  font-weight: 600;
+  color: var(--mail-accent);
+}
+.mail-sources-label {
+  margin: 8px 0 4px;
+  color: var(--mail-soft);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.mail-sources {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 6px;
+}
+.mail-source {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--mail-border);
+  border-radius: 9px;
+  background: var(--mail-surface);
+  color: var(--mail-text);
+  text-decoration: none;
+}
+a.mail-source:hover { border-color: var(--mail-accent); }
+a.mail-source:focus-visible { outline: 2px solid var(--mail-accent); outline-offset: 1px; }
+.mail-source-top { display: flex; justify-content: space-between; gap: 6px; min-width: 0; }
+.mail-source-from {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mail-source-date { color: var(--mail-soft); flex-shrink: 0; }
+.mail-source-subject {
+  color: var(--mail-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mail-source-badge {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--mail-accent);
+  border: 1px solid var(--mail-accent);
+}
+.mail-sources-toggle {
+  margin-top: 6px;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--mail-accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* ---- Mail suggestion chips (chat empty state / above composer) ---- */
+.mail-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.mail-suggestions-label { color: var(--mail-soft); font-size: 12px; margin-right: 2px; }
+.mail-suggestion {
+  padding: 6px 11px;
+  border: 1px solid var(--mail-border);
+  border-radius: 999px;
+  background: var(--mail-surface);
+  color: var(--mail-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.mail-suggestion:hover { border-color: var(--mail-accent); }
+.mail-suggestion:disabled { opacity: .5; cursor: default; }
+
+/* ---- Settings card ---- */
+.mail-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 0;
+  flex-wrap: wrap;
+}
+.mail-settings-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--mail-text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.mail-settings-since { color: var(--mail-soft); font-weight: 400; }
+.mail-settings-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--mail-ok);
+  flex-shrink: 0;
+}
+.mail-settings-warning {
+  margin: 10px 0 4px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  background: var(--mail-warn-bg);
+  color: var(--mail-warn-text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.mail-settings-heading {
+  color: var(--mail-soft);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.mail-settings-examples ul { margin: 0 0 4px; padding-left: 18px; color: var(--mail-text); font-size: 13px; }
+.mail-settings-facts {
+  margin: 12px 0 0;
+  padding: 10px 0 0 16px;
+  border-top: 1px solid var(--mail-border);
+  color: var(--mail-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.mail-settings-facts li + li { margin-top: 6px; }
+.mail-settings-facts strong { color: var(--mail-text); }
+.mail-settings-facts a { color: var(--mail-accent); }

@@ -1,0 +1,366 @@
+/* ChatGPT-style global assistant (AssistantChat.jsx). Rendered inside both
+   design systems -- the classic --wa-* theme (phone web, ChatsSection) and
+   the desktop OS screen (.tl-os) -- so all colors go through local --ac-*
+   tokens set once per system, same approach as styles/mail.css. */
+
+.ac {
+  --ac-bg: var(--wa-chat-bg);
+  --ac-text: var(--wa-text);
+  --ac-soft: var(--wa-text-soft);
+  --ac-border: var(--wa-border);
+  --ac-surface: var(--wa-panel);
+  --ac-surface-2: var(--wa-hover);
+  --ac-accent: var(--wa-accent-solid);
+  --ac-on-accent: #fff;
+  --ac-danger: var(--wa-danger);
+  --ac-user-bg: color-mix(in srgb, var(--wa-accent) 18%, var(--wa-panel));
+  --ac-column: 760px;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  background: var(--ac-bg);
+  color: var(--ac-text);
+}
+
+.tl-os .ac {
+  --ac-bg: var(--surface);
+  --ac-text: var(--text);
+  --ac-soft: var(--muted);
+  --ac-border: var(--border);
+  --ac-surface: var(--surface);
+  --ac-surface-2: var(--surface-2);
+  --ac-accent: var(--accent);
+  --ac-danger: var(--danger);
+  --ac-user-bg: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  overflow: hidden;
+}
+
+/* ---- header: one quiet line, no chrome ---- */
+.ac-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--ac-border);
+  flex-shrink: 0;
+}
+.ac-header-text { min-width: 0; }
+.ac-title { font-weight: 650; font-size: 15px; }
+.ac-subtitle { font-size: 12px; color: var(--ac-soft); }
+
+/* ---- scroll area + centered reading column ---- */
+.ac-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-padding-bottom: 24px;
+}
+.ac-column {
+  max-width: var(--ac-column);
+  margin: 0 auto;
+  padding: 24px 20px 8px;
+}
+
+.ac-turn { margin: 0 0 22px; }
+
+/* user turn: compact right-aligned pill */
+.ac-user { display: flex; justify-content: flex-end; }
+.ac-user-bubble {
+  max-width: min(78%, 560px);
+  padding: 10px 14px;
+  border-radius: 18px;
+  background: var(--ac-user-bg);
+  color: var(--ac-text);
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ac-user-image { max-width: 240px; max-height: 240px; border-radius: 12px; object-fit: cover; }
+.ac-user-file { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.ac-user-file svg { width: 18px; height: 18px; }
+
+/* assistant turn: no bubble, document-style text beside a small mark */
+.ac-assistant { display: flex; gap: 12px; align-items: flex-start; }
+.ac-avatar {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--ac-border);
+  color: var(--ac-accent);
+  margin-top: 1px;
+}
+.ac-avatar svg { width: 15px; height: 15px; }
+.ac-avatar.is-thinking svg { animation: acSpin 2.4s linear infinite; }
+.ac-assistant-body {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  padding-top: 3px;
+}
+.ac-assistant-body .md { line-height: 1.65; }
+
+/* hover/focus-revealed actions under an answer (always visible on touch) */
+.ac-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 6px;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.ac-assistant:hover .ac-actions,
+.ac-assistant:focus-within .ac-actions,
+.ac-turn:last-child .ac-actions { opacity: 1; }
+@media (hover: none) { .ac-actions { opacity: 1; } }
+
+.ac-icon-btn {
+  width: 32px;
+  height: 32px;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ac-soft);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ac-icon-btn:hover:not(:disabled) { background: var(--ac-surface-2); color: var(--ac-text); }
+.ac-icon-btn:focus-visible { outline: 2px solid var(--ac-accent); outline-offset: 1px; }
+.ac-icon-btn:disabled { opacity: .45; cursor: default; }
+.ac-icon-btn svg { width: 17px; height: 17px; }
+
+/* error state, inline with Retry */
+.ac-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--ac-danger) 45%, transparent);
+  background: color-mix(in srgb, var(--ac-danger) 8%, transparent);
+  font-size: 14px;
+}
+.ac-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--ac-border);
+  background: var(--ac-surface);
+  color: var(--ac-text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ac-retry svg { width: 14px; height: 14px; }
+
+/* thinking state */
+.ac-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 5px;
+  color: var(--ac-soft);
+  font-size: 14px;
+}
+.ac-dots { display: inline-flex; gap: 4px; }
+.ac-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: acBounce 1.2s infinite ease-in-out;
+}
+.ac-dots i:nth-child(2) { animation-delay: .15s; }
+.ac-dots i:nth-child(3) { animation-delay: .3s; }
+
+/* loading skeleton */
+.ac-loading { display: grid; gap: 12px; padding: 12px 0; }
+.ac-skeleton {
+  height: 14px;
+  border-radius: 7px;
+  background: linear-gradient(90deg, var(--ac-surface-2), var(--ac-border), var(--ac-surface-2));
+  background-size: 200% 100%;
+  animation: acShimmer 1.4s infinite linear;
+}
+.ac-skeleton.short { width: 60%; }
+
+/* ---- empty state: greeting + starters, composer pulled to the middle ---- */
+.ac-welcome { text-align: center; padding: 6vh 0 12px; }
+.ac-welcome-mark {
+  width: 44px;
+  height: 44px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--ac-accent);
+  border: 1px solid var(--ac-border);
+}
+.ac-welcome-mark svg { width: 22px; height: 22px; }
+.ac-welcome h2 { margin: 0 0 6px; font-size: 26px; font-weight: 650; letter-spacing: -.01em; }
+.ac-welcome p { margin: 0 0 22px; color: var(--ac-soft); font-size: 14.5px; }
+.ac-starters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  text-align: left;
+}
+.ac-starter {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 14px;
+  border: 1px solid var(--ac-border);
+  border-radius: 14px;
+  background: var(--ac-surface);
+  color: var(--ac-text);
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+.ac-starter:hover { border-color: var(--ac-accent); background: var(--ac-surface-2); }
+.ac-starter:focus-visible { outline: 2px solid var(--ac-accent); outline-offset: 1px; }
+.ac-starter-title { font-weight: 600; font-size: 13.5px; }
+.ac-starter-prompt { color: var(--ac-soft); font-size: 13px; }
+
+.ac.is-empty .ac-scroll { flex: 0 1 auto; margin-top: auto; }
+.ac.is-empty .ac-composer-wrap { margin-bottom: auto; }
+
+/* ---- composer ---- */
+.ac-composer-wrap {
+  flex-shrink: 0;
+  width: 100%;
+  max-width: var(--ac-column);
+  margin: 0 auto;
+  padding: 8px 20px 12px;
+  box-sizing: border-box;
+}
+.ac-composer {
+  border: 1px solid var(--ac-border);
+  border-radius: 24px;
+  background: var(--ac-surface);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, .06);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.ac-composer:focus-within {
+  border-color: color-mix(in srgb, var(--ac-accent) 55%, var(--ac-border));
+  box-shadow: 0 4px 24px rgba(0, 0, 0, .09);
+}
+.ac-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 6px 6px 6px 8px;
+}
+.ac-composer textarea {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--ac-text);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 6px 4px;
+  max-height: 200px;
+}
+.ac-composer textarea::placeholder { color: var(--ac-soft); }
+.ac-send {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--ac-accent);
+  color: var(--ac-on-accent);
+  cursor: pointer;
+  transition: opacity .15s ease, transform .1s ease;
+}
+.ac-send:active:not(:disabled) { transform: scale(.94); }
+.ac-send:disabled { opacity: .35; cursor: default; }
+.ac-send:focus-visible { outline: 2px solid var(--ac-accent); outline-offset: 2px; }
+.ac-send svg { width: 18px; height: 18px; }
+
+.ac-attachment {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 8px 0;
+  padding: 6px 6px 6px 8px;
+  border-radius: 14px;
+  background: var(--ac-surface-2);
+  font-size: 13px;
+  color: var(--ac-soft);
+}
+.ac-attachment img { width: 40px; height: 40px; object-fit: cover; border-radius: 8px; }
+.ac-attachment span { flex: 1; min-width: 0; }
+
+.ac-disclaimer {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--ac-soft);
+}
+
+/* ---- jump to latest ---- */
+.ac-jump {
+  position: absolute;
+  left: 50%;
+  bottom: 118px;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--ac-border);
+  background: var(--ac-surface);
+  color: var(--ac-text);
+  display: grid;
+  place-items: center;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .12);
+  cursor: pointer;
+  z-index: 2;
+}
+.ac-jump svg { width: 17px; height: 17px; }
+
+/* ---- phone ---- */
+@media (max-width: 860px) {
+  .ac-column { padding: 16px 14px 4px; }
+  .ac-composer-wrap { padding: 6px 10px calc(10px + env(safe-area-inset-bottom)); }
+  .ac-starters { grid-template-columns: 1fr; }
+  .ac-welcome { padding-top: 3vh; }
+  .ac-welcome h2 { font-size: 22px; }
+  .ac-user-bubble { max-width: 85%; }
+  .ac-assistant { gap: 10px; }
+  .ac-avatar { width: 24px; height: 24px; }
+  .ac-jump { bottom: 104px; }
+  .tl-os .ac { border-radius: 0; border: 0; }
+}
+
+@keyframes acBounce { 0%, 80%, 100% { transform: translateY(0); opacity: .45; } 40% { transform: translateY(-4px); opacity: 1; } }
+@keyframes acShimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@keyframes acSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .ac-dots i, .ac-skeleton, .ac-avatar.is-thinking svg { animation: none; }
+}

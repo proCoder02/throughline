@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import FormattedText from './FormattedText.jsx';
 import ActionCard from './ActionCard.jsx';
+import MailReplyMeta from './MailReplyMeta.jsx';
 import ContextMenu from './ContextMenu.jsx';
 import { useLongPress } from '../hooks/useLongPress.js';
 import { showToast } from '../lib/notify.js';
@@ -67,7 +68,7 @@ function Attachment({ url, type, thumbnail, summary }) {
 export default function MessageRow({
   mine, timestamp, content, formatted = false, imageUrl,
   attachmentUrl, attachmentType, thumbnailDataUrl, attachmentSummary,
-  actionCards, onActionResolved, trailingIcon,
+  actionCards, onActionResolved, trailingIcon, replyMeta,
 }) {
   const time = formatTime(timestamp);
   const [menu, setMenu] = useState(null);
@@ -99,6 +100,7 @@ export default function MessageRow({
           <Attachment url={attachmentUrl} type={attachmentType} thumbnail={thumbnailDataUrl} summary={attachmentSummary} />
         )}
         {formatted ? <FormattedText text={content} /> : content}
+        <MailReplyMeta meta={replyMeta} />
         {(time || trailingIcon) && (
           <span className="bubble-time">
             {time}

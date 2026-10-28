@@ -7,6 +7,7 @@ import { useTheme } from './hooks/useTheme.js';
 import { useIsPhone } from './hooks/useIsPhone.js';
 import { apiJson } from './api.js';
 import { showToast } from './lib/notify.js';
+import { refreshOutlookStatus } from './lib/outlook.js';
 import AuthScreen from './components/AuthScreen.jsx';
 import PersonaOnboarding from './components/PersonaOnboarding.jsx';
 import CallOverlay from './components/CallOverlay.jsx';
@@ -94,6 +95,32 @@ export default function App() {
       document.removeEventListener('touchstart', unlock);
     };
   }, []);
+
+  // Back from the Outlook OAuth round trip (the backend's callback
+  // redirects to /app?outlook=connected|error) -- confirm the result right
+  // where the user lands, then drop the params so a reload doesn't repeat it.
+  useEffect(() => {
+    if (!auth.user) return;
+    const params = new URLSearchParams(location.search);
+    const result = params.get('outlook');
+    if (!result) return;
+    if (result === 'connected') {
+      const who = params.get('outlook_email');
+      showToast(
+        `Outlook connected${who ? ' as ' + who : ''}. Try asking: “Summarize my unread emails”.`,
+        'success', 8000,
+      );
+    } else {
+      showToast('Couldn’t connect Outlook: ' + (params.get('outlook_error') || 'please try again.'), 'error', 9000);
+    }
+    refreshOutlookStatus();
+    ['outlook', 'outlook_email', 'outlook_error'].forEach((k) => params.delete(k));
+    const rest = params.toString();
+    // window.location, not `location`: /app's DefaultRedirect (a child, so
+    // its effect runs first) may already have moved us to /app/os or
+    // /app/home in this same commit.
+    navigate(window.location.pathname + (rest ? '?' + rest : ''), { replace: true });
+  }, [auth.user, location.search]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (auth.loading) return null;
   if (!auth.user) return <AuthScreen auth={auth} />;

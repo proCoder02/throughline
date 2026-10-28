@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { apiJson, post, postForm, del } from '../api.js';
+import { apiJson, post, del } from '../api.js';
 import { showToast, confirmDialog } from '../lib/notify.js';
 import { uploadFile, getUploadsStatus } from '../lib/uploads.js';
 import ChatsSection from '../components/ChatsSection.jsx';
 import DirectMessageThread from '../components/DirectMessageThread.jsx';
 import Avatar from '../components/Avatar.jsx';
 import PhotoViewer from '../components/PhotoViewer.jsx';
-import { CameraIcon, SunIcon, MoonIcon, TrashIcon, AttachIcon, CloseIcon, SendIcon } from '../icons.jsx';
+import OutlookSettingsCard from '../components/OutlookSettingsCard.jsx';
+import AssistantChat from '../components/assistant/AssistantChat.jsx';
+import { CameraIcon, SunIcon, MoonIcon, TrashIcon } from '../icons.jsx';
 import './os.css';
 
 // The "Personal Intelligence OS" screen -- same IA/visual design as the
@@ -245,73 +247,10 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
     call.startCall(ids).catch((err) => showToast('Could not start call: ' + err.message, 'error'));
   }
 
-  // ---- Ask screen: real cross-session assistant, as an actual scrolling
-  // thread (ChatGPT-style: history above, composer pinned at the bottom)
-  // rather than a single search-box-with-one-reply-below layout -- loads
-  // real prior history from GET /chat/global (same persisted thread the
-  // real ChatsSection's own global chat already reads/writes), and every
-  // new turn appends to it instead of replacing a single "reply" slot.
-  // Image attach uses the same /chat/global/image endpoint the existing
-  // ChatsSection's own global chat already uses -- a direct multipart
-  // upload, not the presigned-R2 flow DMs use, so it works regardless of
-  // R2_STORAGE_ENABLED. ----
-  const [askHistory, setAskHistory] = useState(null); // null = loading
-  const [askInput, setAskInput] = useState('');
-  const [askLoading, setAskLoading] = useState(false);
-  const [askImageFile, setAskImageFile] = useState(null);
-  const [askImagePreview, setAskImagePreview] = useState(null);
-  const askImageInputRef = useRef(null);
-  const askMessagesRef = useRef(null);
-
-  useEffect(() => {
-    apiJson('/chat/global').then(setAskHistory).catch(() => setAskHistory([]));
-  }, []);
-  useEffect(() => {
-    const el = askMessagesRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [askHistory, askLoading]);
-
-  function fillAsk(text) { setAskInput(text); }
-  function pickAskImage() { askImageInputRef.current?.click(); }
-  function onAskImageSelected(e) {
-    const file = e.target.files[0];
-    e.target.value = '';
-    if (!file) return;
-    if (file.size > 10 * 1024 * 1024) { showToast('Image is too large (max 10MB)', 'error'); return; }
-    setAskImageFile(file);
-    setAskImagePreview(URL.createObjectURL(file));
-  }
-  function removeAskImage() {
-    if (askImagePreview) URL.revokeObjectURL(askImagePreview);
-    setAskImageFile(null);
-    setAskImagePreview(null);
-  }
-  async function askThroughline() {
-    const text = askInput.trim();
-    if (!text || askLoading) return;
-    setAskInput('');
-    setAskLoading(true);
-    try {
-      if (askImageFile) {
-        const imagePreview = askImagePreview;
-        const form = new FormData();
-        form.append('image', askImageFile);
-        form.append('description', text);
-        setAskImageFile(null);
-        setAskImagePreview(null);
-        const data = await postForm('/chat/global/image', form);
-        setAskHistory((h) => [...(h || []), { role: 'user', content: text, imageUrl: imagePreview }, { role: 'assistant', content: data.reply || '(no reply)' }]);
-      } else {
-        setAskHistory((h) => [...(h || []), { role: 'user', content: text }]);
-        const data = await post('/chat/global', { prompt: text });
-        setAskHistory((h) => [...(h || []), { role: 'assistant', content: data.reply || '(no reply)' }]);
-      }
-    } catch (e) {
-      setAskHistory((h) => [...(h || []), { role: 'assistant', content: 'Something went wrong: ' + e.message }]);
-    } finally {
-      setAskLoading(false);
-    }
-  }
+  // ---- Ask screen: the shared ChatGPT-style AssistantChat (also used by
+  // the phone-web chat) owns its own history/send/attach state. Mounted
+  // only while the Ask screen is open, so it fetches fresh history each
+  // visit instead of holding a stale copy. ----
 
   // ---- Sharing screen: real per-friend cognitive-sharing level ----
   const [sharingMap, setSharingMap] = useState({});
@@ -943,90 +882,16 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
             </section>
 
             {/* ========================= ASK ========================= */}
-            {/* A real scrolling thread (history above, composer pinned at
-                the bottom) instead of a search-box-with-one-reply-below --
-                matches how Conversations/Listen already behave, and how a
-                chat surface is generally expected to work. */}
+            {/* ChatGPT-style assistant -- see components/assistant/AssistantChat.jsx,
+                shared with the phone-web chat. */}
             <section className={screenClass('ask')}>
-              <div className="page-heading">
-                <div>
-                  <h1>Ask Throughline</h1>
-                  <p>Ask questions across your conversations, people, tasks and memories.</p>
-                </div>
-              </div>
-
-              <div className="chat-window ask-thread">
-                <div className="chat-header">
-                  <div className="avatar">✦</div>
-                  <div>
-                    <div className="item-title">Ask Throughline</div>
-                    <div className="item-meta">Ask across everything you've recorded</div>
-                  </div>
-                </div>
-                <div className="messages" ref={askMessagesRef}>
-                  {askHistory === null ? (
-                    <div className="item-meta">Loading…</div>
-                  ) : askHistory.length === 0 ? (
-                    <div className="ask-empty">
-                      <div className="ai-pill" style={{ display: 'flex', width: 'max-content', margin: '0 auto 18px' }}>
-                        ✦ Cognitive intelligence
-                      </div>
-                      <div className="suggestions">
-                        <div className="suggestion" onClick={() => fillAsk('What commitments have I made?')}>
-                          What commitments have I made?
-                        </div>
-                        <div className="suggestion" onClick={() => fillAsk('Who have I not spoken to recently?')}>
-                          Who have I not spoken to recently?
-                        </div>
-                        <div className="suggestion" onClick={() => fillAsk('Summarize my week.')}>
-                          Summarize my week.
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    askHistory.map((m, i) => (
-                      <div key={i} className={'message' + (m.role === 'user' ? ' me' : '')}>
-                        {m.imageUrl && <img src={m.imageUrl} alt="Attached" className="ask-reply-image" />}
-                        {m.content}
-                      </div>
-                    ))
-                  )}
-                  {askLoading && <div className="message">Thinking…</div>}
-                </div>
-
-                {askImagePreview && (
-                  <div className="ask-attachment-preview">
-                    <img src={askImagePreview} alt="Attached" />
-                    <span>Image attached -- type a question about it and hit Ask.</span>
-                    <button type="button" className="icon-button" title="Remove image" onClick={removeAskImage}><CloseIcon /></button>
-                  </div>
-                )}
-
-                <div className="chat-input pill-input">
-                  <input
-                    ref={askImageInputRef} type="file" accept="image/*" style={{ display: 'none' }}
-                    onChange={onAskImageSelected}
-                  />
-                  <button
-                    type="button" className="round-icon-btn" title="Attach an image"
-                    onClick={pickAskImage} disabled={askLoading}
-                  >
-                    <AttachIcon />
-                  </button>
-                  <input
-                    placeholder={askImageFile ? 'Ask something about this image...' : 'Ask about this conversation...'}
-                    value={askInput}
-                    onChange={(e) => setAskInput(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && askThroughline()}
-                  />
-                  <button
-                    type="button" className="round-icon-btn send" title="Ask"
-                    disabled={askLoading} onClick={askThroughline}
-                  >
-                    <SendIcon />
-                  </button>
-                </div>
-              </div>
+              {screen === 'ask' && (
+                <AssistantChat
+                  title="Ask Throughline"
+                  subtitle="Across your conversations, people, tasks and email"
+                  userName={user?.username}
+                />
+              )}
             </section>
 
             {/* ========================= SHARING ========================= */}
@@ -1308,6 +1173,8 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                   })}
                 </div>
               )}
+
+              <OutlookSettingsCard variant="os" style={{ marginTop: 20 }} />
 
               <button className="secondary-button" style={{ marginTop: 20 }} onClick={auth.logout}>Log out</button>
             </section>

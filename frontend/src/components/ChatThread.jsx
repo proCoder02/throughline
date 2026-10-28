@@ -11,6 +11,9 @@ export default function ChatThread({
   tags, onTagClick, onDismissTag,
   messages, onSend, sending, onDelete, onListen, onStopListen, onBack,
   subtitle, placeholder, emptyHint, onSendImage, onSendPdf, onActionResolved,
+  // Global chat only: a waiting bubble while `sending` (e.g. "Checking your
+  // inbox…"), and an optional row rendered just above the composer.
+  pendingLabel, aboveComposer,
 }) {
   const scrollRef = useRef(null);
   // Only relevant when onSendImage is provided (global chat today) -- a
@@ -22,7 +25,7 @@ export default function ChatThread({
   const [infoOpen, setInfoOpen] = useState(false);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages.length]);
+  }, [messages.length, sending]);
 
   return (
     <div className="chat-panel">
@@ -75,13 +78,17 @@ export default function ChatThread({
             formatted={m.role !== 'user'}
             imageUrl={m.imageUrl}
             actionCards={m.actionCards}
+            replyMeta={m.replyMeta}
             onActionResolved={onActionResolved}
           />
         ))}
-        {!messages.length && (
+        {sending && pendingLabel && <MessageRow mine={false} content={pendingLabel} />}
+        {!messages.length && !sending && (
           <div className="list-empty">{emptyHint || 'Ask a question about this conversation to get started.'}</div>
         )}
       </div>
+
+      {aboveComposer && !pendingImage && <div style={{ padding: '6px 12px 0' }}>{aboveComposer}</div>}
 
       {tags?.length > 0 && (
         <div className="topic-tags">

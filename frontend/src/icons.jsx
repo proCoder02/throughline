@@ -68,3 +68,6 @@ export const ChevronRightIcon = (props) => <svg {...base} {...props}><path d="M9
 export const BellIcon = (props) => <svg {...base} {...props}><path d="M6 10a6 6 0 1112 0c0 3.2 1 5 2 6H4c1-1 2-2.8 2-6z"/><path d="M10 19a2 2 0 004 0"/></svg>;
 export const SparkleIcon = (props) => <svg {...base} {...props}><path d="M12 3l1.8 4.9L19 9.5l-5.2 1.6L12 16l-1.8-4.9L5 9.5l5.2-1.6L12 3z"/></svg>;
 export const PlusIcon = (props) => <svg {...base} {...props}><path d="M12 5v14M5 12h14"/></svg>;
+export const ArrowUpIcon = (props) => <svg {...base} {...props}><path d="M12 19V5M5 12l7-7 7 7"/></svg>;
+export const ArrowDownIcon = (props) => <svg {...base} {...props}><path d="M12 5v14M19 12l-7 7-7-7"/></svg>;
+export const RetryIcon = (props) => <svg {...base} {...props}><path d="M3 12a9 9 0 0115.5-6.2L21 8M21 3v5h-5M21 12a9 9 0 01-15.5 6.2L3 16M3 21v-5h5"/></svg>;
