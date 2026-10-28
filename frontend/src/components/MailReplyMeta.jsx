@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { MAIL_PROVIDERS } from '../lib/mail.js';
+import { MAIL_PROVIDERS, connectHref, linkedMailboxCount, useMailStatus } from '../lib/mail.js';
 import '../styles/mail.css';
 
 // Sources/activity saved before Gmail existed carry no provider -- they were Outlook.
@@ -31,7 +31,7 @@ function shortDate(iso) {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-function SourceChip({ source }) {
+function SourceChip({ source, showAccount }) {
   const body = (
     <>
       <span className="mail-source-top">
@@ -39,6 +39,7 @@ function SourceChip({ source }) {
         <span className="mail-source-date">{shortDate(source.received)}</span>
       </span>
       <span className="mail-source-subject">{source.subject || '(no subject)'}</span>
+      {showAccount && source.account && <span className="mail-source-account">{source.account}</span>}
       {source.read && <span className="mail-source-badge">Opened</span>}
     </>
   );
@@ -59,6 +60,8 @@ function SourceChip({ source }) {
 /// grounded and checkable, never indistinguishable from a guess.
 export default function MailReplyMeta({ meta }) {
   const [expanded, setExpanded] = useState(false);
+  // Name the mailbox on each chip only when there's more than one to tell apart.
+  const showAccount = linkedMailboxCount(useMailStatus()) > 1;
   if (!meta) return null;
   const activity = meta.tool_activity || [];
   const sources = meta.mail_sources || [];
@@ -71,14 +74,14 @@ export default function MailReplyMeta({ meta }) {
         <div key={i} className={'mail-activity' + (a.error ? ' error' : '')}>
           <span aria-hidden="true">{a.error ? '⚠️' : '📧'}</span>
           <span>{a.label}</span>
-          {a.error && <a className="mail-activity-action" href={`/integrations/${providerOf(a)}/connect`}>Reconnect</a>}
+          {a.error && <a className="mail-activity-action" href={connectHref(providerOf(a), a.account)}>Reconnect</a>}
         </div>
       ))}
       {sources.length > 0 && (
         <>
           <div className="mail-sources-label">Sources</div>
           <div className="mail-sources">
-            {shown.map((s) => <SourceChip key={`${providerOf(s)}:${s.id}`} source={s} />)}
+            {shown.map((s) => <SourceChip key={`${providerOf(s)}:${s.id}`} source={s} showAccount={showAccount} />)}
           </div>
           {sources.length > VISIBLE_SOURCES && (
             <button type="button" className="mail-sources-toggle" onClick={() => setExpanded((v) => !v)}>

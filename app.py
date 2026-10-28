@@ -2434,7 +2434,9 @@ def run_agent_tool_loop(cur, db, user_id, messages):
             if card:
                 action_cards.append(card)
             activity = result.pop("_activity", None)
-            if activity:
+            if isinstance(activity, list):  # one line per mailbox (multi-account mail tools)
+                tool_activity.extend(a for a in activity if a)
+            elif activity:
                 tool_activity.append(activity)
             mail_sources.extend(result.pop("_mail_sources", None) or [])
 
@@ -7944,7 +7946,8 @@ def outlook_connect():
     db = get_db()
     cur = dict_cursor(db)
     try:
-        url = get_authorize_url(cur, db, current_user_id())
+        # login_hint: reconnecting one already-linked mailbox
+        url = get_authorize_url(cur, db, current_user_id(), login_hint=request.args.get("login_hint"))
     except OutlookError as e:
         return jsonify({"error": str(e)}), 400
     return redirect(url)
@@ -7961,7 +7964,7 @@ def outlook_connect_url():
     db = get_db()
     cur = dict_cursor(db)
     try:
-        url = get_authorize_url(cur, db, current_user_id(), client="app")
+        url = get_authorize_url(cur, db, current_user_id(), client="app", login_hint=request.args.get("login_hint"))
     except OutlookError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"url": url})
@@ -8023,8 +8026,17 @@ def outlook_disconnect():
     from outlook.adapter import disconnect
     db = get_db()
     cur = dict_cursor(db)
-    disconnect(cur, db, current_user_id())
+    # account_id: one mailbox; omitted (older clients): all of them
+    disconnect(cur, db, current_user_id(), _mail_account_id_arg())
     return jsonify({"ok": True})
+
+
+def _mail_account_id_arg():
+    raw = (request.get_json(silent=True) or {}).get("account_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -8060,7 +8072,8 @@ def gmail_connect():
     db = get_db()
     cur = dict_cursor(db)
     try:
-        url = get_authorize_url(cur, db, current_user_id())
+        # login_hint: reconnecting one already-linked mailbox
+        url = get_authorize_url(cur, db, current_user_id(), login_hint=request.args.get("login_hint"))
     except GmailError as e:
         return jsonify({"error": str(e)}), 400
     return redirect(url)
@@ -8077,7 +8090,7 @@ def gmail_connect_url():
     db = get_db()
     cur = dict_cursor(db)
     try:
-        url = get_authorize_url(cur, db, current_user_id(), client="app")
+        url = get_authorize_url(cur, db, current_user_id(), client="app", login_hint=request.args.get("login_hint"))
     except GmailError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"url": url})
@@ -8118,7 +8131,8 @@ def gmail_disconnect():
     from gmail.adapter import disconnect
     db = get_db()
     cur = dict_cursor(db)
-    disconnect(cur, db, current_user_id())
+    # account_id: one mailbox; omitted (older clients): all of them
+    disconnect(cur, db, current_user_id(), _mail_account_id_arg())
     return jsonify({"ok": True})
 
 

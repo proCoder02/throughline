@@ -2,7 +2,9 @@
 Outlook mail integration. app.py uses it for its /integrations/outlook/*
 routes; the chat reaches its tools through mail_common.py, which needs the
 provider surface below (PROVIDER, LABEL, is_enabled, TOOLS,
-get_tool_handler, get_account) -- same surface as gmail/adapter.py.
+get_tool_handler, get_accounts) -- same surface as gmail/adapter.py. A
+user may link several Outlook mailboxes; list/search cover all of them
+unless the model passes `account`.
 
 Each user links their own Microsoft account (personal or work/school) via
 OAuth; the global-chat agent loop then gets read-only mail tools (list
@@ -17,7 +19,7 @@ clients hide the feature.
 Read-only by construction: the only scope requested is Mail.Read, so even a
 prompt-injected email can't make these tools change or send anything in the
 mailbox itself. Email content IS untrusted input to the model though -- see
-_UNTRUSTED_NOTE.
+mail_common.UNTRUSTED_NOTE.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import UNTRUSTED_NOTE
+from mail_common import Mailboxes, account_param, newest_first, prefixed_id
 
 from . import graph
 from .graph import GraphError
@@ -78,32 +80,47 @@ def _decrypt(ciphertext: str) -> str:
 # Account / token management
 # ---------------------------------------------------------------------------
 
-def _get_account(cur, user_id: int) -> dict | None:
-    cur.execute("SELECT * FROM outlook_accounts WHERE user_id = %s AND revoked_at IS NULL", (user_id,))
-    return cur.fetchone()
+def get_accounts(cur, user_id: int) -> list[dict]:
+    """Every linked (not disconnected) Outlook mailbox for this user (e.g.
+    personal + work), in the order first linked -- by id, so a reconnect
+    doesn't reshuffle the list."""
+    cur.execute(
+        "SELECT * FROM outlook_accounts WHERE user_id = %s AND revoked_at IS NULL ORDER BY id",
+        (user_id,),
+    )
+    return cur.fetchall()
 
 
-get_account = _get_account  # provider surface for mail_common
+def _account_status(a: dict) -> dict:
+    return {
+        "id": a["id"], "email": a["email"],
+        "connected_at": a["connected_at"].isoformat() if a.get("connected_at") else None,
+        # Still linked, but Microsoft stopped honoring the refresh token
+        # (password change, revoked consent, ~90 days idle) -- the client
+        # shows a Reconnect state instead of a misleading "Connected".
+        "needs_reconnect": bool(a.get("needs_reconnect")),
+    }
 
 
 def get_status(cur, user_id: int) -> dict:
     if not is_enabled():
         return {"enabled": False}
-    account = _get_account(cur, user_id)
+    accounts = [_account_status(a) for a in get_accounts(cur, user_id)]
+    first = accounts[0] if accounts else None
     return {
         "enabled": True,
-        "connected": account is not None,
-        # Still linked, but Microsoft stopped honoring the refresh token
-        # (password change, revoked consent, ~90 days idle) -- the client
-        # shows a Reconnect state instead of a misleading "Connected".
-        "needs_reconnect": bool(account and account.get("needs_reconnect")),
-        "email": account["email"] if account else None,
-        "connected_at": account["connected_at"].isoformat() if account else None,
+        "accounts": accounts,
+        # Single-account fields (first linked mailbox), kept for app builds
+        # that predate multi-account support.
+        "connected": first is not None,
+        "needs_reconnect": bool(first and first["needs_reconnect"]),
+        "email": first["email"] if first else None,
+        "connected_at": first["connected_at"] if first else None,
     }
 
 
-def _mark_needs_reconnect(cur, db, user_id: int) -> None:
-    cur.execute("UPDATE outlook_accounts SET needs_reconnect = TRUE WHERE user_id = %s", (user_id,))
+def _mark_needs_reconnect(cur, db, account: dict) -> None:
+    cur.execute("UPDATE outlook_accounts SET needs_reconnect = TRUE WHERE id = %s", (account["id"],))
     db.commit()
 
 
@@ -112,10 +129,7 @@ def _expiry_from(token_response: dict) -> datetime | None:
     return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in)) if expires_in else None
 
 
-def _ensure_fresh_token(cur, db, user_id: int) -> str:
-    account = _get_account(cur, user_id)
-    if not account:
-        raise NotConnectedError()
+def _ensure_fresh_token(cur, db, account: dict) -> str:
     expires_at = account["token_expires_at"]
     if expires_at is not None:
         if expires_at.tzinfo is None:
@@ -130,16 +144,16 @@ def _ensure_fresh_token(cur, db, user_id: int) -> str:
     except GraphError:
         # Refresh token revoked/expired (password change, admin revoke, 90
         # days idle) -- the only fix is the user reconnecting.
-        _mark_needs_reconnect(cur, db, user_id)
+        _mark_needs_reconnect(cur, db, account)
         raise NotConnectedError()
     new_access = token_response["access_token"]
     new_refresh = token_response.get("refresh_token")
     cur.execute(
         "UPDATE outlook_accounts SET access_token_encrypted = %s, "
         "refresh_token_encrypted = COALESCE(%s, refresh_token_encrypted), token_expires_at = %s "
-        "WHERE user_id = %s",
+        "WHERE id = %s",
         (_encrypt(new_access), _encrypt(new_refresh) if new_refresh else None,
-         _expiry_from(token_response), user_id),
+         _expiry_from(token_response), account["id"]),
     )
     db.commit()
     return new_access
@@ -152,16 +166,18 @@ def _ensure_fresh_token(cur, db, user_id: int) -> str:
 CLIENTS = ("web", "app")
 
 
-def get_authorize_url(cur, db, user_id: int, client: str = "web") -> str:
+def get_authorize_url(cur, db, user_id: int, client: str = "web", login_hint: str | None = None) -> str:
     """client decides where the callback lands afterwards: 'web' redirects
     back into the SPA, 'app' (Flutter, signed in via the system browser)
-    gets a static "you can close this window" page."""
+    gets a static "you can close this window" page. Signing in with a
+    different Microsoft account ADDS a mailbox; login_hint (an already-
+    linked address) is for reconnecting that one."""
     if client not in CLIENTS:
         client = "web"
     try:
         verifier, challenge = graph.generate_pkce_pair()
         state = secrets.token_urlsafe(32)
-        url = graph.build_authorize_url(state, challenge)
+        url = graph.build_authorize_url(state, challenge, (login_hint or "").strip() or None)
     except RuntimeError as e:
         raise OutlookError(str(e)) from e
     # Abandoned attempts never reach the callback that deletes them.
@@ -221,17 +237,22 @@ def handle_callback(cur, db, code: str, state: str) -> dict:
     access_token = token_response["access_token"]
     refresh_token = token_response.get("refresh_token")
 
-    email = None
+    # The address identifies the mailbox (one row per user + address), so
+    # it's required.
     try:
         me = graph.get("/me", access_token, params={"$select": "mail,userPrincipalName"})
-        email = me.get("mail") or me.get("userPrincipalName")
+        email = ((me.get("mail") or me.get("userPrincipalName") or "").strip().lower()) or None
     except GraphError:
-        pass  # display-only, not required to complete linking
+        email = None
+    if not email:
+        raise OutlookError("Couldn't read which Outlook address this is. Please try connecting again.")
 
+    # Same address again = reconnect in place (even after a disconnect);
+    # a new address adds a mailbox alongside the others.
     cur.execute(
         "INSERT INTO outlook_accounts (user_id, email, access_token_encrypted, refresh_token_encrypted, token_expires_at) "
         "VALUES (%s, %s, %s, %s, %s) "
-        "ON CONFLICT (user_id) DO UPDATE SET email = EXCLUDED.email, "
+        "ON CONFLICT (user_id, email) DO UPDATE SET "
         "access_token_encrypted = EXCLUDED.access_token_encrypted, "
         "refresh_token_encrypted = EXCLUDED.refresh_token_encrypted, "
         "token_expires_at = EXCLUDED.token_expires_at, connected_at = now(), revoked_at = NULL, "
@@ -243,13 +264,22 @@ def handle_callback(cur, db, code: str, state: str) -> dict:
     return {"user_id": user_id, "email": email}
 
 
-def disconnect(cur, db, user_id: int) -> None:
-    # Tokens are wiped, not just flagged -- there's nothing to keep them for.
-    cur.execute(
-        "UPDATE outlook_accounts SET revoked_at = now(), access_token_encrypted = '', "
-        "refresh_token_encrypted = NULL WHERE user_id = %s AND revoked_at IS NULL",
-        (user_id,),
-    )
+def disconnect(cur, db, user_id: int, account_id: int | None = None) -> None:
+    """One mailbox when account_id is given, otherwise all of them (what an
+    older client's plain Disconnect means). Tokens are wiped, not just
+    flagged -- there's nothing to keep them for."""
+    if account_id is None:
+        cur.execute(
+            "UPDATE outlook_accounts SET revoked_at = now(), access_token_encrypted = '', "
+            "refresh_token_encrypted = NULL WHERE user_id = %s AND revoked_at IS NULL",
+            (user_id,),
+        )
+    else:
+        cur.execute(
+            "UPDATE outlook_accounts SET revoked_at = now(), access_token_encrypted = '', "
+            "refresh_token_encrypted = NULL WHERE user_id = %s AND id = %s AND revoked_at IS NULL",
+            (user_id, account_id),
+        )
     db.commit()
 
 
@@ -259,8 +289,6 @@ def disconnect(cur, db, user_id: int) -> None:
 # raising, same convention as the other _tool_* handlers in app.py, so the
 # model can relay a problem (not connected, bad id) as a normal reply.
 # ---------------------------------------------------------------------------
-
-_UNTRUSTED_NOTE = UNTRUSTED_NOTE  # every tool result carries it -- see mail_common
 
 _FOLDER_LABELS = {
     "inbox": "inbox", "sentitems": "sent mail", "drafts": "drafts",
@@ -291,6 +319,7 @@ TOOLS = [
                         "description": "inbox (default), sentitems, drafts, archive, junkemail, or deleteditems.",
                     },
                     "limit": {"type": "integer", "description": "Max emails to return, 1-25. Default 15."},
+                    "account": account_param("Outlook"),
                 },
             },
         },
@@ -300,7 +329,7 @@ TOOLS = [
         "function": {
             "name": "outlook_search_emails",
             "description": (
-                "Search the user's whole Outlook mailbox by keyword -- matches sender, subject and body. "
+                "Search the user's whole Outlook mailbox(es) by keyword -- matches sender, subject and body. "
                 "Use when the user asks about emails from someone or about a topic "
                 "(e.g. 'did HR email me about the offer?')."
             ),
@@ -309,6 +338,7 @@ TOOLS = [
                 "properties": {
                     "query": {"type": "string", "description": "Keywords, a sender name, or an email address."},
                     "limit": {"type": "integer", "description": "Max emails to return, 1-25. Default 10."},
+                    "account": account_param("Outlook"),
                 },
                 "required": ["query"],
             },
@@ -346,9 +376,10 @@ def _sender(msg: dict) -> str:
     return email or name or "unknown sender"
 
 
-def _summarize(msg: dict) -> dict:
+def _summarize(msg: dict, account: dict) -> dict:
     return {
-        "id": msg.get("id"),
+        "id": prefixed_id(account, msg.get("id")),
+        "account": account.get("email"),
         "from": _sender(msg),
         "subject": msg.get("subject") or "(no subject)",
         "received": msg.get("receivedDateTime"),
@@ -367,47 +398,27 @@ def _plural(n: int, word: str) -> str:
 def _source(email: dict) -> dict:
     """The slice of an email the client shows as a clickable source chip --
     never the preview/body, which only the model needs."""
-    return {"provider": PROVIDER, **{k: email.get(k) for k in ("id", "from", "subject", "received", "web_link")}}
+    return {"provider": PROVIDER, **{k: email.get(k) for k in ("id", "account", "from", "subject", "received", "web_link")}}
 
 
-_RECONNECT_ACTIVITY = {
-    "tool": "outlook", "provider": PROVIDER, "error": True,
-    "label": "Couldn't reach your Outlook -- reconnect it in Settings",
-}
+# Multi-account mechanics (run across mailboxes, per-mailbox reconnect,
+# result shaping) shared with gmail/ -- see mail_common.Mailboxes. Results
+# may carry "_activity" (human-readable lines) and "_mail_sources" (emails
+# surfaced), which app.py's tool loop pops before the model sees them.
+_MB = Mailboxes(
+    provider=PROVIDER, label=LABEL, get_accounts=lambda cur, uid: get_accounts(cur, uid),
+    ensure_token=lambda cur, db, a: _ensure_fresh_token(cur, db, a),
+    mark_needs_reconnect=lambda cur, db, a: _mark_needs_reconnect(cur, db, a),
+    api_error=GraphError, not_connected=NotConnectedError,
+)
 
 
-def _with_token(fn):
-    """Wraps a handler's Graph work with token lookup and maps the expected
-    failures to model-relayable {"error": ...} results. Successful results
-    may carry "_activity" (one human-readable line, e.g. "Searched your
-    inbox for 'offer'") and "_mail_sources" (emails it surfaced) -- app.py's
-    tool loop pops both before the result goes back to the model and hands
-    them to the client instead."""
-    def handler(cur, db, user_id, args):
-        try:
-            token = _ensure_fresh_token(cur, db, user_id)
-            return {**fn(token, args), "note": _UNTRUSTED_NOTE}
-        except NotConnectedError:
-            return {
-                "error": "The user's Outlook account isn't connected, or needs reconnecting -- tell them to "
-                         "reconnect it in Settings.",
-                "_activity": _RECONNECT_ACTIVITY,
-            }
-        except GraphError as e:
-            if e.status == 401:
-                _mark_needs_reconnect(cur, db, user_id)
-                return {
-                    "error": "Microsoft rejected the saved sign-in -- tell the user to reconnect Outlook in Settings.",
-                    "_activity": _RECONNECT_ACTIVITY,
-                }
-            if e.status in (400, 404):
-                return {"error": f"Outlook couldn't find that: {e}. If using a message_id, re-run the list/search tool and copy the id exactly."}
-            return {"error": f"Outlook request failed: {e}"}
-    return handler
+def _mailboxes(n: int, where: str) -> str:
+    return f"your {where}" if n == 1 else f"{n} Outlook mailboxes ({where})"
 
 
-@_with_token
-def _list_recent(token: str, args: dict) -> dict:
+@_MB.tool
+def _list_recent(cur, db, accounts, args) -> dict:
     days = _clamp(args.get("days"), 7, 1, 30)
     limit = _clamp(args.get("limit"), 15, 1, 25)
     folder = (args.get("folder") or "inbox").strip().lower()
@@ -418,50 +429,60 @@ def _list_recent(token: str, args: dict) -> dict:
     filter_expr = f"receivedDateTime ge {since}"
     if args.get("unread_only"):
         filter_expr += " and isRead eq false"
-    data = graph.get(
+    done, broken = _MB.across(cur, db, accounts, lambda token, a: [_summarize(m, a) for m in graph.get(
         f"/me/mailFolders/{folder}/messages", token,
         params={"$filter": filter_expr, "$orderby": "receivedDateTime desc", "$top": limit, "$select": _LIST_SELECT},
-    )
-    emails = [_summarize(m) for m in data.get("value", [])]
+    ).get("value", [])])
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], limit)
     where = _FOLDER_LABELS.get(folder, folder)
-    label = f"Checked your {where} · {_plural(len(emails), 'unread email' if args.get('unread_only') else 'email')} from the last {_plural(days, 'day')}"
-    return {
+    label = (f"Checked {_mailboxes(len(done), where)} · "
+             f"{_plural(len(emails), 'unread email' if args.get('unread_only') else 'email')} from the last {_plural(days, 'day')}")
+    return _MB.with_failures({
         "ok": True, "folder": folder, "days": days, "count": len(emails), "emails": emails,
-        "_activity": {"tool": "outlook_list_recent_emails", "provider": PROVIDER, "label": label},
+        "mailboxes": [a.get("email") for a, _ in done],
         "_mail_sources": [_source(e) for e in emails],
-    }
+    }, broken, {"tool": "outlook_list_recent_emails", "provider": PROVIDER, "label": label})
 
 
-@_with_token
-def _search(token: str, args: dict) -> dict:
+@_MB.tool
+def _search(cur, db, accounts, args) -> dict:
     query = (args.get("query") or "").replace('"', " ").strip()
     if not query:
         return {"error": "query is required"}
     limit = _clamp(args.get("limit"), 10, 1, 25)
-    # $search can't be combined with $orderby -- Graph returns by relevance.
-    data = graph.get(
+    # $search can't be combined with $orderby -- Graph returns by relevance;
+    # merged across mailboxes, newest first.
+    done, broken = _MB.across(cur, db, accounts, lambda token, a: [_summarize(m, a) for m in graph.get(
         "/me/messages", token,
         params={"$search": f'"{query}"', "$top": limit, "$select": _LIST_SELECT},
-    )
-    emails = [_summarize(m) for m in data.get("value", [])]
-    return {
+    ).get("value", [])])
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], limit)
+    where = "Outlook" if len(done) == 1 else f"{len(done)} Outlook mailboxes"
+    return _MB.with_failures({
         "ok": True, "query": query, "count": len(emails), "emails": emails,
-        "_activity": {"tool": "outlook_search_emails", "provider": PROVIDER,
-                      "label": f"Searched Outlook for “{query}” · {_plural(len(emails), 'match')}"},
+        "mailboxes": [a.get("email") for a, _ in done],
         "_mail_sources": [_source(e) for e in emails],
-    }
+    }, broken, {"tool": "outlook_search_emails", "provider": PROVIDER,
+                "label": f"Searched {where} for “{query}” · {_plural(len(emails), 'match')}"})
 
 
-@_with_token
-def _read(token: str, args: dict) -> dict:
-    message_id = (args.get("message_id") or "").strip()
-    if not message_id:
+@_MB.tool
+def _read(cur, db, accounts, args) -> dict:
+    given = (args.get("message_id") or "").strip()
+    if not given:
         return {"error": "message_id is required"}
-    msg = graph.get(
-        f"/me/messages/{quote(message_id, safe='')}", token,
+    # The id's prefix says which mailbox to open.
+    account, msg, message_id = _MB.read_one(cur, db, accounts, given, lambda token, raw: graph.get(
+        f"/me/messages/{quote(raw, safe='')}", token,
         params={"$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,webLink"},
         headers={"Prefer": 'outlook.body-content-type="text"'},
-    )
+    ))
+    if account is None:
+        return msg  # an error result
     body = ((msg.get("body") or {}).get("content") or "").strip()
     truncated = len(body) > _MAX_BODY_CHARS
 
@@ -470,11 +491,13 @@ def _read(token: str, args: dict) -> dict:
 
     subject = msg.get("subject") or "(no subject)"
     source = {
-        "provider": PROVIDER, "id": msg.get("id") or message_id, "from": _sender(msg), "subject": subject,
+        "provider": PROVIDER, "id": prefixed_id(account, msg.get("id") or message_id), "account": account.get("email"),
+        "from": _sender(msg), "subject": subject,
         "received": msg.get("receivedDateTime"), "web_link": msg.get("webLink"),
     }
     return {
         "ok": True,
+        "account": account.get("email"),
         "from": source["from"],
         "to": _addresses("toRecipients"),
         "cc": _addresses("ccRecipients"),
@@ -483,7 +506,7 @@ def _read(token: str, args: dict) -> dict:
         "has_attachments": bool(msg.get("hasAttachments")),
         "body": body[:_MAX_BODY_CHARS],
         "body_truncated": truncated,
-        "_activity": {"tool": "outlook_read_email", "provider": PROVIDER, "label": f"Read “{subject}”", "read_id": source["id"]},
+        "_activity": [{"tool": "outlook_read_email", "provider": PROVIDER, "label": f"Read “{subject}”", "read_id": source["id"]}],
         "_mail_sources": [source],
     }
 

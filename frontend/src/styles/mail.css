@@ -157,6 +157,28 @@ a.mail-source:focus-visible { outline: 2px solid var(--mail-accent); outline-off
   background: var(--mail-ok);
   flex-shrink: 0;
 }
+.mail-settings-dot.warn { background: #f59e0b; }
+.mail-accounts { list-style: none; margin: 6px 0 0; padding: 0; }
+.mail-accounts .mail-settings-row { margin: 0; padding: 9px 0; border-bottom: 1px solid var(--mail-border); }
+.mail-accounts .mail-settings-row:last-child { border-bottom: 0; }
+.mail-add-account {
+  display: inline-block;
+  margin: 8px 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mail-accent);
+  text-decoration: none;
+}
+.mail-add-account:hover { text-decoration: underline; }
+.mail-settings-hint { margin: 6px 0 0; font-size: 12px; color: var(--mail-soft); }
+.mail-source-account {
+  font-size: 10.5px;
+  color: var(--mail-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .mail-settings-warning {
   margin: 10px 0 4px;
   padding: 9px 11px;

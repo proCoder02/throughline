@@ -806,3 +806,32 @@ CREATE TABLE IF NOT EXISTS gmail_accounts (
     revoked_at TIMESTAMPTZ,
     needs_reconnect BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- Several linked mailboxes per user (e.g. personal + work), for both
+-- providers: each row gets its own id key, and (user, address) becomes the
+-- unique pair a reconnect upserts on. Idempotent; existing links carry over
+-- (each keeps its row, gaining an id).
+ALTER TABLE outlook_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+ALTER TABLE gmail_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['outlook_accounts', 'gmail_accounts'] LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage k ON k.constraint_name = tc.constraint_name
+            WHERE tc.table_name = t AND tc.constraint_type = 'PRIMARY KEY' AND k.column_name = 'user_id'
+        ) THEN
+            EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', t, t || '_pkey');
+            EXECUTE format('ALTER TABLE %I ADD PRIMARY KEY (id)', t);
+        END IF;
+    END LOOP;
+END $$;
+-- Addresses are stored lowercased (the adapters normalize on link), so a
+-- reconnect always lands on the same row.
+UPDATE outlook_accounts SET email = lower(email) WHERE email <> lower(email);
+UPDATE gmail_accounts SET email = lower(email) WHERE email <> lower(email);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_outlook_accounts_user_email ON outlook_accounts (user_id, email);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_gmail_accounts_user_email ON gmail_accounts (user_id, email);
+CREATE INDEX IF NOT EXISTS idx_outlook_accounts_user ON outlook_accounts (user_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_accounts_user ON gmail_accounts (user_id);

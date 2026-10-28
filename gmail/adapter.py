@@ -4,9 +4,11 @@ chat reaches its tools through mail_common.py, via the provider surface
 (PROVIDER, LABEL, is_enabled, TOOLS, get_tool_handler, get_account) --
 same surface and same behavior contract as outlook/adapter.py.
 
-Each user links their own Google account via OAuth; the global-chat agent
-loop then gets read-only tools (list recent, search, read one) backed by
-the Gmail API with that user's token.
+Each user links one or more Google accounts via OAuth; the global-chat
+agent loop then gets read-only tools (list recent, search, read one)
+backed by the Gmail API. List/search cover every linked mailbox unless the
+model passes `account`; ids are account-prefixed (mail_common.prefixed_id)
+so a read always hits the right mailbox.
 
 Gated behind GMAIL_ENABLED in .env: flag off (the default) -> mail_common
 offers none of these tools, every route 404s, /status reports
@@ -32,7 +34,7 @@ from email.utils import parseaddr
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import UNTRUSTED_NOTE
+from mail_common import Mailboxes, account_param, newest_first, prefixed_id
 
 from . import google
 from .google import GoogleError
@@ -82,21 +84,38 @@ def _decrypt(ciphertext: str) -> str:
 # Account / token management
 # ---------------------------------------------------------------------------
 
-def get_account(cur, user_id: int) -> dict | None:
-    cur.execute("SELECT * FROM gmail_accounts WHERE user_id = %s AND revoked_at IS NULL", (user_id,))
-    return cur.fetchone()
+def get_accounts(cur, user_id: int) -> list[dict]:
+    """Every linked (not disconnected) Gmail mailbox for this user, in the
+    order first linked (by id -- a reconnect doesn't reshuffle the list)."""
+    cur.execute(
+        "SELECT * FROM gmail_accounts WHERE user_id = %s AND revoked_at IS NULL ORDER BY id",
+        (user_id,),
+    )
+    return cur.fetchall()
+
+
+def _account_status(a: dict) -> dict:
+    return {
+        "id": a["id"], "email": a["email"],
+        "connected_at": a["connected_at"].isoformat() if a.get("connected_at") else None,
+        "needs_reconnect": bool(a.get("needs_reconnect")),
+    }
 
 
 def get_status(cur, user_id: int) -> dict:
     if not is_enabled():
         return {"enabled": False}
-    account = get_account(cur, user_id)
+    accounts = [_account_status(a) for a in get_accounts(cur, user_id)]
+    first = accounts[0] if accounts else None
     return {
         "enabled": True,
-        "connected": account is not None,
-        "needs_reconnect": bool(account and account.get("needs_reconnect")),
-        "email": account["email"] if account else None,
-        "connected_at": account["connected_at"].isoformat() if account else None,
+        "accounts": accounts,
+        # Single-account fields (first linked mailbox), kept for app builds
+        # that predate multi-account support.
+        "connected": first is not None,
+        "needs_reconnect": bool(first and first["needs_reconnect"]),
+        "email": first["email"] if first else None,
+        "connected_at": first["connected_at"] if first else None,
         # Until Google verifies the app (restricted scope), refresh tokens
         # expire after 7 days -- the clients say so up front. Set
         # GMAIL_APP_VERIFIED=true once verification is through.
@@ -104,8 +123,8 @@ def get_status(cur, user_id: int) -> dict:
     }
 
 
-def _mark_needs_reconnect(cur, db, user_id: int) -> None:
-    cur.execute("UPDATE gmail_accounts SET needs_reconnect = TRUE WHERE user_id = %s", (user_id,))
+def _mark_needs_reconnect(cur, db, account: dict) -> None:
+    cur.execute("UPDATE gmail_accounts SET needs_reconnect = TRUE WHERE id = %s", (account["id"],))
     db.commit()
 
 
@@ -114,7 +133,7 @@ def _expiry_from(token_response: dict) -> datetime | None:
     return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in)) if expires_in else None
 
 
-def _ensure_fresh_token(cur, db, user_id: int, account: dict) -> str:
+def _ensure_fresh_token(cur, db, account: dict) -> str:
     expires_at = account["token_expires_at"]
     if expires_at is not None:
         if expires_at.tzinfo is None:
@@ -128,15 +147,15 @@ def _ensure_fresh_token(cur, db, user_id: int, account: dict) -> str:
     except GoogleError:
         # invalid_grant: revoked, password change, or Testing mode's 7-day
         # refresh-token expiry -- only reconnecting fixes it.
-        _mark_needs_reconnect(cur, db, user_id)
+        _mark_needs_reconnect(cur, db, account)
         raise NotConnectedError()
     new_access = token_response["access_token"]
     new_refresh = token_response.get("refresh_token")
     cur.execute(
         "UPDATE gmail_accounts SET access_token_encrypted = %s, "
         "refresh_token_encrypted = COALESCE(%s, refresh_token_encrypted), token_expires_at = %s "
-        "WHERE user_id = %s",
-        (_encrypt(new_access), _encrypt(new_refresh) if new_refresh else None, _expiry_from(token_response), user_id),
+        "WHERE id = %s",
+        (_encrypt(new_access), _encrypt(new_refresh) if new_refresh else None, _expiry_from(token_response), account["id"]),
     )
     db.commit()
     return new_access
@@ -149,15 +168,17 @@ def _ensure_fresh_token(cur, db, user_id: int, account: dict) -> str:
 CLIENTS = ("web", "app")
 
 
-def get_authorize_url(cur, db, user_id: int, client: str = "web") -> str:
+def get_authorize_url(cur, db, user_id: int, client: str = "web", login_hint: str | None = None) -> str:
     """client decides where the callback lands: 'web' redirects back into
-    the SPA, 'app' (Flutter, via the system browser) gets a static page."""
+    the SPA, 'app' (Flutter, via the system browser) gets a static page.
+    Connecting again with a different Google account ADDS a mailbox;
+    login_hint (an already-linked address) is for reconnecting that one."""
     if client not in CLIENTS:
         client = "web"
     try:
         verifier, challenge = google.generate_pkce_pair()
         state = secrets.token_urlsafe(32)
-        url = google.build_authorize_url(state, challenge)
+        url = google.build_authorize_url(state, challenge, (login_hint or "").strip() or None)
     except RuntimeError as e:
         raise GmailError(str(e)) from e
     cur.execute("DELETE FROM gmail_oauth_pending WHERE created_at < now() - interval '1 hour'")
@@ -211,16 +232,22 @@ def handle_callback(cur, db, code: str, state: str) -> dict:
     access_token = token_response["access_token"]
     refresh_token = token_response.get("refresh_token")
 
-    email = None
+    # The address identifies the mailbox (one row per user + address), so
+    # it's required -- /profile only needs the gmail.readonly scope.
     try:
-        email = google.get("/profile", access_token).get("emailAddress")
+        email = (google.get("/profile", access_token).get("emailAddress") or "").strip().lower() or None
     except GoogleError:
-        pass  # display-only, not required to complete linking
+        email = None
+    if not email:
+        raise GmailError("Couldn't read which Gmail address this is. Please try connecting again.")
 
+    # One row per (user, address): the same address again is a reconnect
+    # (refresh in place, even if it was disconnected before); a new address
+    # adds a mailbox alongside the others.
     cur.execute(
         "INSERT INTO gmail_accounts (user_id, email, access_token_encrypted, refresh_token_encrypted, token_expires_at) "
         "VALUES (%s, %s, %s, %s, %s) "
-        "ON CONFLICT (user_id) DO UPDATE SET email = EXCLUDED.email, "
+        "ON CONFLICT (user_id, email) DO UPDATE SET "
         "access_token_encrypted = EXCLUDED.access_token_encrypted, "
         "refresh_token_encrypted = COALESCE(EXCLUDED.refresh_token_encrypted, gmail_accounts.refresh_token_encrypted), "
         "token_expires_at = EXCLUDED.token_expires_at, connected_at = now(), revoked_at = NULL, "
@@ -232,9 +259,11 @@ def handle_callback(cur, db, code: str, state: str) -> dict:
     return {"user_id": user_id, "email": email}
 
 
-def disconnect(cur, db, user_id: int) -> None:
-    account = get_account(cur, user_id)
-    if account:
+def disconnect(cur, db, user_id: int, account_id: int | None = None) -> None:
+    """One mailbox when account_id is given, otherwise all of them (what an
+    older client's plain Disconnect means)."""
+    accounts = [a for a in get_accounts(cur, user_id) if account_id is None or a["id"] == account_id]
+    for account in accounts:
         # Drop the grant on Google's side too (best effort), so the app also
         # disappears from the user's Google "third-party connections".
         try:
@@ -243,11 +272,11 @@ def disconnect(cur, db, user_id: int) -> None:
                 google.revoke(_decrypt(token))
         except Exception:
             pass
-    cur.execute(
-        "UPDATE gmail_accounts SET revoked_at = now(), access_token_encrypted = '', "
-        "refresh_token_encrypted = NULL WHERE user_id = %s AND revoked_at IS NULL",
-        (user_id,),
-    )
+        cur.execute(
+            "UPDATE gmail_accounts SET revoked_at = now(), access_token_encrypted = '', "
+            "refresh_token_encrypted = NULL WHERE id = %s",
+            (account["id"],),
+        )
     db.commit()
 
 
@@ -291,6 +320,7 @@ TOOLS = [
                         "description": "inbox (default), sent, drafts, starred, important, spam, trash, or all.",
                     },
                     "limit": {"type": "integer", "description": "Max emails to return, 1-25. Default 15."},
+                    "account": account_param("Gmail"),
                 },
             },
         },
@@ -300,7 +330,7 @@ TOOLS = [
         "function": {
             "name": "gmail_search_emails",
             "description": (
-                "Search the user's whole Gmail mailbox. Accepts plain keywords or Gmail search operators "
+                "Search the user's whole Gmail mailbox(es). Accepts plain keywords or Gmail search operators "
                 "(from:hr@company.com, subject:offer, has:attachment, after:2026/10/01, is:unread). Use when the "
                 "user asks about emails from someone or about a topic."
             ),
@@ -309,6 +339,7 @@ TOOLS = [
                 "properties": {
                     "query": {"type": "string", "description": "Keywords and/or Gmail search operators."},
                     "limit": {"type": "integer", "description": "Max emails to return, 1-25. Default 10."},
+                    "account": account_param("Gmail"),
                 },
                 "required": ["query"],
             },
@@ -371,23 +402,24 @@ def _web_link(msg: dict, account_email: str | None) -> str:
     return f"https://mail.google.com/mail/u/{account}#all/{thread_id}"
 
 
-def _summarize(msg: dict, account_email: str | None) -> dict:
+def _summarize(msg: dict, account: dict) -> dict:
     h = _headers(msg)
     labels = set(msg.get("labelIds") or [])
     return {
-        "id": msg.get("id"),
+        "id": prefixed_id(account, msg.get("id")),
+        "account": account.get("email"),
         "from": _sender(h.get("from")),
         "subject": h.get("subject") or "(no subject)",
         "received": _received(msg),
         "preview": html.unescape(msg.get("snippet") or ""),
         "unread": "UNREAD" in labels,
         "important": "IMPORTANT" in labels,
-        "web_link": _web_link(msg, account_email),
+        "web_link": _web_link(msg, account.get("email")),
     }
 
 
 def _source(email: dict) -> dict:
-    return {"provider": PROVIDER, **{k: email.get(k) for k in ("id", "from", "subject", "received", "web_link")}}
+    return {"provider": PROVIDER, **{k: email.get(k) for k in ("id", "account", "from", "subject", "received", "web_link")}}
 
 
 def _fetch_metadata(token: str, ids: list[str]) -> list[dict]:
@@ -405,34 +437,12 @@ def _fetch_metadata(token: str, ids: list[str]) -> list[dict]:
         return list(pool.map(one, ids))
 
 
-_RECONNECT_ACTIVITY = {
-    "tool": "gmail", "provider": PROVIDER, "error": True,
-    "label": "Couldn't reach your Gmail -- reconnect it in Settings",
-}
-
-
-def _with_token(fn):
-    def handler(cur, db, user_id, args):
-        try:
-            account = get_account(cur, user_id)
-            if not account:
-                raise NotConnectedError()
-            token = _ensure_fresh_token(cur, db, user_id, account)
-            return {**fn(token, args, account.get("email")), "note": UNTRUSTED_NOTE}
-        except NotConnectedError:
-            return {
-                "error": "The user's Gmail account isn't connected, or needs reconnecting -- tell them to reconnect it in Settings.",
-                "_activity": _RECONNECT_ACTIVITY,
-            }
-        except GoogleError as e:
-            if e.status == 401:
-                _mark_needs_reconnect(cur, db, user_id)
-                return {"error": "Google rejected the saved sign-in -- tell the user to reconnect Gmail in Settings.",
-                        "_activity": _RECONNECT_ACTIVITY}
-            if e.status in (400, 404):
-                return {"error": f"Gmail couldn't find that: {e}. If using a message_id, re-run the list/search tool and copy the id exactly."}
-            return {"error": f"Gmail request failed: {e}"}
-    return handler
+_MB = Mailboxes(
+    provider=PROVIDER, label=LABEL, get_accounts=lambda cur, uid: get_accounts(cur, uid),
+    ensure_token=lambda cur, db, a: _ensure_fresh_token(cur, db, a),
+    mark_needs_reconnect=lambda cur, db, a: _mark_needs_reconnect(cur, db, a),
+    api_error=GoogleError, not_connected=NotConnectedError,
+)
 
 
 def _list_ids(token: str, query: str, limit: int) -> list[str]:
@@ -440,8 +450,12 @@ def _list_ids(token: str, query: str, limit: int) -> list[str]:
     return [m["id"] for m in data.get("messages") or [] if m.get("id")]
 
 
-@_with_token
-def _list_recent(token: str, args: dict, account_email: str | None) -> dict:
+def _mailboxes(n: int) -> str:
+    return "your Gmail" if n == 1 else f"{n} Gmail mailboxes"
+
+
+@_MB.tool
+def _list_recent(cur, db, accounts, args) -> dict:
     days = _clamp(args.get("days"), 7, 1, 30)
     limit = _clamp(args.get("limit"), 15, 1, 25)
     folder = (args.get("folder") or "inbox").strip().lower()
@@ -449,29 +463,38 @@ def _list_recent(token: str, args: dict, account_email: str | None) -> dict:
         folder = "inbox"
     folder_q, where = _FOLDER_QUERY[folder]
     query = " ".join(p for p in (folder_q, f"newer_than:{days}d", "is:unread" if args.get("unread_only") else "") if p)
-    emails = [_summarize(m, account_email) for m in _fetch_metadata(token, _list_ids(token, query, limit))]
-    label = (f"Checked your Gmail {where} · "
+    done, broken = _MB.across(cur, db, accounts, lambda token, a: [
+        _summarize(m, a) for m in _fetch_metadata(token, _list_ids(token, query, limit))])
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], limit)
+    label = (f"Checked {_mailboxes(len(done))} ({where}) · "
              f"{_plural(len(emails), 'unread email' if args.get('unread_only') else 'email')} from the last {_plural(days, 'day')}")
-    return {
+    return _MB.with_failures({
         "ok": True, "folder": folder, "days": days, "count": len(emails), "emails": emails,
-        "_activity": {"tool": "gmail_list_recent_emails", "provider": PROVIDER, "label": label},
+        "mailboxes": [a.get("email") for a, _ in done],
         "_mail_sources": [_source(e) for e in emails],
-    }
+    }, broken, {"tool": "gmail_list_recent_emails", "provider": PROVIDER, "label": label})
 
 
-@_with_token
-def _search(token: str, args: dict, account_email: str | None) -> dict:
+@_MB.tool
+def _search(cur, db, accounts, args) -> dict:
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
     limit = _clamp(args.get("limit"), 10, 1, 25)
-    emails = [_summarize(m, account_email) for m in _fetch_metadata(token, _list_ids(token, query, limit))]
-    return {
+    done, broken = _MB.across(cur, db, accounts, lambda token, a: [
+        _summarize(m, a) for m in _fetch_metadata(token, _list_ids(token, query, limit))])
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], limit)
+    where = "Gmail" if len(done) == 1 else f"{len(done)} Gmail mailboxes"
+    return _MB.with_failures({
         "ok": True, "query": query, "count": len(emails), "emails": emails,
-        "_activity": {"tool": "gmail_search_emails", "provider": PROVIDER,
-                      "label": f"Searched Gmail for “{query}” · {_plural(len(emails), 'match')}"},
+        "mailboxes": [a.get("email") for a, _ in done],
         "_mail_sources": [_source(e) for e in emails],
-    }
+    }, broken, {"tool": "gmail_search_emails", "provider": PROVIDER,
+                "label": f"Searched {where} for “{query}” · {_plural(len(emails), 'match')}"})
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -515,21 +538,27 @@ def _body_and_attachments(payload: dict) -> tuple[str, list[str]]:
     return _html_to_text("\n".join(rich)), attachments
 
 
-@_with_token
-def _read(token: str, args: dict, account_email: str | None) -> dict:
-    message_id = (args.get("message_id") or "").strip()
-    if not message_id:
+@_MB.tool
+def _read(cur, db, accounts, args) -> dict:
+    given = (args.get("message_id") or "").strip()
+    if not given:
         return {"error": "message_id is required"}
-    msg = google.get(f"/messages/{quote(message_id, safe='')}", token, params={"format": "full"})
+    # The id's prefix says which mailbox to open.
+    account, msg, message_id = _MB.read_one(cur, db, accounts, given, lambda token, raw: google.get(
+        f"/messages/{quote(raw, safe='')}", token, params={"format": "full"}))
+    if account is None:
+        return msg  # an error result
     h = _headers(msg)
     body, attachments = _body_and_attachments(msg.get("payload"))
     subject = h.get("subject") or "(no subject)"
     source = {
-        "provider": PROVIDER, "id": msg.get("id") or message_id, "from": _sender(h.get("from")),
-        "subject": subject, "received": _received(msg), "web_link": _web_link({"id": message_id, **msg}, account_email),
+        "provider": PROVIDER, "id": prefixed_id(account, msg.get("id") or message_id), "account": account.get("email"),
+        "from": _sender(h.get("from")), "subject": subject, "received": _received(msg),
+        "web_link": _web_link({"id": message_id, **msg}, account.get("email")),
     }
     return {
         "ok": True,
+        "account": account.get("email"),
         "from": source["from"],
         "to": [a.strip() for a in (h.get("to") or "").split(",") if a.strip()],
         "cc": [a.strip() for a in (h.get("cc") or "").split(",") if a.strip()],
@@ -538,7 +567,7 @@ def _read(token: str, args: dict, account_email: str | None) -> dict:
         "attachments": attachments,
         "body": body[:_MAX_BODY_CHARS],
         "body_truncated": len(body) > _MAX_BODY_CHARS,
-        "_activity": {"tool": "gmail_read_email", "provider": PROVIDER, "label": f"Read “{subject}”", "read_id": source["id"]},
+        "_activity": [{"tool": "gmail_read_email", "provider": PROVIDER, "label": f"Read “{subject}”", "read_id": source["id"]}],
         "_mail_sources": [source],
     }
 

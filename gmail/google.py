@@ -69,7 +69,7 @@ def generate_pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-def build_authorize_url(state: str, code_challenge: str) -> str:
+def build_authorize_url(state: str, code_challenge: str, login_hint: str | None = None) -> str:
     params = {
         "client_id": client_id(),
         "redirect_uri": redirect_uri(),
@@ -84,6 +84,9 @@ def build_authorize_url(state: str, code_challenge: str) -> str:
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
     }
+    if login_hint:
+        # Reconnecting one specific mailbox -- pre-selects it on Google's picker.
+        params["login_hint"] = login_hint
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
 

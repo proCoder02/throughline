@@ -52,9 +52,27 @@ export function useMailStatus() {
   return value;
 }
 
-/** This provider is connected and usable for chat right now. */
+/** A provider status's linked mailboxes ({id, email, connected_at,
+ * needs_reconnect}) -- tolerates a backend that predates multi-account. */
+export function mailAccounts(s) {
+  if (!s?.enabled) return [];
+  if (Array.isArray(s.accounts)) return s.accounts;
+  return s.connected ? [{ id: null, email: s.email, connected_at: s.connected_at, needs_reconnect: !!s.needs_reconnect }] : [];
+}
+
+/** At least one of this provider's mailboxes is usable for chat right now. */
 export function providerReady(s) {
-  return !!(s?.enabled && s.connected && !s.needs_reconnect);
+  return mailAccounts(s).some((a) => !a.needs_reconnect);
+}
+
+/** Total linked mailboxes across providers -- source chips only name the
+ * mailbox an email came from when there's more than one. */
+export function linkedMailboxCount(all) {
+  return PROVIDER_KEYS.reduce((n, p) => n + mailAccounts(all?.[p]).length, 0);
+}
+
+export function connectHref(provider, loginHint) {
+  return `/integrations/${provider}/connect` + (loginHint ? `?login_hint=${encodeURIComponent(loginHint)}` : '');
 }
 
 /** At least one mailbox is usable for chat right now. */

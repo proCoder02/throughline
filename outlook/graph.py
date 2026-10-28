@@ -73,7 +73,7 @@ def generate_pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-def build_authorize_url(state: str, code_challenge: str) -> str:
+def build_authorize_url(state: str, code_challenge: str, login_hint: str | None = None) -> str:
     params = {
         "client_id": client_id(),
         "response_type": "code",
@@ -88,6 +88,9 @@ def build_authorize_url(state: str, code_challenge: str) -> str:
         # with whichever one the browser last used.
         "prompt": "select_account",
     }
+    if login_hint:
+        # Reconnecting one specific mailbox -- pre-fills it on Microsoft's picker.
+        params["login_hint"] = login_hint
     return f"{_authority()}/authorize?{urlencode(params)}"
 
 
