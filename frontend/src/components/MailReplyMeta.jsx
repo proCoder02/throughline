@@ -5,6 +5,15 @@ import '../styles/mail.css';
 // Sources/activity saved before Gmail existed carry no provider -- they were Outlook.
 const providerOf = (x) => (x?.provider && MAIL_PROVIDERS[x.provider] ? x.provider : 'outlook');
 
+// Gmail links saved by the first release used /mail/u/?authuser=<addr>#all/<id>,
+// whose authuser redirect can drop the #fragment -- rewrite them to the
+// /mail/u/<addr>/#all/<id> form new replies already carry.
+const OLD_GMAIL_LINK_RE = /^https:\/\/mail\.google\.com\/mail\/u\/\?authuser=([^#]+)#all\/(.+)$/;
+function webLink(source) {
+  const m = OLD_GMAIL_LINK_RE.exec(source.web_link || '');
+  return m ? `https://mail.google.com/mail/u/${decodeURIComponent(m[1])}/#all/${m[2]}` : source.web_link;
+}
+
 const VISIBLE_SOURCES = 4;
 
 function senderName(from) {
@@ -36,7 +45,7 @@ function SourceChip({ source }) {
   const title = `${source.from || ''} — ${source.subject || ''}`;
   const where = MAIL_PROVIDERS[providerOf(source)].label;
   return source.web_link ? (
-    <a className="mail-source" href={source.web_link} target="_blank" rel="noopener noreferrer" title={`${title} (opens in ${where})`}>
+    <a className="mail-source" href={webLink(source)} target="_blank" rel="noopener noreferrer" title={`${title} (opens in ${where})`}>
       {body}
     </a>
   ) : (

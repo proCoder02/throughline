@@ -360,11 +360,15 @@ def _received(msg: dict) -> str | None:
         return None
 
 
-def _web_link(message_id: str, account_email: str | None) -> str:
-    # authuser picks the right account when the browser is signed in to
-    # several Google accounts; #all/<id> opens the message in any label.
-    who = f"?authuser={quote(account_email)}" if account_email else ""
-    return f"https://mail.google.com/mail/u/{who}#all/{message_id}"
+def _web_link(msg: dict, account_email: str | None) -> str:
+    # Gmail's web UI addresses conversations, so link the THREAD id -- a
+    # later message's own id doesn't open anything there. The account goes
+    # in the path (/u/<address>/), not ?authuser=: Gmail's authuser redirect
+    # can drop the #fragment and strand the user in the inbox. #all/ opens
+    # the thread whichever label it's under.
+    thread_id = msg.get("threadId") or msg.get("id")
+    account = f"{quote(account_email, safe='@')}/" if account_email else "0/"
+    return f"https://mail.google.com/mail/u/{account}#all/{thread_id}"
 
 
 def _summarize(msg: dict, account_email: str | None) -> dict:
@@ -378,7 +382,7 @@ def _summarize(msg: dict, account_email: str | None) -> dict:
         "preview": html.unescape(msg.get("snippet") or ""),
         "unread": "UNREAD" in labels,
         "important": "IMPORTANT" in labels,
-        "web_link": _web_link(msg.get("id"), account_email),
+        "web_link": _web_link(msg, account_email),
     }
 
 
@@ -522,7 +526,7 @@ def _read(token: str, args: dict, account_email: str | None) -> dict:
     subject = h.get("subject") or "(no subject)"
     source = {
         "provider": PROVIDER, "id": msg.get("id") or message_id, "from": _sender(h.get("from")),
-        "subject": subject, "received": _received(msg), "web_link": _web_link(msg.get("id") or message_id, account_email),
+        "subject": subject, "received": _received(msg), "web_link": _web_link({"id": message_id, **msg}, account_email),
     }
     return {
         "ok": True,
