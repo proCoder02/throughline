@@ -34,7 +34,7 @@ from email.utils import parseaddr
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import Mailboxes, account_param, newest_first, prefixed_id
+from mail_common import Mailboxes, account_param, is_automated_sender, newest_first, prefixed_id
 
 from . import google
 from .google import GoogleError
@@ -348,6 +348,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "gmail_find_needs_reply",
+            "description": (
+                "Find recent Gmail conversations still waiting on the user: the last message is from someone "
+                "else, in the primary inbox, not from a no-reply sender. Use for 'what do I need to reply to?', "
+                "'anything waiting on me?'. Returns candidates with previews -- judge which genuinely ask "
+                "something of the user before listing them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How far back to look, 1-30. Default 14."},
+                    "limit": {"type": "integer", "description": "Max candidates, 1-20. Default 10."},
+                    "account": account_param("Gmail"),
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "gmail_read_email",
             "description": "Read one Gmail email's full text. message_id must be copied exactly from a list/search result.",
             "parameters": {
@@ -497,6 +517,55 @@ def _search(cur, db, accounts, args) -> dict:
                 "label": f"Searched {where} for “{query}” · {_plural(len(emails), 'match')}"})
 
 
+def _fetch_threads(token: str, ids: list[str]) -> list[dict]:
+    def one(thread_id):
+        return google.get(
+            f"/threads/{quote(thread_id, safe='')}", token,
+            params=[("format", "metadata"), *[("metadataHeaders", h) for h in _METADATA_HEADERS]],
+        )
+    if not ids:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+        return list(pool.map(one, ids))
+
+
+@_MB.tool
+def _needs_reply(cur, db, accounts, args) -> dict:
+    days = _clamp(args.get("days"), 14, 1, 30)
+    limit = _clamp(args.get("limit"), 10, 1, 20)
+    # Primary inbox only (skips promotions/social/updates), not sent by the
+    # user, recent. Over-fetch: some threads turn out to be already answered.
+    query = f"in:inbox category:primary newer_than:{days}d -from:me"
+
+    def work(token, account):
+        data = google.get("/threads", token, params={"q": query, "maxResults": min(50, limit * 3)})
+        waiting = []
+        for thread in _fetch_threads(token, [t["id"] for t in data.get("threads") or [] if t.get("id")]):
+            messages = thread.get("messages") or []
+            if not messages:
+                continue
+            last = messages[-1]
+            if "SENT" in (last.get("labelIds") or []):
+                continue  # the user had the last word
+            sender = _headers(last).get("from", "")
+            if is_automated_sender(sender):
+                continue
+            waiting.append({**_summarize(last, account), "messages_in_thread": len(messages)})
+        return waiting
+
+    done, broken = _MB.across(cur, db, accounts, work)
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], limit)
+    return _MB.with_failures({
+        "ok": True, "days": days, "count": len(emails), "emails": emails,
+        "mailboxes": [a.get("email") for a, _ in done],
+        "guidance": "Candidates only: list just the ones that actually ask the user something or expect an answer.",
+        "_mail_sources": [_source(e) for e in emails],
+    }, broken, {"tool": "gmail_find_needs_reply", "provider": PROVIDER,
+                "label": f"Looked for Gmail threads awaiting your reply · {_plural(len(emails), 'candidate')} from the last {_plural(days, 'day')}"})
+
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _BLOCK_TAG_RE = re.compile(r"(?i)<\s*(br|/p|/div|/tr|/li|/h\d)\s*/?>")
 _STYLE_SCRIPT_RE = re.compile(r"(?is)<(style|script)[^>]*>.*?</\1>")
@@ -575,6 +644,7 @@ def _read(cur, db, accounts, args) -> dict:
 _DISPATCH = {
     "gmail_list_recent_emails": _list_recent,
     "gmail_search_emails": _search,
+    "gmail_find_needs_reply": _needs_reply,
     "gmail_read_email": _read,
 }
 

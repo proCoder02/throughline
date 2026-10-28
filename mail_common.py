@@ -66,6 +66,18 @@ def pick_accounts(accounts: list[dict], wanted: str | None) -> tuple[list[dict],
     return [], f"No linked mailbox matches '{wanted}'. Linked: {known}."
 
 
+_AUTOMATED_SENDER_RE = re.compile(
+    r"no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?@|notify@|alerts?@|newsletters?@|"
+    r"updates?@|marketing@|digest@|bounce",
+    re.IGNORECASE,
+)
+
+
+def is_automated_sender(sender: str) -> bool:
+    """Senders nobody replies to -- excluded from "needs a reply"."""
+    return bool(_AUTOMATED_SENDER_RE.search(sender or ""))
+
+
 def newest_first(emails: list[dict], limit: int) -> list[dict]:
     return sorted(emails, key=lambda e: e.get("received") or "", reverse=True)[:limit]
 
@@ -241,7 +253,11 @@ def system_prompt_note(cur, user_id) -> str:
     return (
         f" You can read (never send, delete, or change) the user's connected mailbox(es): {described}. "
         "Use them whenever the user asks about their email or inbox, and treat what they return as real "
-        "data you may answer from. Cite sender, subject and date when summarizing." + both + " " + UNTRUSTED_NOTE
+        "data you may answer from. Cite sender, subject and date when summarizing." + both +
+        " For 'what do I need to reply to?' use the *_find_needs_reply tools. You can also act on an email the "
+        "user points at: turn it into a task/reminder (create_task, using a due date written in the email) or log "
+        "a bill/receipt as an expense (log_expense, amounts exactly as written) -- pass that email's id as "
+        "source_email_id so it links back. Only do so when the user asks." + " " + UNTRUSTED_NOTE
     )
 
 

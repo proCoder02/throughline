@@ -835,3 +835,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_outlook_accounts_user_email ON outlook_acco
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gmail_accounts_user_email ON gmail_accounts (user_id, email);
 CREATE INDEX IF NOT EXISTS idx_outlook_accounts_user ON outlook_accounts (user_id);
 CREATE INDEX IF NOT EXISTS idx_gmail_accounts_user ON gmail_accounts (user_id);
+
+-- A task created from an email in chat ("remind me to pay this bill") keeps
+-- a link back to it: {provider, account, id, from, subject, received,
+-- web_link}. NULL for every other task.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS source_email JSONB;

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { post } from '../api.js';
 import TransactionConfirmModal from './TransactionConfirmModal.jsx';
 import { ReceiptIcon } from '../icons.jsx';
+import EmailSourceLink from './EmailSourceLink.jsx';
 
 // Web counterpart of the Flutter client's ExpenseConfirmCard
 // (expense_confirm_card.dart) -- the "review before saving" card a
@@ -67,6 +68,9 @@ export default function ExpenseConfirmCard({ card, onResolved }) {
       </div>
       {subtitleParts.length > 0 && (
         <div className="action-card-need" style={{ marginTop: 4 }}>{subtitleParts.join(' ')}</div>
+      )}
+      {card.source_email && (
+        <div style={{ marginTop: 6 }}><EmailSourceLink source={card.source_email} /></div>
       )}
       <div className="action-card-buttons" style={{ marginTop: 10 }}>
         <button className="btn" disabled={busy} onClick={() => setShowModal(true)}>Save</button>

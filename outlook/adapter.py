@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import Mailboxes, account_param, newest_first, prefixed_id
+from mail_common import Mailboxes, account_param, is_automated_sender, newest_first, prefixed_id
 
 from . import graph
 from .graph import GraphError
@@ -347,6 +347,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "outlook_find_needs_reply",
+            "description": (
+                "Find recent Outlook emails still waiting on the user: in the Focused inbox, from a real person "
+                "(not no-reply), with no reply from the user in that conversation since. Use for 'what do I "
+                "need to reply to?', 'anything waiting on me?'. Returns candidates with previews -- judge which "
+                "genuinely ask something of the user before listing them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How far back to look, 1-30. Default 14."},
+                    "limit": {"type": "integer", "description": "Max candidates, 1-20. Default 10."},
+                    "account": account_param("Outlook"),
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "outlook_read_email",
             "description": "Read one email's full text. message_id must be copied exactly from a list/search result.",
             "parameters": {
@@ -471,6 +491,60 @@ def _search(cur, db, accounts, args) -> dict:
 
 
 @_MB.tool
+def _needs_reply(cur, db, accounts, args) -> dict:
+    days = _clamp(args.get("days"), 14, 1, 30)
+    limit = _clamp(args.get("limit"), 10, 1, 20)
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def work(token, account):
+        # Two plain queries rather than one clever one: Graph rejects many
+        # filter/sort combinations, but date filter + date sort is always
+        # accepted. Focused/Other is checked on the results instead.
+        inbox = graph.get(
+            "/me/mailFolders/inbox/messages", token,
+            params={"$filter": f"receivedDateTime ge {since}", "$orderby": "receivedDateTime desc", "$top": 50,
+                    "$select": _LIST_SELECT + ",conversationId,inferenceClassification"},
+        ).get("value", [])
+        sent = graph.get(
+            "/me/mailFolders/sentitems/messages", token,
+            params={"$filter": f"sentDateTime ge {since}", "$orderby": "sentDateTime desc", "$top": 100,
+                    "$select": "conversationId,sentDateTime"},
+        ).get("value", [])
+        last_sent = {}
+        for m in sent:
+            conv, at = m.get("conversationId"), m.get("sentDateTime") or ""
+            if conv and at > last_sent.get(conv, ""):
+                last_sent[conv] = at
+        waiting, seen_conversations = [], set()
+        for m in inbox:  # newest first: the first one seen per conversation is its latest
+            conv = m.get("conversationId")
+            if conv in seen_conversations:
+                continue
+            seen_conversations.add(conv)
+            if m.get("inferenceClassification") == "other":
+                continue
+            if conv and last_sent.get(conv, "") > (m.get("receivedDateTime") or ""):
+                continue  # the user replied after it
+            sender = _sender(m)
+            if is_automated_sender(sender) or (account.get("email") and account["email"] in sender.lower()):
+                continue
+            waiting.append(_summarize(m, account))
+        return waiting
+
+    done, broken = _MB.across(cur, db, accounts, work)
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], limit)
+    return _MB.with_failures({
+        "ok": True, "days": days, "count": len(emails), "emails": emails,
+        "mailboxes": [a.get("email") for a, _ in done],
+        "guidance": "Candidates only: list just the ones that actually ask the user something or expect an answer.",
+        "_mail_sources": [_source(e) for e in emails],
+    }, broken, {"tool": "outlook_find_needs_reply", "provider": PROVIDER,
+                "label": f"Looked for Outlook emails awaiting your reply · {_plural(len(emails), 'candidate')} from the last {_plural(days, 'day')}"})
+
+
+@_MB.tool
 def _read(cur, db, accounts, args) -> dict:
     given = (args.get("message_id") or "").strip()
     if not given:
@@ -514,6 +588,7 @@ def _read(cur, db, accounts, args) -> dict:
 _DISPATCH = {
     "outlook_list_recent_emails": _list_recent,
     "outlook_search_emails": _search,
+    "outlook_find_needs_reply": _needs_reply,
     "outlook_read_email": _read,
 }
 

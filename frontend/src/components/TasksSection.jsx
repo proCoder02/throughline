@@ -2,6 +2,7 @@
 import ListPane from './ListPane.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import ContextMenu from './ContextMenu.jsx';
+import EmailSourceLink from './EmailSourceLink.jsx';
 import { MailIcon, ChatIcon, PencilIcon, TrashIcon, BackIcon, CheckIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
 import { confirmDialog } from '../lib/notify.js';
@@ -141,6 +142,7 @@ export default function TasksSection({ notify, onOpenConversation }) {
               <div className="row-sub">
                 {[t.owner && `Owner: ${t.owner}`, t.due_date && `Due: ${t.due_date}`].filter(Boolean).join(' Â· ') || 'No details'}
               </div>
+              {t.source_email && <EmailSourceLink source={t.source_email} compact style={{ marginTop: 2 }} />}
             </div>
           </div>
         ))}
@@ -193,6 +195,9 @@ export default function TasksSection({ notify, onOpenConversation }) {
               </>
             ) : (
               <p style={{ fontSize: 15.5, lineHeight: 1.5, margin: '4px 0 0' }}>{selected.description}</p>
+            )}
+            {selected.source_email && (
+              <div style={{ marginTop: 8 }}><EmailSourceLink source={selected.source_email} /></div>
             )}
 
             <div className="profile-section">

@@ -9,6 +9,7 @@ import Avatar from '../components/Avatar.jsx';
 import PhotoViewer from '../components/PhotoViewer.jsx';
 import MailSettingsCard from '../components/MailSettingsCard.jsx';
 import AssistantChat from '../components/assistant/AssistantChat.jsx';
+import EmailSourceLink from '../components/EmailSourceLink.jsx';
 import { CameraIcon, SunIcon, MoonIcon, TrashIcon } from '../icons.jsx';
 import './os.css';
 
@@ -693,6 +694,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                         <div className="item-meta">
                           {t.status === 'done' ? 'Completed' : t.due_date ? `Due ${new Date(t.due_date).toLocaleDateString()}` : 'No due date'}
                         </div>
+                        {t.source_email && <EmailSourceLink source={t.source_email} compact style={{ marginTop: 3 }} />}
                       </div>
                       <span className={'badge' + (t.status === 'done' ? ' green' : t.category === 'study' ? ' blue' : t.category === 'office' ? ' orange' : '')}>
                         {t.status === 'done' ? 'Done' : (t.category || 'personal')}

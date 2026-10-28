@@ -1773,6 +1773,14 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "ISO 8601 'YYYY-MM-DDTHH:MM:SS' if a specific reminder time was stated or clearly implied, else omit. Assume 09:00:00 if only a day is given.",
                     },
+                    "source_email_id": {
+                        "type": "string",
+                        "description": (
+                            "Only when the task comes from an email you looked up with a mail tool this turn "
+                            "(e.g. 'remind me to pay this bill'): that email's id, exactly as the tool returned it. "
+                            "The task then links back to the email. Omit otherwise."
+                        ),
+                    },
                 },
                 "required": ["description"],
             },
@@ -1799,10 +1807,11 @@ AGENT_TOOLS = [
             "name": "log_expense",
             "description": (
                 "Record a payment/purchase the user just stated in conversation (e.g. 'I spent 270 on "
-                "chai today', 'paid 2000 for groceries'). Use this whenever the user mentions spending "
-                "money, NOT when they share a receipt photo (that's extracted separately). Never invent "
-                "amounts or details not actually said. This always comes back as a pending card the user "
-                "must still tap Save on -- tell them it's ready to review/save, don't say it's been "
+                "chai today', 'paid 2000 for groceries'), or one from an email the user asked you to log "
+                "(an order confirmation, invoice, payment receipt -- read it first and pass source_email_id). "
+                "NOT when they share a receipt photo (that's extracted separately). Never invent amounts or "
+                "details not actually said or written in the email. This always comes back as a pending card "
+                "the user must still tap Save on -- tell them it's ready to review/save, don't say it's been "
                 "logged/saved yet."
             ),
             "parameters": {
@@ -1819,6 +1828,10 @@ AGENT_TOOLS = [
                         "description": "How it was paid, only if the user actually said (e.g. 'UPI', 'credit card', 'cash') -- omit if not mentioned, never guess.",
                     },
                     "item": {"type": "string", "description": "What was bought, if mentioned, e.g. 'chai', 'groceries'."},
+                    "source_email_id": {
+                        "type": "string",
+                        "description": "When logging from an email you looked up this turn: its id, exactly as the mail tool returned it. Omit otherwise.",
+                    },
                 },
                 "required": ["amount"],
             },
@@ -1981,14 +1994,43 @@ def _tool_create_task(cur, db, user_id, args):
     description = (args.get("description") or "").strip()
     if not description:
         return {"error": "description is required"}
-    cur.execute(
-        "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
-        "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
-        (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at"))),
-    )
+    # _source_email is filled in by run_agent_tool_loop (never by the model)
+    # from a mail result it already saw -- see _attach_source_email.
+    source = args.get("_source_email")
+    if source:
+        cur.execute(
+            "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status, source_email) "
+            "VALUES (%s, NULL, %s, NULL, %s, %s, 'open', %s) RETURNING id",
+            (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at")),
+             psycopg2.extras.Json(source)),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
+            "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
+            (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at"))),
+        )
     task_id = cur.fetchone()["id"]
     db.commit()
-    return {"ok": True, "task_id": task_id, "description": description}
+    result = {"ok": True, "task_id": task_id, "description": description}
+    if source:
+        result["linked_email"] = source.get("subject")
+    return result
+
+
+def _attach_source_email(args, mail_sources):
+    """create_task/log_expense may name the email they came from by the id a
+    mail tool returned this turn. Swap that id for the email's display
+    details from what the loop already collected -- never trusting the model
+    to copy a link -- and drop it silently if it doesn't match anything."""
+    wanted = args.pop("source_email_id", None)
+    args.pop("_source_email", None)  # only ever set here
+    if not wanted:
+        return args
+    match = next((s for s in reversed(mail_sources) if s.get("id") == wanted), None)
+    if match:
+        args["_source_email"] = {k: match.get(k) for k in ("provider", "account", "id", "from", "subject", "received", "web_link")}
+    return args
 
 
 def _tool_message_friend(cur, db, user_id, args):
@@ -2042,17 +2084,17 @@ def _tool_log_expense(cur, db, user_id, args):
     except (TypeError, ValueError):
         return {"error": "amount must be a number"}
 
-    return {
-        "ok": True, "pending": True,
-        "_action_card": {
-            "type": "expense_confirm",
-            "amount": amount,
-            "payee": (args.get("payee") or "").strip() or None,
-            "category": _normalize_category(args.get("category")),
-            "payment_method": _normalize_payment_method(args.get("payment_method")),
-            "item": (args.get("item") or "").strip() or None,
-        },
+    card = {
+        "type": "expense_confirm",
+        "amount": amount,
+        "payee": (args.get("payee") or "").strip() or None,
+        "category": _normalize_category(args.get("category")),
+        "payment_method": _normalize_payment_method(args.get("payment_method")),
+        "item": (args.get("item") or "").strip() or None,
     }
+    if args.get("_source_email"):  # set by the tool loop -- see _attach_source_email
+        card["source_email"] = args["_source_email"]
+    return {"ok": True, "pending": True, "_action_card": card}
 
 
 def _tool_make_call(cur, db, user_id, args):
@@ -2418,6 +2460,7 @@ def run_agent_tool_loop(cur, db, user_id, messages):
             else:
                 args = raw_args or {}
 
+            args = _attach_source_email(args, mail_sources)
             handler = AGENT_TOOL_DISPATCH.get(name) or extra_handler(name)
             if not handler:
                 result = {"error": f"Unknown tool '{name}'"}
