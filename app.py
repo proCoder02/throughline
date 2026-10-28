@@ -6,6 +6,7 @@ import math
 import json
 import base64
 import hashlib
+import html
 import secrets
 import tempfile
 import threading
@@ -2376,16 +2377,31 @@ def run_agent_tool_loop(cur, db, user_id, messages):
     trigger_reminder_extraction background pass for this same message --
     without it, a single "remind me to..." could create two tasks: one
     from this loop's create_task call, one from that older regex-triggered
-    extraction path."""
+    extraction path.
+
+    reply_meta (4th value) is None unless an optional integration's tool
+    ran -- then it's what the client shows alongside the reply (which tools
+    ran, which emails it drew on; see outlook.adapter.build_reply_meta)."""
     action_cards = []
     created_task = False
+    tool_activity, mail_sources = [], []
     messages = list(messages)
 
+    # Optional integrations' tools ride along only when their flag is on --
+    # with OUTLOOK_ENABLED off this is exactly AGENT_TOOLS, unchanged.
+    tools, extra_handler = AGENT_TOOLS, (lambda name: None)
+    try:
+        from outlook.adapter import agent_tools as _outlook_tools, get_tool_handler as _outlook_handler
+        if _outlook_tools():
+            tools, extra_handler = AGENT_TOOLS + _outlook_tools(), _outlook_handler
+    except Exception:
+        pass  # optional and additive, never affects the core tool loop
+
     for _ in range(AGENT_LOOP_MAX_TURNS):
-        message = call_llm_with_tools(messages, AGENT_TOOLS)
+        message = call_llm_with_tools(messages, tools)
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            return message.get("content") or "", action_cards, created_task
+            return message.get("content") or "", action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
 
         messages.append(message)
         for call in tool_calls:
@@ -2400,7 +2416,7 @@ def run_agent_tool_loop(cur, db, user_id, messages):
             else:
                 args = raw_args or {}
 
-            handler = AGENT_TOOL_DISPATCH.get(name)
+            handler = AGENT_TOOL_DISPATCH.get(name) or extra_handler(name)
             if not handler:
                 result = {"error": f"Unknown tool '{name}'"}
             else:
@@ -2415,13 +2431,27 @@ def run_agent_tool_loop(cur, db, user_id, messages):
             card = result.pop("_action_card", None)
             if card:
                 action_cards.append(card)
+            activity = result.pop("_activity", None)
+            if activity:
+                tool_activity.append(activity)
+            mail_sources.extend(result.pop("_mail_sources", None) or [])
 
             messages.append({"role": "tool", "content": json.dumps(result)})
 
     # Ran out of turns -- fall back to a plain call so the user still gets
     # a reply instead of an empty response.
     final = call_llm(messages)
-    return final, action_cards, created_task
+    return final, action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
+
+
+def _build_reply_meta(tool_activity, mail_sources):
+    if not tool_activity and not mail_sources:
+        return None
+    try:
+        from outlook.adapter import build_reply_meta
+        return build_reply_meta(tool_activity, mail_sources)
+    except Exception:
+        return None  # display-only extra, never worth failing a reply over
 
 
 # Strips a leading <think>...</think> reasoning block some models (e.g. Groq's
@@ -6242,6 +6272,11 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
     base += _commerce_safety_guardrail()
     base += _agent_continuation_guardrail()
+    try:
+        from outlook.adapter import system_prompt_note as _outlook_prompt_note
+        base += _outlook_prompt_note()
+    except Exception:
+        pass  # optional and additive
     return base + (f" {persona_context}" if persona_context else "")
 
 
@@ -6343,12 +6378,22 @@ def load_chat_context(cur, user_id, conversation_id):
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
-def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
-    cur.execute(
-        "INSERT INTO chat_messages (user_id, conversation_id, role, content) "
-        "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
-        (user_id, conversation_id, prompt, user_id, conversation_id, reply),
-    )
+def append_chat_messages(cur, user_id, conversation_id, prompt, reply, reply_meta=None):
+    if reply_meta:
+        # Only this branch touches the reply_meta column -- every ordinary
+        # reply keeps using the exact INSERT below.
+        cur.execute(
+            "INSERT INTO chat_messages (user_id, conversation_id, role, content, reply_meta) "
+            "VALUES (%s, %s, 'user', %s, NULL), (%s, %s, 'assistant', %s, %s)",
+            (user_id, conversation_id, prompt, user_id, conversation_id, reply,
+             psycopg2.extras.Json(reply_meta)),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO chat_messages (user_id, conversation_id, role, content) "
+            "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
+            (user_id, conversation_id, prompt, user_id, conversation_id, reply),
+        )
     # Keep the message-list cache (if any is warm) up to date in place rather
     # than invalidating it -- this is the highest-frequency write path, and
     # re-fetching the full history from Postgres on every single chat turn
@@ -6357,10 +6402,10 @@ def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
     cached = cache_get_json(cache_key)
     if cached is not None:
         ts = datetime.now(timezone.utc).isoformat()
-        cached = cached + [
-            {"role": "user", "content": prompt, "created_at": ts},
-            {"role": "assistant", "content": reply, "created_at": ts},
-        ]
+        assistant_row = {"role": "assistant", "content": reply, "created_at": ts}
+        if reply_meta:
+            assistant_row["reply_meta"] = reply_meta
+        cached = cached + [{"role": "user", "content": prompt, "created_at": ts}, assistant_row]
         cache_set_json(cache_key, cached, ttl=3600)
 
 
@@ -6683,11 +6728,16 @@ def get_global_chat_history():
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT role, content, created_at FROM chat_messages "
+        "SELECT role, content, created_at, reply_meta FROM chat_messages "
         "WHERE user_id = %s AND conversation_id IS NULL ORDER BY created_at ASC",
         (user_id,),
     )
-    result = [serialize_row(r) for r in cur.fetchall()]
+    result = []
+    for r in cur.fetchall():
+        row = serialize_row(r)
+        if row.get("reply_meta") is None:
+            row.pop("reply_meta", None)  # same row shape as before for every ordinary message
+        result.append(row)
     cache_set_json(cache_key, result, ttl=3600)
     return jsonify(result)
 
@@ -6943,9 +6993,15 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
+    try:
+        from outlook.adapter import mentions_mail as _outlook_mentions_mail
+        outlook_mail_intent = _outlook_mentions_mail(prompt_lower)
+    except Exception:
+        outlook_mail_intent = False
+
     if (not conversations and not ei_context and not personal_notes_context and not direct_messages_context
             and not nearby_context and not commerce_context and not finance_context
-            and not _AGENT_ACTION_INTENT_RE.search(prompt_lower)):
+            and not _AGENT_ACTION_INTENT_RE.search(prompt_lower) and not outlook_mail_intent):
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -7001,7 +7057,7 @@ def chat_global():
     messages.append({"role": "user", "content": user_content})
 
     try:
-        reply, tool_action_cards, created_task_this_turn = run_agent_tool_loop(cur, db, user_id, messages)
+        reply, tool_action_cards, created_task_this_turn, reply_meta = run_agent_tool_loop(cur, db, user_id, messages)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 500
         if status == 429:
@@ -7047,7 +7103,7 @@ def chat_global():
         # Store the clean question/reply, not the retrieval blob -- that
         # gets freshly rebuilt from profile_conversations/conversations on
         # every turn already, so saving it too would duplicate it forever.
-        append_chat_messages(cur, user_id, None, prompt, reply)
+        append_chat_messages(cur, user_id, None, prompt, reply, reply_meta=reply_meta)
         db.commit()
 
     try:
@@ -7066,6 +7122,8 @@ def chat_global():
         "matched_speaker": matched["name"] if matched else None,
         "conversations_used": len(conversations),
         "action_cards": action_cards,
+        # Only present when a mail tool ran -- {tool_activity, mail_sources}.
+        **({"reply_meta": reply_meta} if reply_meta else {}),
     })
 
 
@@ -7846,6 +7904,118 @@ def extract_vehicle_policy_pdf():
         "reply": reply, "conversation_id": conversation_id, "title": title, "category": category,
         "transaction": transaction, "policy": policy,
     })
+
+
+# ---------------------------------------------------------------------------
+# Outlook mail (outlook/adapter.py) -- per-user Microsoft OAuth link; the
+# actual mail access happens through the outlook_* agent tools in
+# run_agent_tool_loop. Same gating as the Swiggy routes: OUTLOOK_ENABLED off
+# -> every route 404s except /status, which reports enabled=false.
+# ---------------------------------------------------------------------------
+
+def _outlook_feature_check():
+    from outlook.adapter import is_enabled
+    if not is_enabled():
+        return jsonify({"error": "Outlook integration is not enabled."}), 404
+    return None
+
+
+@app.route("/integrations/outlook/status")
+@login_required
+def outlook_status():
+    from outlook.adapter import get_status
+    db = get_db()
+    cur = dict_cursor(db)
+    return jsonify(get_status(cur, current_user_id()))
+
+
+@app.route("/integrations/outlook/connect")
+@login_required
+def outlook_connect():
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    from outlook.adapter import OutlookError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id())
+    except OutlookError as e:
+        return jsonify({"error": str(e)}), 400
+    return redirect(url)
+
+
+@app.route("/integrations/outlook/connect_url")
+@login_required
+def outlook_connect_url():
+    # JSON variant of /connect for Flutter -- see swiggy_connect_url.
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    from outlook.adapter import OutlookError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), client="app")
+    except OutlookError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"url": url})
+
+
+def _render_outlook_callback_page(success: bool, error: str | None = None):
+    message = "Your Outlook account is connected. You can close this window and go back to the app." if success \
+        else f"Couldn't connect your Outlook account: {html.escape(error or '')}"
+    return f"<html><body style='font-family:sans-serif;padding:32px;text-align:center;'>{message}</body></html>"
+
+
+def _outlook_callback_response(client: str, success: bool, email: str | None = None, error: str | None = None):
+    # Web: land back inside the SPA, which shows a toast and strips these
+    # params (see App.jsx) -- never a dead-end page. /app's DefaultRedirect
+    # keeps the query string while picking the phone/desktop landing route.
+    if client == "web":
+        params = {"outlook": "connected", "outlook_email": email or ""} if success else {"outlook": "error", "outlook_error": error or ""}
+        from urllib.parse import urlencode
+        return redirect("/app?" + urlencode(params))
+    return _render_outlook_callback_page(success, error)
+
+
+@app.route("/integrations/outlook/callback")
+def outlook_callback():
+    # No @login_required -- the user is recovered from the single-use
+    # pending-state row, same as swiggy_callback.
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    code, state = request.args.get("code"), request.args.get("state")
+    from outlook.adapter import OutlookError, friendly_callback_error, handle_callback, pending_client
+    db = get_db()
+    cur = dict_cursor(db)
+    client = pending_client(cur, state)
+    if request.args.get("error") or not code or not state:
+        message = friendly_callback_error(request.args.get("error"), request.args.get("error_description"))
+        return _outlook_callback_response(client, False, error=message)
+    try:
+        linked = handle_callback(cur, db, code, state)
+    except OutlookError as e:
+        return _outlook_callback_response(client, False, error=str(e))
+    except Exception as e:
+        db.rollback()
+        print(f"[outlook] callback failed: {e!r}")
+        return _outlook_callback_response(client, False, error="Something went wrong linking your Outlook account.")
+    return _outlook_callback_response(client, True, email=linked.get("email"))
+
+
+@app.route("/integrations/outlook/disconnect", methods=["POST"])
+@login_required
+def outlook_disconnect():
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    from outlook.adapter import disconnect
+    db = get_db()
+    cur = dict_cursor(db)
+    disconnect(cur, db, current_user_id())
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------

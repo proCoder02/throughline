@@ -742,3 +742,41 @@ ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS attachment_summary TEXT;
 -- time in GET /me/home-signals.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_tone TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_tone_at TIMESTAMPTZ;
+
+-- ============================================================================
+-- Outlook mail (outlook/adapter.py) -- read-only Microsoft Graph access for
+-- the global chat agent. Gated behind OUTLOOK_ENABLED in .env, same as the
+-- Swiggy tables above: these just sit empty when the flag is off.
+-- ============================================================================
+
+-- Short-lived PKCE state for an in-flight connect attempt, deleted by the
+-- OAuth callback (or swept after an hour). A table rather than an in-process
+-- dict so it survives across gunicorn workers/restarts.
+CREATE TABLE IF NOT EXISTS outlook_oauth_pending (
+    state TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    code_verifier TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One linked Microsoft account per user. Tokens are Fernet-encrypted at rest
+-- (OUTLOOK_TOKEN_ENCRYPTION_KEY) and wiped on disconnect.
+CREATE TABLE IF NOT EXISTS outlook_accounts (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    email TEXT,
+    access_token_encrypted TEXT NOT NULL,
+    refresh_token_encrypted TEXT,
+    token_expires_at TIMESTAMPTZ,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
+-- Added after the tables above shipped -- idempotent migrations.
+-- Set when Microsoft stops honoring the refresh token; cleared on reconnect.
+ALTER TABLE outlook_accounts ADD COLUMN IF NOT EXISTS needs_reconnect BOOLEAN NOT NULL DEFAULT FALSE;
+-- 'web' | 'app' -- decides whether the callback redirects into the SPA or
+-- shows a close-this-window page (Flutter signs in via the system browser).
+ALTER TABLE outlook_oauth_pending ADD COLUMN IF NOT EXISTS client TEXT NOT NULL DEFAULT 'web';
+-- Per-reply metadata for the global chat thread: which tools ran and which
+-- emails a reply drew on ({tool_activity: [...], mail_sources: [...]}), so
+-- source chips survive a reload. NULL for every ordinary reply.
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_meta JSONB;
