@@ -257,7 +257,13 @@ def system_prompt_note(cur, user_id) -> str:
         " For 'what do I need to reply to?' use the *_find_needs_reply tools. You can also act on an email the "
         "user points at: turn it into a task/reminder (create_task, using a due date written in the email) or log "
         "a bill/receipt as an expense (log_expense, amounts exactly as written) -- pass that email's id as "
-        "source_email_id so it links back. Only do so when the user asks." + " " + UNTRUSTED_NOTE
+        "source_email_id so it links back. Only do so when the user asks."
+        " For spending questions (\"how much did I spend on flights last year?\"), check query_spending first; if "
+        "the logged expenses don't cover it, search the mailbox(es) for booking confirmations, e-tickets, invoices "
+        "or receipts in that period (Gmail accepts e.g. 'flight (booking OR e-ticket OR itinerary OR invoice) "
+        "after:2025/01/01 before:2026/01/01'), read the relevant ones, and add up only amounts actually written in "
+        "them -- list each one, say the total comes from emails (so may miss bookings made elsewhere), and offer to "
+        "log them as expenses." + " " + UNTRUSTED_NOTE
     )
 
 
@@ -286,7 +292,7 @@ def build_reply_meta(activity: list[dict], sources: list[dict]) -> dict | None:
     return {
         "tool_activity": [
             {"label": a["label"], "error": bool(a.get("error")),
-             **{k: a[k] for k in ("provider", "account") if a.get(k)}}
+             **{k: a[k] for k in ("provider", "account", "icon") if a.get(k)}}
             for a in activity
         ],
         "mail_sources": ordered[:_MAX_SOURCES],

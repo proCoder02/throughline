@@ -594,6 +594,35 @@ def compute_monthly_payment_method_summary(cur, user_id, start, end):
     return [{"payment_method": r["payment_method"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
 
 
+def query_transactions(cur, user_id, start, end, keywords=None, category=None, limit=50):
+    """Logged expenses in [start, end), optionally narrowed to ones whose
+    item/payee/category matches ANY keyword (case-insensitive substring) or
+    an exact category. Returns (rows newest-first capped at limit, total,
+    count, by_category) -- totals cover every match, not just the rows
+    returned."""
+    where, params = ["user_id = %s", "created_at >= %s", "created_at < %s"], [user_id, start, end]
+    words = [w.strip() for w in (keywords or []) if isinstance(w, str) and w.strip()][:15]
+    if words:
+        where.append("(" + " OR ".join(
+            ["COALESCE(item,'') ILIKE %s OR COALESCE(payee,'') ILIKE %s OR COALESCE(category,'') ILIKE %s"] * len(words)) + ")")
+        for w in words:
+            params += [f"%{w}%"] * 3
+    if category:
+        where.append("lower(category) = lower(%s)")
+        params.append(category.strip())
+    clause = " AND ".join(where)
+    cur.execute(f"SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n FROM transactions WHERE {clause}", params)
+    agg = cur.fetchone()
+    cur.execute(
+        f"SELECT COALESCE(category, 'Uncategorized') AS category, SUM(amount) AS total, COUNT(*) AS n "
+        f"FROM transactions WHERE {clause} GROUP BY 1 ORDER BY total DESC LIMIT 12", params)
+    by_category = [{"category": r["category"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
+    cur.execute(
+        f"SELECT item, payee, category, payment_method, amount, created_at FROM transactions WHERE {clause} "
+        f"ORDER BY created_at DESC LIMIT %s", params + [limit])
+    return [dict(r) for r in cur.fetchall()], float(agg["total"]), agg["n"], by_category
+
+
 def compute_recent_transactions(cur, user_id, start, end, limit=25):
     """Individual transactions (not aggregated), newest first -- the
     category/payment-method summaries above answer "where am I spending
@@ -1840,6 +1869,35 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "query_spending",
+            "description": (
+                "Look up the user's LOGGED expenses for any period, optionally narrowed to an item/merchant/"
+                "category. Use for every spending question beyond 'this month so far' -- e.g. 'how much did I "
+                "spend on flight tickets last year' (start_date/end_date for last year, keywords like flight, "
+                "airline names, travel sites). Work out exact dates from today's date. Only covers what the user "
+                "logged in the app (receipts, stated expenses), dated by when it was logged."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "description": "First day, YYYY-MM-DD."},
+                    "end_date": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD."},
+                    "keywords": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": (
+                            "Optional: match ANY of these in the item, payee or category (case-insensitive), e.g. "
+                            "['flight', 'airline', 'indigo', 'air india', 'makemytrip']. Cast a wide net."
+                        ),
+                    },
+                    "category": {"type": "string", "description": "Optional exact category, e.g. 'Travel'."},
+                },
+                "required": ["start_date", "end_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "make_call",
             "description": "Start an in-app call with one of the user's friends. Use when the user explicitly asks to call someone.",
             "parameters": {
@@ -2095,6 +2153,42 @@ def _tool_log_expense(cur, db, user_id, args):
     if args.get("_source_email"):  # set by the tool loop -- see _attach_source_email
         card["source_email"] = args["_source_email"]
     return {"ok": True, "pending": True, "_action_card": card}
+
+
+def _tool_query_spending(cur, db, user_id, args):
+    try:
+        start = datetime.strptime((args.get("start_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        last = datetime.strptime((args.get("end_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return {"error": "start_date and end_date must be YYYY-MM-DD"}
+    if last < start:
+        start, last = last, start
+    end = last + timedelta(days=1)  # end_date is inclusive
+    keywords = args.get("keywords")
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    rows, total, count, by_category = query_transactions(cur, user_id, start, end, keywords, args.get("category"))
+    period = f"{start:%Y-%m-%d} to {last:%Y-%m-%d}"
+    narrowed = bool(keywords or args.get("category"))
+    label = (f"Checked your logged expenses ({period}) · "
+             f"{count} {'match' if count == 1 else 'matches'}{' · Rs ' + format(total, ',.0f') if count else ''}")
+    return {
+        "ok": True, "period": period, "total": round(total, 2), "count": count,
+        "by_category": by_category,
+        "transactions": [{
+            "date": r["created_at"].strftime("%Y-%m-%d") if isinstance(r["created_at"], datetime) else str(r["created_at"]),
+            "amount": float(r["amount"]), "item": r["item"], "payee": r["payee"],
+            "category": r["category"], "payment_method": r["payment_method"],
+        } for r in rows],
+        "note": (
+            "These are only expenses the user logged in the app. "
+            + ("Nothing matched -- if they paid for this without logging it (e.g. bookings that only exist as "
+               "confirmation emails) and a mailbox is connected, search those emails for the same period instead, "
+               "or say plainly that nothing was logged."
+               if narrowed and not count else "Say so if the user may have spent more without logging it.")
+        ),
+        "_activity": {"tool": "query_spending", "icon": "spending", "label": label},
+    }
 
 
 def _tool_make_call(cur, db, user_id, args):
@@ -2392,13 +2486,17 @@ AGENT_TOOL_DISPATCH = {
     "create_task": lambda cur, db, user_id, args: _tool_create_task(cur, db, user_id, args),
     "message_friend": lambda cur, db, user_id, args: _tool_message_friend(cur, db, user_id, args),
     "log_expense": lambda cur, db, user_id, args: _tool_log_expense(cur, db, user_id, args),
+    "query_spending": lambda cur, db, user_id, args: _tool_query_spending(cur, db, user_id, args),
     "make_call": lambda cur, db, user_id, args: _tool_make_call(cur, db, user_id, args),
     "send_email": lambda cur, db, user_id, args: _tool_send_email(cur, db, user_id, args),
     "file_vehicle_insurance_claim": lambda cur, db, user_id, args: _tool_file_vehicle_insurance_claim(cur, db, user_id, args),
     "get_latest_draft": lambda cur, db, user_id, args: _tool_get_latest_draft(cur, db, user_id, args),
 }
 
-AGENT_LOOP_MAX_TURNS = 4
+# 5, not 4: a spending question answered from email needs query_spending ->
+# mail search -> read receipts -> answer; at 4 the last step fell through
+# to the tool-less fallback call. Only chains that long ever use the 5th.
+AGENT_LOOP_MAX_TURNS = 5
 
 
 def run_agent_tool_loop(cur, db, user_id, messages):
@@ -6988,7 +7086,11 @@ def chat_global():
         month_end = datetime.now(timezone.utc)
         spending_rows = compute_monthly_spending_summary(cur, user_id, month_start, month_end)
         if spending_rows:
-            lines = [f"Real spending data for {month_start.strftime('%B %Y')} so far, by category (highest first):"]
+            lines = [
+                f"Real spending data for {month_start.strftime('%B %Y')} so far, by category (highest first). "
+                f"This snapshot covers THIS MONTH ONLY -- for any other period, or a specific item/merchant "
+                f"(e.g. flights last year), call the query_spending tool instead of answering from this:"
+            ]
             for r in spending_rows:
                 lines.append(f"- {r['category']}: Rs {r['total']:.2f} across {r['count']} transaction{'s' if r['count'] != 1 else ''}")
             # Second breakdown, same data but grouped by which UPI app was
@@ -7016,8 +7118,10 @@ def chat_global():
             finance_context = "\n".join(lines)
         else:
             finance_context = (
-                "The user asked about their spending, but no transactions have been recorded this "
-                "month -- say so plainly rather than inventing numbers."
+                "The user asked about their spending. Nothing has been logged THIS MONTH -- but if they're asking "
+                "about any other period or a specific item/merchant (e.g. flights last year), call the "
+                "query_spending tool first. Only if that also finds nothing, say so plainly rather than "
+                "inventing numbers."
             )
 
     if matched:

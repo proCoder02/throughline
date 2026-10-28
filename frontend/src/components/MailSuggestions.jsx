@@ -23,5 +23,9 @@ export default function MailSuggestions({ onPick, disabled, style }) {
 /** True once the thread already has a reply that used mail -- the user has
  * discovered the feature, so the suggestion chips can step aside. */
 export function hasMailReply(messages) {
-  return (messages || []).some((m) => m.replyMeta || m.reply_meta);
+  return (messages || []).some((m) => {
+    const meta = m.replyMeta || m.reply_meta;
+    // A spending-only answer (query_spending) carries reply_meta too, but no mail.
+    return meta && ((meta.mail_sources || []).length > 0 || (meta.tool_activity || []).some((a) => a.provider));
+  });
 }

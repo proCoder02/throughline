@@ -72,7 +72,7 @@ export default function MailReplyMeta({ meta }) {
     <div className="mail-ui mail-reply-meta">
       {activity.map((a, i) => (
         <div key={i} className={'mail-activity' + (a.error ? ' error' : '')}>
-          <span aria-hidden="true">{a.error ? '⚠️' : '📧'}</span>
+          <span aria-hidden="true">{a.error ? '⚠️' : a.icon === 'spending' ? '📊' : '📧'}</span>
           <span>{a.label}</span>
           {a.error && <a className="mail-activity-action" href={connectHref(providerOf(a), a.account)}>Reconnect</a>}
         </div>
