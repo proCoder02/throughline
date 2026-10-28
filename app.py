@@ -2169,24 +2169,57 @@ def _tool_query_spending(cur, db, user_id, args):
         keywords = [keywords]
     rows, total, count, by_category = query_transactions(cur, user_id, start, end, keywords, args.get("category"))
     period = f"{start:%Y-%m-%d} to {last:%Y-%m-%d}"
-    narrowed = bool(keywords or args.get("category"))
     label = (f"Checked your logged expenses ({period}) · "
              f"{count} {'match' if count == 1 else 'matches'}{' · Rs ' + format(total, ',.0f') if count else ''}")
+
+    # How much of the period the logged data can even speak for: a user who
+    # started logging last week has no logged history for last year at all
+    # -- confirmed live, where "0 matches" for 2025 was then presented as if
+    # it were the answer instead of a gap.
+    cur.execute("SELECT min(created_at) AS first FROM transactions WHERE user_id = %s", (user_id,))
+    first_logged = cur.fetchone()["first"]
+    covered_from = max(start, first_logged) if first_logged else None
+    uncovered = first_logged is None or first_logged > start
+    try:
+        import mail_common
+        mail_linked = mail_common.any_enabled() and bool(mail_common.agent_tools(cur, user_id))
+    except Exception:
+        mail_linked = False
+
+    if mail_linked and (count == 0 or uncovered):
+        gap = (f"The user only started logging expenses on {first_logged:%Y-%m-%d}, so " if first_logged and uncovered
+               else "")
+        gap_end = min(end, first_logged) if first_logged and uncovered and count else end
+        words = [w for w in (keywords if isinstance(keywords, list) else []) if isinstance(w, str) and w.strip()][:8]
+        topic = " OR ".join(f'"{w.strip()}"' if " " in w.strip() else w.strip() for w in words)
+        gmail_q = (f"({topic}) " if topic else "") + \
+            f"(booking OR ticket OR e-ticket OR invoice OR receipt OR payment) after:{start:%Y/%m/%d} before:{gap_end:%Y/%m/%d}"
+        note = (
+            f"{gap}logged expenses can't answer this for {'that part of ' if count else ''}the period. A mailbox IS "
+            "connected: do NOT ask the user for permission (searching is read-only) -- in this same turn, search their "
+            f"mail for receipts/confirmations covering it (Gmail query: {gmail_q}; for Outlook use the keywords), read "
+            "the relevant ones, and add up only amounts written in them. In the answer, list each item with its amount "
+            "and source, say the total comes from emails (so bookings made elsewhere may be missing), "
+            + ("combine it with the logged amount above, " if count else "")
+            + "and offer to log them as expenses."
+        )
+    elif count == 0:
+        note = ("Nothing logged matches this period. Say so plainly; if they paid without logging it, suggest logging "
+                "it, or connecting their Gmail/Outlook in Settings so receipts there can be checked.")
+    else:
+        note = "These are only expenses the user logged in the app. Say so if they may have spent more without logging it."
+
     return {
         "ok": True, "period": period, "total": round(total, 2), "count": count,
+        "logging_started": f"{first_logged:%Y-%m-%d}" if first_logged else None,
+        "logged_data_covers_from": f"{covered_from:%Y-%m-%d}" if covered_from else None,
         "by_category": by_category,
         "transactions": [{
             "date": r["created_at"].strftime("%Y-%m-%d") if isinstance(r["created_at"], datetime) else str(r["created_at"]),
             "amount": float(r["amount"]), "item": r["item"], "payee": r["payee"],
             "category": r["category"], "payment_method": r["payment_method"],
         } for r in rows],
-        "note": (
-            "These are only expenses the user logged in the app. "
-            + ("Nothing matched -- if they paid for this without logging it (e.g. bookings that only exist as "
-               "confirmation emails) and a mailbox is connected, search those emails for the same period instead, "
-               "or say plainly that nothing was logged."
-               if narrowed and not count else "Say so if the user may have spent more without logging it.")
-        ),
+        "note": note,
         "_activity": {"tool": "query_spending", "icon": "spending", "label": label},
     }
 
@@ -3215,6 +3248,10 @@ _AGENT_ACTION_INTENT_RE = re.compile(
 # chat_global below -- catches the literal tell of fabricated drafted
 # content (template placeholder brackets), regardless of why it happened.
 _FABRICATED_PLACEHOLDER_RE = re.compile(r"\[(insert|your)\b", re.IGNORECASE)
+
+# Model-internal citation markers -- lenticular brackets (never used in
+# normal prose), optionally preceded by spaces.
+_TOOL_CITATION_RE = re.compile(r"[ \t]*【[^】\n]{0,400}】")
 
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
 
@@ -7252,6 +7289,11 @@ def chat_global():
             "I don't have a reliable way to show exact drafted content here -- please review it "
             "directly on the card, or tell me what you'd like changed and I'll redo it properly."
         )
+    # gpt-oss sometimes leaves its own tool-citation markers in the answer
+    # ("【...read_email result showing ...】" -- confirmed live). They mean
+    # nothing to the user; the source chips already show where data came from.
+    if reply:
+        reply = _TOOL_CITATION_RE.sub("", reply).strip()
 
     if reply:
         # Store the clean question/reply, not the retrieval blob -- that
