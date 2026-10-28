@@ -7,7 +7,7 @@ import { useTheme } from './hooks/useTheme.js';
 import { useIsPhone } from './hooks/useIsPhone.js';
 import { apiJson } from './api.js';
 import { showToast } from './lib/notify.js';
-import { refreshOutlookStatus } from './lib/outlook.js';
+import { refreshMailStatus, MAIL_PROVIDERS, PROVIDER_KEYS } from './lib/mail.js';
 import AuthScreen from './components/AuthScreen.jsx';
 import PersonaOnboarding from './components/PersonaOnboarding.jsx';
 import CallOverlay from './components/CallOverlay.jsx';
@@ -96,25 +96,27 @@ export default function App() {
     };
   }, []);
 
-  // Back from the Outlook OAuth round trip (the backend's callback
-  // redirects to /app?outlook=connected|error) -- confirm the result right
-  // where the user lands, then drop the params so a reload doesn't repeat it.
+  // Back from a mailbox OAuth round trip (the backend's callback redirects
+  // to /app?outlook=connected|error or /app?gmail=...) -- confirm the result
+  // right where the user lands, then drop the params so a reload doesn't
+  // repeat it.
   useEffect(() => {
     if (!auth.user) return;
     const params = new URLSearchParams(location.search);
-    const result = params.get('outlook');
-    if (!result) return;
-    if (result === 'connected') {
-      const who = params.get('outlook_email');
+    const provider = PROVIDER_KEYS.find((p) => params.get(p));
+    if (!provider) return;
+    const label = MAIL_PROVIDERS[provider].label;
+    if (params.get(provider) === 'connected') {
+      const who = params.get(`${provider}_email`);
       showToast(
-        `Outlook connected${who ? ' as ' + who : ''}. Try asking: “Summarize my unread emails”.`,
+        `${label} connected${who ? ' as ' + who : ''}. Try asking: “Summarize my unread emails”.`,
         'success', 8000,
       );
     } else {
-      showToast('Couldn’t connect Outlook: ' + (params.get('outlook_error') || 'please try again.'), 'error', 9000);
+      showToast(`Couldn’t connect ${label}: ` + (params.get(`${provider}_error`) || 'please try again.'), 'error', 9000);
     }
-    refreshOutlookStatus();
-    ['outlook', 'outlook_email', 'outlook_error'].forEach((k) => params.delete(k));
+    refreshMailStatus();
+    [provider, `${provider}_email`, `${provider}_error`].forEach((k) => params.delete(k));
     const rest = params.toString();
     // window.location, not `location`: /app's DefaultRedirect (a child, so
     // its effect runs first) may already have moved us to /app/os or

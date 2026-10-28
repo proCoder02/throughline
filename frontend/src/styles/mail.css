@@ -1,4 +1,4 @@
-/* Outlook mail UI (MailReplyMeta, OutlookSettingsCard, mail suggestion
+/* Mailbox UI -- Outlook + Gmail (MailReplyMeta, MailSettingsCard, mail suggestion
    chips). Used inside both design systems -- the classic --wa-* theme and
    the "os" screen's (.tl-os) palette -- so every color goes through local
    --mail-* tokens, set once per system below. */

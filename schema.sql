@@ -780,3 +780,29 @@ ALTER TABLE outlook_oauth_pending ADD COLUMN IF NOT EXISTS client TEXT NOT NULL 
 -- emails a reply drew on ({tool_activity: [...], mail_sources: [...]}), so
 -- source chips survive a reload. NULL for every ordinary reply.
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_meta JSONB;
+
+-- ============================================================================
+-- Gmail (gmail/adapter.py) -- read-only Gmail API access for the global chat
+-- agent, same shape as the Outlook tables above. Gated behind GMAIL_ENABLED;
+-- these just sit empty when the flag is off.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS gmail_oauth_pending (
+    state TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    code_verifier TEXT NOT NULL,
+    client TEXT NOT NULL DEFAULT 'web', -- 'web' | 'app', see outlook_oauth_pending
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One linked Google account per user. Tokens Fernet-encrypted at rest
+-- (GMAIL_TOKEN_ENCRYPTION_KEY), wiped and revoked at Google on disconnect.
+CREATE TABLE IF NOT EXISTS gmail_accounts (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    email TEXT,
+    access_token_encrypted TEXT NOT NULL,
+    refresh_token_encrypted TEXT,
+    token_expires_at TIMESTAMPTZ,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ,
+    needs_reconnect BOOLEAN NOT NULL DEFAULT FALSE
+);

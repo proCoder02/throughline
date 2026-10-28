@@ -1,5 +1,9 @@
 import { useState } from 'react';
+import { MAIL_PROVIDERS } from '../lib/mail.js';
 import '../styles/mail.css';
+
+// Sources/activity saved before Gmail existed carry no provider -- they were Outlook.
+const providerOf = (x) => (x?.provider && MAIL_PROVIDERS[x.provider] ? x.provider : 'outlook');
 
 const VISIBLE_SOURCES = 4;
 
@@ -30,8 +34,9 @@ function SourceChip({ source }) {
     </>
   );
   const title = `${source.from || ''} — ${source.subject || ''}`;
+  const where = MAIL_PROVIDERS[providerOf(source)].label;
   return source.web_link ? (
-    <a className="mail-source" href={source.web_link} target="_blank" rel="noopener noreferrer" title={`${title} (opens in Outlook)`}>
+    <a className="mail-source" href={source.web_link} target="_blank" rel="noopener noreferrer" title={`${title} (opens in ${where})`}>
       {body}
     </a>
   ) : (
@@ -57,14 +62,14 @@ export default function MailReplyMeta({ meta }) {
         <div key={i} className={'mail-activity' + (a.error ? ' error' : '')}>
           <span aria-hidden="true">{a.error ? '⚠️' : '📧'}</span>
           <span>{a.label}</span>
-          {a.error && <a className="mail-activity-action" href="/integrations/outlook/connect">Reconnect</a>}
+          {a.error && <a className="mail-activity-action" href={`/integrations/${providerOf(a)}/connect`}>Reconnect</a>}
         </div>
       ))}
       {sources.length > 0 && (
         <>
           <div className="mail-sources-label">Sources</div>
           <div className="mail-sources">
-            {shown.map((s) => <SourceChip key={s.id} source={s} />)}
+            {shown.map((s) => <SourceChip key={`${providerOf(s)}:${s.id}`} source={s} />)}
           </div>
           {sources.length > VISIBLE_SOURCES && (
             <button type="button" className="mail-sources-toggle" onClick={() => setExpanded((v) => !v)}>

@@ -2387,15 +2387,17 @@ def run_agent_tool_loop(cur, db, user_id, messages):
     tool_activity, mail_sources = [], []
     messages = list(messages)
 
-    # Optional integrations' tools ride along only when their flag is on --
-    # with OUTLOOK_ENABLED off this is exactly AGENT_TOOLS, unchanged.
+    # Mailbox tools (Outlook/Gmail, via mail_common) ride along only for the
+    # mailboxes this user has actually linked -- with every MAIL flag off,
+    # or nothing linked, this is exactly AGENT_TOOLS, unchanged.
     tools, extra_handler = AGENT_TOOLS, (lambda name: None)
     try:
-        from outlook.adapter import agent_tools as _outlook_tools, get_tool_handler as _outlook_handler
-        if _outlook_tools():
-            tools, extra_handler = AGENT_TOOLS + _outlook_tools(), _outlook_handler
-    except Exception:
-        pass  # optional and additive, never affects the core tool loop
+        import mail_common
+        mail_tools = mail_common.agent_tools(cur, user_id) if mail_common.any_enabled() else []
+        if mail_tools:
+            tools, extra_handler = AGENT_TOOLS + mail_tools, mail_common.get_tool_handler
+    except Exception as e:
+        print(f"[mail] tool setup failed, continuing without mail tools: {e!r}")
 
     for _ in range(AGENT_LOOP_MAX_TURNS):
         message = call_llm_with_tools(messages, tools)
@@ -2448,7 +2450,7 @@ def _build_reply_meta(tool_activity, mail_sources):
     if not tool_activity and not mail_sources:
         return None
     try:
-        from outlook.adapter import build_reply_meta
+        from mail_common import build_reply_meta
         return build_reply_meta(tool_activity, mail_sources)
     except Exception:
         return None  # display-only extra, never worth failing a reply over
@@ -6272,11 +6274,6 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
     base += _commerce_safety_guardrail()
     base += _agent_continuation_guardrail()
-    try:
-        from outlook.adapter import system_prompt_note as _outlook_prompt_note
-        base += _outlook_prompt_note()
-    except Exception:
-        pass  # optional and additive
     return base + (f" {persona_context}" if persona_context else "")
 
 
@@ -6994,14 +6991,14 @@ def chat_global():
     conversations = cur.fetchall()
 
     try:
-        from outlook.adapter import mentions_mail as _outlook_mentions_mail
-        outlook_mail_intent = _outlook_mentions_mail(prompt_lower)
+        from mail_common import mentions_mail as _mentions_mail
+        mail_intent = _mentions_mail(prompt_lower)
     except Exception:
-        outlook_mail_intent = False
+        mail_intent = False
 
     if (not conversations and not ei_context and not personal_notes_context and not direct_messages_context
             and not nearby_context and not commerce_context and not finance_context
-            and not _AGENT_ACTION_INTENT_RE.search(prompt_lower) and not outlook_mail_intent):
+            and not _AGENT_ACTION_INTENT_RE.search(prompt_lower) and not mail_intent):
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -7050,6 +7047,14 @@ def chat_global():
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
     matched_name = matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
     global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched_name)
+    # Which mailboxes (Outlook/Gmail) this user has linked -- the base prompt
+    # says to answer only from conversation excerpts, so without this the
+    # model refuses mail questions instead of calling the mail tools.
+    try:
+        from mail_common import system_prompt_note as _mail_prompt_note
+        global_chat_system_prompt += _mail_prompt_note(cur, user_id)
+    except Exception:
+        pass  # optional and additive
     if ei_context:
         global_chat_system_prompt = f"{global_chat_system_prompt}\n\n{ei_context}"
     messages = [{"role": "system", "content": global_chat_system_prompt}]
@@ -7962,21 +7967,25 @@ def outlook_connect_url():
     return jsonify({"url": url})
 
 
-def _render_outlook_callback_page(success: bool, error: str | None = None):
-    message = "Your Outlook account is connected. You can close this window and go back to the app." if success \
-        else f"Couldn't connect your Outlook account: {html.escape(error or '')}"
+def _mail_callback_response(provider: str, label: str, client: str, success: bool,
+                            email: str | None = None, error: str | None = None):
+    """End of a mailbox OAuth round trip (Outlook or Gmail). Web: land back
+    inside the SPA as /app?<provider>=connected|error, which App.jsx toasts
+    and strips -- never a dead-end page (/app's DefaultRedirect keeps the
+    query string while picking the phone/desktop route). Flutter, which
+    signed in through the system browser: a static page saying to go back."""
+    if client == "web":
+        from urllib.parse import urlencode
+        params = ({provider: "connected", f"{provider}_email": email or ""} if success
+                  else {provider: "error", f"{provider}_error": error or ""})
+        return redirect("/app?" + urlencode(params))
+    message = (f"Your {label} account is connected. You can close this window and go back to the app." if success
+               else f"Couldn't connect your {label} account: {html.escape(error or '')}")
     return f"<html><body style='font-family:sans-serif;padding:32px;text-align:center;'>{message}</body></html>"
 
 
 def _outlook_callback_response(client: str, success: bool, email: str | None = None, error: str | None = None):
-    # Web: land back inside the SPA, which shows a toast and strips these
-    # params (see App.jsx) -- never a dead-end page. /app's DefaultRedirect
-    # keeps the query string while picking the phone/desktop landing route.
-    if client == "web":
-        params = {"outlook": "connected", "outlook_email": email or ""} if success else {"outlook": "error", "outlook_error": error or ""}
-        from urllib.parse import urlencode
-        return redirect("/app?" + urlencode(params))
-    return _render_outlook_callback_page(success, error)
+    return _mail_callback_response("outlook", "Outlook", client, success, email, error)
 
 
 @app.route("/integrations/outlook/callback")
@@ -8012,6 +8021,101 @@ def outlook_disconnect():
     if blocked:
         return blocked
     from outlook.adapter import disconnect
+    db = get_db()
+    cur = dict_cursor(db)
+    disconnect(cur, db, current_user_id())
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Gmail (gmail/adapter.py) -- per-user Google OAuth link, same shape as the
+# Outlook routes above; the mail access itself is the gmail_* agent tools
+# (offered through mail_common). GMAIL_ENABLED off -> every route 404s
+# except /status, which reports enabled=false.
+# ---------------------------------------------------------------------------
+
+def _gmail_feature_check():
+    from gmail.adapter import is_enabled
+    if not is_enabled():
+        return jsonify({"error": "Gmail integration is not enabled."}), 404
+    return None
+
+
+@app.route("/integrations/gmail/status")
+@login_required
+def gmail_status():
+    from gmail.adapter import get_status
+    db = get_db()
+    cur = dict_cursor(db)
+    return jsonify(get_status(cur, current_user_id()))
+
+
+@app.route("/integrations/gmail/connect")
+@login_required
+def gmail_connect():
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    from gmail.adapter import GmailError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id())
+    except GmailError as e:
+        return jsonify({"error": str(e)}), 400
+    return redirect(url)
+
+
+@app.route("/integrations/gmail/connect_url")
+@login_required
+def gmail_connect_url():
+    # JSON variant of /connect for Flutter -- see swiggy_connect_url.
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    from gmail.adapter import GmailError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), client="app")
+    except GmailError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"url": url})
+
+
+@app.route("/integrations/gmail/callback")
+def gmail_callback():
+    # No @login_required -- the user is recovered from the single-use
+    # pending-state row, same as outlook_callback.
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    code, state = request.args.get("code"), request.args.get("state")
+    from gmail.adapter import GmailError, friendly_callback_error, handle_callback, pending_client
+    db = get_db()
+    cur = dict_cursor(db)
+    client = pending_client(cur, state)
+    if request.args.get("error") or not code or not state:
+        message = friendly_callback_error(request.args.get("error"), request.args.get("error_description"))
+        return _mail_callback_response("gmail", "Gmail", client, False, error=message)
+    try:
+        linked = handle_callback(cur, db, code, state)
+    except GmailError as e:
+        return _mail_callback_response("gmail", "Gmail", client, False, error=str(e))
+    except Exception as e:
+        db.rollback()
+        print(f"[gmail] callback failed: {e!r}")
+        return _mail_callback_response("gmail", "Gmail", client, False, error="Something went wrong linking your Gmail account.")
+    return _mail_callback_response("gmail", "Gmail", client, True, email=linked.get("email"))
+
+
+@app.route("/integrations/gmail/disconnect", methods=["POST"])
+@login_required
+def gmail_disconnect():
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    from gmail.adapter import disconnect
     db = get_db()
     cur = dict_cursor(db)
     disconnect(cur, db, current_user_id())

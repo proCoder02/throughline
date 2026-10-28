@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { apiJson, post, postForm } from '../../api.js';
 import { showToast } from '../../lib/notify.js';
 import { maybeGetLocation } from '../../lib/location.js';
-import { useOutlookStatus, pendingReplyLabel } from '../../lib/outlook.js';
+import { useMailStatus, pendingReplyLabel } from '../../lib/mail.js';
 import FormattedText from '../FormattedText.jsx';
 import ActionCard from '../ActionCard.jsx';
 import MailReplyMeta from '../MailReplyMeta.jsx';
@@ -114,7 +114,7 @@ function UserTurn({ message }) {
 }
 
 export default function AssistantChat({ title = 'Ask Throughline', subtitle, userName, onBack }) {
-  const outlookStatus = useOutlookStatus();
+  const mailStatus = useMailStatus();
   const [messages, setMessages] = useState(null); // null = loading history
   const [sending, setSending] = useState(false);
   const [pendingText, setPendingText] = useState('');
@@ -426,7 +426,7 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
               <div className="ac-avatar is-thinking" aria-hidden="true"><SparkleIcon /></div>
               <div className="ac-thinking">
                 <span className="ac-dots" aria-hidden="true"><i /><i /><i /></span>
-                {pendingReplyLabel(outlookStatus, pendingText)}
+                {pendingReplyLabel(mailStatus, pendingText)}
               </div>
             </div>
           )}

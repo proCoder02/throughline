@@ -1,0 +1,550 @@
+"""
+Gmail integration. app.py uses it for its /integrations/gmail/* routes; the
+chat reaches its tools through mail_common.py, via the provider surface
+(PROVIDER, LABEL, is_enabled, TOOLS, get_tool_handler, get_account) --
+same surface and same behavior contract as outlook/adapter.py.
+
+Each user links their own Google account via OAuth; the global-chat agent
+loop then gets read-only tools (list recent, search, read one) backed by
+the Gmail API with that user's token.
+
+Gated behind GMAIL_ENABLED in .env: flag off (the default) -> mail_common
+offers none of these tools, every route 404s, /status reports
+enabled=false.
+
+Read-only by construction: the only scope requested is gmail.readonly.
+That scope is Google-"restricted": until the app passes Google's
+verification it runs in Testing mode, where only listed test users can
+connect and refresh tokens die after 7 days -- which surfaces here as
+needs_reconnect, so users get a Reconnect prompt rather than a silent
+failure.
+"""
+from __future__ import annotations
+
+import base64
+import html
+import os
+import re
+import secrets
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
+from functools import lru_cache
+from urllib.parse import quote
+
+from mail_common import UNTRUSTED_NOTE
+
+from . import google
+from .google import GoogleError
+
+PROVIDER = "gmail"
+LABEL = "Gmail"
+
+
+class GmailError(Exception):
+    """Raised from an explicit user action (connect/callback) -- routes turn
+    this into a clear error response, never a silent failure."""
+
+
+class NotConnectedError(GmailError):
+    def __init__(self):
+        super().__init__("No linked Gmail account. Connect it in Settings first.")
+
+
+def is_enabled() -> bool:
+    return os.getenv("GMAIL_ENABLED", "false").strip().lower() == "true"
+
+
+# ---------------------------------------------------------------------------
+# At-rest token encryption -- its own key (GMAIL_TOKEN_ENCRYPTION_KEY),
+# never shared with Outlook's or Swiggy's, so rotating one never forces
+# rotating another.
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = os.getenv("GMAIL_TOKEN_ENCRYPTION_KEY")
+    if not key:
+        raise RuntimeError("GMAIL_TOKEN_ENCRYPTION_KEY is not set -- required whenever GMAIL_ENABLED=true.")
+    return Fernet(key.encode("ascii"))
+
+
+def _encrypt(plaintext: str) -> str:
+    return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def _decrypt(ciphertext: str) -> str:
+    return _fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Account / token management
+# ---------------------------------------------------------------------------
+
+def get_account(cur, user_id: int) -> dict | None:
+    cur.execute("SELECT * FROM gmail_accounts WHERE user_id = %s AND revoked_at IS NULL", (user_id,))
+    return cur.fetchone()
+
+
+def get_status(cur, user_id: int) -> dict:
+    if not is_enabled():
+        return {"enabled": False}
+    account = get_account(cur, user_id)
+    return {
+        "enabled": True,
+        "connected": account is not None,
+        "needs_reconnect": bool(account and account.get("needs_reconnect")),
+        "email": account["email"] if account else None,
+        "connected_at": account["connected_at"].isoformat() if account else None,
+        # Until Google verifies the app (restricted scope), refresh tokens
+        # expire after 7 days -- the clients say so up front. Set
+        # GMAIL_APP_VERIFIED=true once verification is through.
+        "weekly_reconnect": os.getenv("GMAIL_APP_VERIFIED", "false").strip().lower() != "true",
+    }
+
+
+def _mark_needs_reconnect(cur, db, user_id: int) -> None:
+    cur.execute("UPDATE gmail_accounts SET needs_reconnect = TRUE WHERE user_id = %s", (user_id,))
+    db.commit()
+
+
+def _expiry_from(token_response: dict) -> datetime | None:
+    expires_in = token_response.get("expires_in")
+    return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in)) if expires_in else None
+
+
+def _ensure_fresh_token(cur, db, user_id: int, account: dict) -> str:
+    expires_at = account["token_expires_at"]
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at > datetime.now(timezone.utc) + timedelta(seconds=60):
+            return _decrypt(account["access_token_encrypted"])
+    if not account["refresh_token_encrypted"]:
+        raise NotConnectedError()
+    try:
+        token_response = google.refresh_access_token(_decrypt(account["refresh_token_encrypted"]))
+    except GoogleError:
+        # invalid_grant: revoked, password change, or Testing mode's 7-day
+        # refresh-token expiry -- only reconnecting fixes it.
+        _mark_needs_reconnect(cur, db, user_id)
+        raise NotConnectedError()
+    new_access = token_response["access_token"]
+    new_refresh = token_response.get("refresh_token")
+    cur.execute(
+        "UPDATE gmail_accounts SET access_token_encrypted = %s, "
+        "refresh_token_encrypted = COALESCE(%s, refresh_token_encrypted), token_expires_at = %s "
+        "WHERE user_id = %s",
+        (_encrypt(new_access), _encrypt(new_refresh) if new_refresh else None, _expiry_from(token_response), user_id),
+    )
+    db.commit()
+    return new_access
+
+
+# ---------------------------------------------------------------------------
+# OAuth connect / callback / disconnect
+# ---------------------------------------------------------------------------
+
+CLIENTS = ("web", "app")
+
+
+def get_authorize_url(cur, db, user_id: int, client: str = "web") -> str:
+    """client decides where the callback lands: 'web' redirects back into
+    the SPA, 'app' (Flutter, via the system browser) gets a static page."""
+    if client not in CLIENTS:
+        client = "web"
+    try:
+        verifier, challenge = google.generate_pkce_pair()
+        state = secrets.token_urlsafe(32)
+        url = google.build_authorize_url(state, challenge)
+    except RuntimeError as e:
+        raise GmailError(str(e)) from e
+    cur.execute("DELETE FROM gmail_oauth_pending WHERE created_at < now() - interval '1 hour'")
+    cur.execute(
+        "INSERT INTO gmail_oauth_pending (state, user_id, code_verifier, client) VALUES (%s, %s, %s, %s)",
+        (state, user_id, verifier, client),
+    )
+    db.commit()
+    return url
+
+
+def pending_client(cur, state: str | None) -> str:
+    if not state:
+        return "web"
+    cur.execute("SELECT client FROM gmail_oauth_pending WHERE state = %s", (state,))
+    row = cur.fetchone()
+    return (row and row.get("client")) or "web"
+
+
+def friendly_callback_error(error: str | None, description: str | None) -> str:
+    if error == "access_denied":
+        # Also what an unlisted user sees while the app is in Testing mode.
+        return ("Google didn't grant access, so nothing was connected. If you didn't cancel, this "
+                "Google account may not be on the app's tester list yet.")
+    if not error:
+        return "Google didn't return an authorization code. Please try connecting again."
+    return (description or "").strip()[:200] or f"Google returned an error ({error})."
+
+
+def handle_callback(cur, db, code: str, state: str) -> dict:
+    """Returns {user_id, email}."""
+    cur.execute(
+        "DELETE FROM gmail_oauth_pending WHERE state = %s AND created_at > now() - interval '1 hour' RETURNING *",
+        (state,),
+    )
+    pending = cur.fetchone()
+    db.commit()  # single use, even if the exchange below fails
+    if not pending:
+        raise GmailError("This Gmail connection attempt has expired or is invalid. Please try connecting again.")
+    user_id = pending["user_id"]
+
+    try:
+        token_response = google.exchange_code(code, pending["code_verifier"])
+    except GoogleError as e:
+        raise GmailError(str(e)) from e
+    # Google's consent screen lets people untick individual permissions --
+    # without gmail.readonly there's nothing to link.
+    if google.READONLY_SCOPE not in (token_response.get("scope") or "").split():
+        google.revoke(token_response["access_token"])
+        raise GmailError("Reading your email wasn't allowed on Google's screen. Connect again and keep that box ticked.")
+    access_token = token_response["access_token"]
+    refresh_token = token_response.get("refresh_token")
+
+    email = None
+    try:
+        email = google.get("/profile", access_token).get("emailAddress")
+    except GoogleError:
+        pass  # display-only, not required to complete linking
+
+    cur.execute(
+        "INSERT INTO gmail_accounts (user_id, email, access_token_encrypted, refresh_token_encrypted, token_expires_at) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET email = EXCLUDED.email, "
+        "access_token_encrypted = EXCLUDED.access_token_encrypted, "
+        "refresh_token_encrypted = COALESCE(EXCLUDED.refresh_token_encrypted, gmail_accounts.refresh_token_encrypted), "
+        "token_expires_at = EXCLUDED.token_expires_at, connected_at = now(), revoked_at = NULL, "
+        "needs_reconnect = FALSE",
+        (user_id, email, _encrypt(access_token), _encrypt(refresh_token) if refresh_token else None,
+         _expiry_from(token_response)),
+    )
+    db.commit()
+    return {"user_id": user_id, "email": email}
+
+
+def disconnect(cur, db, user_id: int) -> None:
+    account = get_account(cur, user_id)
+    if account:
+        # Drop the grant on Google's side too (best effort), so the app also
+        # disappears from the user's Google "third-party connections".
+        try:
+            token = account.get("refresh_token_encrypted") or account.get("access_token_encrypted")
+            if token:
+                google.revoke(_decrypt(token))
+        except Exception:
+            pass
+    cur.execute(
+        "UPDATE gmail_accounts SET revoked_at = now(), access_token_encrypted = '', "
+        "refresh_token_encrypted = NULL WHERE user_id = %s AND revoked_at IS NULL",
+        (user_id,),
+    )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Agent tools -- reached through mail_common. Handlers return {"error": ...}
+# dicts rather than raising, so the model can relay a problem as a reply.
+# Results may carry "_activity"/"_mail_sources", which app.py's tool loop
+# pops before the model sees them (see mail_common.build_reply_meta).
+# ---------------------------------------------------------------------------
+
+_FOLDER_QUERY = {
+    "inbox": ("in:inbox", "inbox"),
+    "sent": ("in:sent", "sent mail"),
+    "drafts": ("in:drafts", "drafts"),
+    "starred": ("is:starred", "starred mail"),
+    "important": ("is:important", "important mail"),
+    "spam": ("in:spam", "spam"),
+    "trash": ("in:trash", "trash"),
+    "all": ("", "mail"),
+}
+_MAX_BODY_CHARS = 8000
+_METADATA_HEADERS = ["From", "Subject", "Date"]
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_list_recent_emails",
+            "description": (
+                "List the user's recent emails from their linked Gmail account (newest first), with sender, "
+                "subject, time and a short preview. Use when the user asks to check/review/summarize their "
+                "Gmail or inbox. Use gmail_read_email for an email's full text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How many days back to look, 1-30. Default 7."},
+                    "unread_only": {"type": "boolean", "description": "Only unread emails. Default false."},
+                    "folder": {
+                        "type": "string",
+                        "description": "inbox (default), sent, drafts, starred, important, spam, trash, or all.",
+                    },
+                    "limit": {"type": "integer", "description": "Max emails to return, 1-25. Default 15."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_search_emails",
+            "description": (
+                "Search the user's whole Gmail mailbox. Accepts plain keywords or Gmail search operators "
+                "(from:hr@company.com, subject:offer, has:attachment, after:2026/10/01, is:unread). Use when the "
+                "user asks about emails from someone or about a topic."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keywords and/or Gmail search operators."},
+                    "limit": {"type": "integer", "description": "Max emails to return, 1-25. Default 10."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_read_email",
+            "description": "Read one Gmail email's full text. message_id must be copied exactly from a list/search result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "The email's id, exactly as returned by a list/search tool."},
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+]
+
+
+def _clamp(value, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _headers(msg: dict) -> dict:
+    return {h.get("name", "").lower(): h.get("value", "") for h in (msg.get("payload") or {}).get("headers") or []}
+
+
+def _sender(raw_from: str) -> str:
+    name, email = parseaddr(raw_from or "")
+    if name and email and name != email:
+        return f"{name} <{email}>"
+    return email or name or "unknown sender"
+
+
+def _received(msg: dict) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(msg["internalDate"]) / 1000, tz=timezone.utc).isoformat()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _web_link(message_id: str, account_email: str | None) -> str:
+    # authuser picks the right account when the browser is signed in to
+    # several Google accounts; #all/<id> opens the message in any label.
+    who = f"?authuser={quote(account_email)}" if account_email else ""
+    return f"https://mail.google.com/mail/u/{who}#all/{message_id}"
+
+
+def _summarize(msg: dict, account_email: str | None) -> dict:
+    h = _headers(msg)
+    labels = set(msg.get("labelIds") or [])
+    return {
+        "id": msg.get("id"),
+        "from": _sender(h.get("from")),
+        "subject": h.get("subject") or "(no subject)",
+        "received": _received(msg),
+        "preview": html.unescape(msg.get("snippet") or ""),
+        "unread": "UNREAD" in labels,
+        "important": "IMPORTANT" in labels,
+        "web_link": _web_link(msg.get("id"), account_email),
+    }
+
+
+def _source(email: dict) -> dict:
+    return {"provider": PROVIDER, **{k: email.get(k) for k in ("id", "from", "subject", "received", "web_link")}}
+
+
+def _fetch_metadata(token: str, ids: list[str]) -> list[dict]:
+    """Gmail's list endpoint returns ids only -- fetch each message's
+    headers in parallel (cooperative greenlets under gunicorn's gevent
+    worker), keeping the list's newest-first order."""
+    def one(message_id):
+        return google.get(
+            f"/messages/{quote(message_id, safe='')}", token,
+            params=[("format", "metadata"), *[("metadataHeaders", h) for h in _METADATA_HEADERS]],
+        )
+    if not ids:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+        return list(pool.map(one, ids))
+
+
+_RECONNECT_ACTIVITY = {
+    "tool": "gmail", "provider": PROVIDER, "error": True,
+    "label": "Couldn't reach your Gmail -- reconnect it in Settings",
+}
+
+
+def _with_token(fn):
+    def handler(cur, db, user_id, args):
+        try:
+            account = get_account(cur, user_id)
+            if not account:
+                raise NotConnectedError()
+            token = _ensure_fresh_token(cur, db, user_id, account)
+            return {**fn(token, args, account.get("email")), "note": UNTRUSTED_NOTE}
+        except NotConnectedError:
+            return {
+                "error": "The user's Gmail account isn't connected, or needs reconnecting -- tell them to reconnect it in Settings.",
+                "_activity": _RECONNECT_ACTIVITY,
+            }
+        except GoogleError as e:
+            if e.status == 401:
+                _mark_needs_reconnect(cur, db, user_id)
+                return {"error": "Google rejected the saved sign-in -- tell the user to reconnect Gmail in Settings.",
+                        "_activity": _RECONNECT_ACTIVITY}
+            if e.status in (400, 404):
+                return {"error": f"Gmail couldn't find that: {e}. If using a message_id, re-run the list/search tool and copy the id exactly."}
+            return {"error": f"Gmail request failed: {e}"}
+    return handler
+
+
+def _list_ids(token: str, query: str, limit: int) -> list[str]:
+    data = google.get("/messages", token, params={"q": query, "maxResults": limit})
+    return [m["id"] for m in data.get("messages") or [] if m.get("id")]
+
+
+@_with_token
+def _list_recent(token: str, args: dict, account_email: str | None) -> dict:
+    days = _clamp(args.get("days"), 7, 1, 30)
+    limit = _clamp(args.get("limit"), 15, 1, 25)
+    folder = (args.get("folder") or "inbox").strip().lower()
+    if folder not in _FOLDER_QUERY:
+        folder = "inbox"
+    folder_q, where = _FOLDER_QUERY[folder]
+    query = " ".join(p for p in (folder_q, f"newer_than:{days}d", "is:unread" if args.get("unread_only") else "") if p)
+    emails = [_summarize(m, account_email) for m in _fetch_metadata(token, _list_ids(token, query, limit))]
+    label = (f"Checked your Gmail {where} · "
+             f"{_plural(len(emails), 'unread email' if args.get('unread_only') else 'email')} from the last {_plural(days, 'day')}")
+    return {
+        "ok": True, "folder": folder, "days": days, "count": len(emails), "emails": emails,
+        "_activity": {"tool": "gmail_list_recent_emails", "provider": PROVIDER, "label": label},
+        "_mail_sources": [_source(e) for e in emails],
+    }
+
+
+@_with_token
+def _search(token: str, args: dict, account_email: str | None) -> dict:
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    limit = _clamp(args.get("limit"), 10, 1, 25)
+    emails = [_summarize(m, account_email) for m in _fetch_metadata(token, _list_ids(token, query, limit))]
+    return {
+        "ok": True, "query": query, "count": len(emails), "emails": emails,
+        "_activity": {"tool": "gmail_search_emails", "provider": PROVIDER,
+                      "label": f"Searched Gmail for “{query}” · {_plural(len(emails), 'match')}"},
+        "_mail_sources": [_source(e) for e in emails],
+    }
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_BLOCK_TAG_RE = re.compile(r"(?i)<\s*(br|/p|/div|/tr|/li|/h\d)\s*/?>")
+_STYLE_SCRIPT_RE = re.compile(r"(?is)<(style|script)[^>]*>.*?</\1>")
+
+
+def _decode(data: str) -> str:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
+
+
+def _html_to_text(markup: str) -> str:
+    text = _STYLE_SCRIPT_RE.sub("", markup)
+    text = _BLOCK_TAG_RE.sub("\n", text)
+    text = html.unescape(_TAG_RE.sub("", text))
+    return re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
+
+
+def _body_and_attachments(payload: dict) -> tuple[str, list[str]]:
+    """Prefers the text/plain part; falls back to text/html stripped to
+    text. Attachments are listed by filename only, never downloaded."""
+    plain, rich, attachments = [], [], []
+
+    def walk(part):
+        if part.get("filename"):
+            attachments.append(part["filename"])
+            return
+        mime = part.get("mimeType", "")
+        data = (part.get("body") or {}).get("data")
+        if data and mime == "text/plain":
+            plain.append(_decode(data))
+        elif data and mime == "text/html":
+            rich.append(_decode(data))
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload or {})
+    if plain:
+        return "\n".join(plain).strip(), attachments
+    return _html_to_text("\n".join(rich)), attachments
+
+
+@_with_token
+def _read(token: str, args: dict, account_email: str | None) -> dict:
+    message_id = (args.get("message_id") or "").strip()
+    if not message_id:
+        return {"error": "message_id is required"}
+    msg = google.get(f"/messages/{quote(message_id, safe='')}", token, params={"format": "full"})
+    h = _headers(msg)
+    body, attachments = _body_and_attachments(msg.get("payload"))
+    subject = h.get("subject") or "(no subject)"
+    source = {
+        "provider": PROVIDER, "id": msg.get("id") or message_id, "from": _sender(h.get("from")),
+        "subject": subject, "received": _received(msg), "web_link": _web_link(msg.get("id") or message_id, account_email),
+    }
+    return {
+        "ok": True,
+        "from": source["from"],
+        "to": [a.strip() for a in (h.get("to") or "").split(",") if a.strip()],
+        "cc": [a.strip() for a in (h.get("cc") or "").split(",") if a.strip()],
+        "subject": subject,
+        "received": source["received"],
+        "attachments": attachments,
+        "body": body[:_MAX_BODY_CHARS],
+        "body_truncated": len(body) > _MAX_BODY_CHARS,
+        "_activity": {"tool": "gmail_read_email", "provider": PROVIDER, "label": f"Read “{subject}”", "read_id": source["id"]},
+        "_mail_sources": [source],
+    }
+
+
+_DISPATCH = {
+    "gmail_list_recent_emails": _list_recent,
+    "gmail_search_emails": _search,
+    "gmail_read_email": _read,
+}
+
+
+def get_tool_handler(name: str):
+    return _DISPATCH.get(name) if is_enabled() else None

@@ -7,7 +7,7 @@ import ChatsSection from '../components/ChatsSection.jsx';
 import DirectMessageThread from '../components/DirectMessageThread.jsx';
 import Avatar from '../components/Avatar.jsx';
 import PhotoViewer from '../components/PhotoViewer.jsx';
-import OutlookSettingsCard from '../components/OutlookSettingsCard.jsx';
+import MailSettingsCard from '../components/MailSettingsCard.jsx';
 import AssistantChat from '../components/assistant/AssistantChat.jsx';
 import { CameraIcon, SunIcon, MoonIcon, TrashIcon } from '../icons.jsx';
 import './os.css';
@@ -1174,7 +1174,8 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                 </div>
               )}
 
-              <OutlookSettingsCard variant="os" style={{ marginTop: 20 }} />
+              <MailSettingsCard provider="outlook" variant="os" style={{ marginTop: 20 }} />
+              <MailSettingsCard provider="gmail" variant="os" style={{ marginTop: 20 }} />
 
               <button className="secondary-button" style={{ marginTop: 20 }} onClick={auth.logout}>Log out</button>
             </section>
