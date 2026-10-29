@@ -35,7 +35,8 @@ from functools import lru_cache
 from urllib.parse import quote
 
 from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes,
-                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail,
+                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, group_purchases,
+                         topic_words_of, is_automated_sender, is_bulk_mail,
                          newest_first, parse_period, prefixed_id)
 
 from . import google
@@ -716,13 +717,16 @@ def _find_purchases(cur, db, accounts, args) -> dict:
     emails = newest_first([e for _, found in done for e in found], 40)
     with_amounts = sum(1 for e in emails if e["amounts"] and not e["promotional"])
     last_day = end - timedelta(days=1)
+    grouped = group_purchases(emails, topic_words_of(topic))
     return _MB.with_failures({
-        "ok": True, "query": query, "count": len(emails), "emails": emails,
+        "ok": True, "emails_scanned": len(emails), **grouped,
         "mailboxes": [a.get("email") for a, _ in done], "guidance": PURCHASE_GUIDANCE,
         "_mail_sources": [_source(e) for e in emails if e["amounts"] and not e["promotional"]],
     }, broken, {"tool": "gmail_find_purchases", "provider": PROVIDER,
                 "label": (f"Scanned {_plural(len(emails), 'Gmail email')} {start:%Y-%m-%d} to {last_day:%Y-%m-%d} for purchases"
-                          + (f" ({topic})" if topic else "") + f" · {with_amounts} with amounts")})
+                          + (f" ({topic})" if topic else "")
+                          + f" · {len(grouped['purchases'])} purchase{'' if len(grouped['purchases']) == 1 else 's'}"
+                          + (f" · Rs {grouped['total']:,.0f}" if grouped['purchases'] else ""))})
 
 
 _DISPATCH = {

@@ -199,11 +199,10 @@ PURCHASE_WORDS = ("booking", "ticket", "e-ticket", "invoice", "receipt", "paymen
 
 
 PURCHASE_GUIDANCE = (
-    "Each email was opened and its written amounts extracted. Count only real purchases (e-tickets, booking "
-    "confirmations, invoices, payment receipts) using the amount marked likely_total / labelled total or paid -- "
-    "one amount per booking: emails sharing a booking_id / PNR are ONE purchase, and an airline itinerary plus a "
-    "booking-site (ixigo, MakeMyTrip, ...) confirmation for the same route on the same date are ONE trip -- count "
-    "what was paid to the booking site, never both. Skip anything promotional or with no amount. List each purchase with amount, merchant and date."
+    "`purchases` is already de-duplicated by the server (emails sharing a booking ID/PNR, and a booking-site + "
+    "airline email for the same trip, are one purchase; cancelled bookings, reminders and offers are left out) and "
+    "`total` is their sum. Present exactly those purchases and that total -- do NOT re-add amounts from anything "
+    "else. Mention `unrelated` items only if relevant to the question (they are NOT in the total)."
 )
 
 
@@ -436,3 +435,143 @@ def build_reply_meta(activity: list[dict], sources: list[dict]) -> dict | None:
         ],
         "mail_sources": ordered[:_MAX_SOURCES],
     }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic purchase grouping for *_find_purchases. Confirmed live: told
+# in words not to double-count, the model still added an ixigo invoice AND
+# the airline itinerary for the same flight (Rs 49,119 instead of ~28,630).
+# The server groups emails into purchases and computes the total itself.
+# ---------------------------------------------------------------------------
+
+_BOOKING_SITE_RE = re.compile(r"ixigo|makemytrip|goibibo|cleartrip|yatra|easemytrip|paytm|booking\.com|agoda|expedia", re.IGNORECASE)
+_AIRLINE_RE = re.compile(r"indigo|goindigo|akasa|air ?india|spicejet|vistara|airasia|alliance ?air|star ?air|emirates|qatar", re.IGNORECASE)
+_NOT_A_PURCHASE_RE = re.compile(
+    r"cancel|refund|pending payment|complete (?:the )?(?:pending )?payment|payment (?:failed|pending)|reminder|"
+    r"limited.time|offer|% off|deal|sale\b|web check-?in|boarding pass|check-?in (?:details|open)",
+    re.IGNORECASE)
+
+
+def _kind(email: dict) -> str:
+    who = f"{email.get('from') or ''} {email.get('subject') or ''}"
+    if _BOOKING_SITE_RE.search(email.get("from") or ""):
+        return "booking_site"
+    if _AIRLINE_RE.search(who):
+        return "airline"
+    return "other"
+
+
+def _top_amount(email: dict):
+    amounts = email.get("amounts") or []
+    return next((a for a in amounts if a.get("likely_total")), amounts[0] if amounts else None)
+
+
+def group_purchases(emails: list[dict], topic_words: list[str] | None = None) -> dict:
+    """emails: find_purchases results (subject, from, received, booking_ids,
+    amounts, promotional). Returns {purchases, total, unrelated, excluded}.
+
+    One purchase = one group of emails that share a booking id/PNR, plus a
+    booking-site email paired one-to-one with an airline email on the same
+    day whose amounts are within 15% (the same flight seen twice). A group
+    with a cancellation in it is dropped. Amount: what was paid to the
+    booking site, else the largest total in the group."""
+    cands, excluded = [], []
+    for e in emails:
+        top = _top_amount(e)
+        if e.get("promotional") or not top:
+            continue
+        if _NOT_A_PURCHASE_RE.search(e.get("subject") or ""):
+            excluded.append({"subject": e.get("subject"), "reason": "cancellation/reminder/offer, not a payment"})
+            # still contributes its ids so a cancelled booking drops out
+            cands.append({**e, "_amount": top["amount"], "_line": top["line"], "_kind": _kind(e), "_void": True})
+            continue
+        cands.append({**e, "_amount": top["amount"], "_line": top["line"], "_kind": _kind(e), "_void": False})
+
+    parent = list(range(len(cands)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        parent[find(i)] = find(j)
+
+    # 1. shared booking ids / PNRs
+    owner = {}
+    for i, c in enumerate(cands):
+        for ref in c.get("booking_ids") or []:
+            if ref in owner:
+                union(i, owner[ref])
+            else:
+                owner[ref] = i
+    # 2. same trip seen by booking site + airline: same day, amounts within
+    #    15%, closest amounts paired first, one-to-one (no chaining).
+    day = lambda c: (c.get("received") or "")[:10]  # noqa: E731
+    pairs = []
+    for i, a in enumerate(cands):
+        for j, b in enumerate(cands):
+            if a["_kind"] == "booking_site" and b["_kind"] == "airline" and day(a) and day(a) == day(b) \
+                    and not a["_void"] and not b["_void"] and find(i) != find(j):
+                diff = abs(a["_amount"] - b["_amount"]) / max(a["_amount"], b["_amount"])
+                if diff <= 0.15:
+                    pairs.append((diff, i, j))
+    used_site, used_airline = set(), set()
+    for diff, i, j in sorted(pairs):
+        gi, gj = find(i), find(j)
+        if gi in used_site or gj in used_airline or gi == gj:
+            continue
+        union(i, j)
+        used_site.add(find(i))
+        used_airline.add(find(i))
+
+    groups = {}
+    for i, c in enumerate(cands):
+        groups.setdefault(find(i), []).append(c)
+
+    words = [w.lower() for w in (topic_words or []) if w and len(w) > 2]
+    # Booking-site names say nothing about WHAT was bought (MakeMyTrip sells
+    # hotels too -- confirmed live, a hotel voucher landed in a flight total),
+    # so relevance is judged on the other words, against subject + amount line.
+    item_words = [w for w in words if not _BOOKING_SITE_RE.search(w)] or words
+    purchases, unrelated = [], []
+    for members in groups.values():
+        if any(m["_void"] and _re_cancel(m) for m in members):
+            excluded.append({"subject": members[0].get("subject"), "reason": "booking was cancelled"})
+            continue
+        paid = [m for m in members if not m["_void"]]
+        if not paid:
+            continue
+        rank = {"booking_site": 0, "other": 1, "airline": 2}
+        best = sorted(paid, key=lambda m: (rank[m["_kind"]], -m["_amount"]))[0]
+        text = " ".join(f"{m.get('subject') or ''} {m.get('_line') or ''}" for m in members).lower()
+        item = {
+            "date": (best.get("received") or "")[:10],
+            "merchant": (best.get("from") or "").split("<")[0].strip().strip("'\"") or best.get("from"),
+            "amount": best["_amount"],
+            "evidence": best["_line"],
+            "booking_ids": sorted({r for m in members for r in (m.get("booking_ids") or [])}),
+            "emails": [m.get("subject") for m in members],
+            "account": best.get("account"),
+        }
+        if item_words and not any(w in text for w in item_words):
+            unrelated.append(item)
+        else:
+            purchases.append(item)
+    purchases.sort(key=lambda p: p["date"], reverse=True)
+    return {
+        "purchases": purchases,
+        "total": round(sum(p["amount"] for p in purchases), 2),
+        "unrelated": unrelated,
+        "excluded": excluded,
+    }
+
+
+def _re_cancel(email: dict) -> bool:
+    return bool(re.search(r"cancel|refund", email.get("subject") or "", re.IGNORECASE))
+
+
+def topic_words_of(query: str) -> list[str]:
+    return [w.strip('"()').lower() for w in re.split(r"\s+OR\s+|\s+AND\s+|\s+", query or "", flags=re.IGNORECASE)
+            if w.strip('"()') and w.strip('"()').upper() not in ("OR", "AND")]
