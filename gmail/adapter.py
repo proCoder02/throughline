@@ -601,10 +601,16 @@ def _decode(data: str) -> str:
 
 
 def _html_to_text(markup: str) -> str:
+    # Whitespace in HTML source (incl. newlines) means nothing -- collapse it
+    # FIRST, then let real block tags make the line breaks. Confirmed live:
+    # keeping source newlines split "payment of Rs." and "8128" onto
+    # different lines, so no amount was found in ixigo's invoices.
     text = _STYLE_SCRIPT_RE.sub("", markup)
+    text = re.sub(r"\s+", " ", text)
     text = _BLOCK_TAG_RE.sub("\n", text)
     text = html.unescape(_TAG_RE.sub("", text))
-    return re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _body_and_attachments(payload: dict) -> tuple[str, list[str]]:
@@ -697,7 +703,9 @@ def _find_purchases(cur, db, accounts, args) -> dict:
         for msg in messages:
             summary = _summarize(msg, account)
             body, _ = _body_and_attachments(msg.get("payload"))
-            text = summary["subject"] + "\n" + body
+            # Gmail's snippet is a one-line copy of the opening text -- a
+            # backup source of amounts if the body parses oddly.
+            text = summary["subject"] + "\n" + body + "\n" + (summary.get("preview") or "")
             found.append({**{k: v for k, v in summary.items() if k != "preview"},
                           "booking_ids": booking_ids(text), "amounts": extract_amounts(text)})
         return found

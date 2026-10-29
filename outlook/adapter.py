@@ -661,7 +661,7 @@ def _find_purchases(cur, db, accounts, args) -> dict:
         found = []
         for m, text in zip(picked, bodies):
             summary = _summarize(m, account)
-            full_text = summary["subject"] + "\n" + text
+            full_text = summary["subject"] + "\n" + text + "\n" + (summary.get("preview") or "")
             found.append({**{k: v for k, v in summary.items() if k != "preview"},
                           "booking_ids": booking_ids(full_text), "amounts": extract_amounts(full_text)})
         return found

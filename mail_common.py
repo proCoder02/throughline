@@ -101,13 +101,19 @@ _TOTAL_WORD_RE = re.compile(
     r"total|amount\s+paid|you\s+paid|paid|payment\s+of|fare|amount|net\s+payable|charged|price", re.IGNORECASE)
 
 
+_CURRENCY_LINE_END_RE = re.compile(r"(₹|\brs\.?|\binr)[ \t]*\r?\n\s*(?=[0-9])", re.IGNORECASE)
+
+
 def extract_amounts(text: str, limit: int = 6) -> list[dict]:
     """Money amounts written in an email (Rs/₹/INR), each with the line it
     appeared on. likely_total marks a line -- or the label line just above
     it, since HTML tables flatten to "Total\\n₹ 7,563" -- that names a total
     or payment. Most-likely totals first, then larger amounts."""
+    # Hard-wrapped plain text can still end a line on the currency sign
+    # ("payment of Rs." then "8128" on the next line) -- join those first.
+    text = _CURRENCY_LINE_END_RE.sub(lambda m: m.group(1) + " ", text or "")
     found, seen, prev = [], set(), ""
-    for raw in (text or "").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()[:300]
         if not line:
             continue
@@ -195,8 +201,9 @@ PURCHASE_WORDS = ("booking", "ticket", "e-ticket", "invoice", "receipt", "paymen
 PURCHASE_GUIDANCE = (
     "Each email was opened and its written amounts extracted. Count only real purchases (e-tickets, booking "
     "confirmations, invoices, payment receipts) using the amount marked likely_total / labelled total or paid -- "
-    "one amount per booking (emails sharing a booking_id / PNR are ONE purchase -- use the invoice or payment "
-    "amount, don't add both). Skip anything promotional or with no amount. List each purchase with amount, merchant and date."
+    "one amount per booking: emails sharing a booking_id / PNR are ONE purchase, and an airline itinerary plus a "
+    "booking-site (ixigo, MakeMyTrip, ...) confirmation for the same route on the same date are ONE trip -- count "
+    "what was paid to the booking site, never both. Skip anything promotional or with no amount. List each purchase with amount, merchant and date."
 )
 
 
