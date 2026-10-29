@@ -34,7 +34,8 @@ from email.utils import parseaddr
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import Mailboxes, account_param, is_automated_sender, newest_first, prefixed_id
+from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, Mailboxes, account_param, is_automated_sender,
+                         is_bulk_mail, newest_first, prefixed_id)
 
 from . import google
 from .google import GoogleError
@@ -390,7 +391,9 @@ def _clamp(value, default: int, low: int, high: int) -> int:
 
 
 def _plural(n: int, word: str) -> str:
-    return f"{n} {word}{'' if n == 1 else 's'}"
+    if n == 1:
+        return f"{n} {word}"
+    return f"{n} {word}{'es' if word.endswith(('ch', 'sh', 's', 'x')) else 's'}"
 
 
 def _headers(msg: dict) -> dict:
@@ -517,11 +520,16 @@ def _search(cur, db, accounts, args) -> dict:
                 "label": f"Searched {where} for “{query}” · {_plural(len(emails), 'match')}"})
 
 
+_THREAD_HEADERS = _METADATA_HEADERS + list(BULK_HEADER_NAMES)
+# Gmail's own non-primary tabs -- belt and braces with category:primary.
+_BULK_LABELS = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "SPAM"}
+
+
 def _fetch_threads(token: str, ids: list[str]) -> list[dict]:
     def one(thread_id):
         return google.get(
             f"/threads/{quote(thread_id, safe='')}", token,
-            params=[("format", "metadata"), *[("metadataHeaders", h) for h in _METADATA_HEADERS]],
+            params=[("format", "metadata"), *[("metadataHeaders", h) for h in _THREAD_HEADERS]],
         )
     if not ids:
         return []
@@ -545,10 +553,13 @@ def _needs_reply(cur, db, accounts, args) -> dict:
             if not messages:
                 continue
             last = messages[-1]
-            if "SENT" in (last.get("labelIds") or []):
+            labels = set(last.get("labelIds") or [])
+            if "SENT" in labels:
                 continue  # the user had the last word
-            sender = _headers(last).get("from", "")
-            if is_automated_sender(sender):
+            if labels & _BULK_LABELS:
+                continue
+            headers = _headers(last)
+            if is_automated_sender(headers.get("from", "")) or is_bulk_mail(headers):
                 continue
             waiting.append({**_summarize(last, account), "messages_in_thread": len(messages)})
         return waiting
@@ -560,7 +571,7 @@ def _needs_reply(cur, db, accounts, args) -> dict:
     return _MB.with_failures({
         "ok": True, "days": days, "count": len(emails), "emails": emails,
         "mailboxes": [a.get("email") for a, _ in done],
-        "guidance": "Candidates only: list just the ones that actually ask the user something or expect an answer.",
+        "guidance": NEEDS_REPLY_GUIDANCE,
         "_mail_sources": [_source(e) for e in emails],
     }, broken, {"tool": "gmail_find_needs_reply", "provider": PROVIDER,
                 "label": f"Looked for Gmail threads awaiting your reply · {_plural(len(emails), 'candidate')} from the last {_plural(days, 'day')}"})

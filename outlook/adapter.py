@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import os
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import Mailboxes, account_param, is_automated_sender, newest_first, prefixed_id
+from mail_common import (NEEDS_REPLY_GUIDANCE, Mailboxes, account_param, is_automated_sender, is_bulk_mail,
+                         newest_first, prefixed_id)
 
 from . import graph
 from .graph import GraphError
@@ -412,7 +414,9 @@ def _summarize(msg: dict, account: dict) -> dict:
 
 
 def _plural(n: int, word: str) -> str:
-    return f"{n} {word}{'' if n == 1 else 's'}"
+    if n == 1:
+        return f"{n} {word}"
+    return f"{n} {word}{'es' if word.endswith(('ch', 'sh', 's', 'x')) else 's'}"
 
 
 def _source(email: dict) -> dict:
@@ -528,8 +532,24 @@ def _needs_reply(cur, db, accounts, args) -> dict:
             sender = _sender(m)
             if is_automated_sender(sender) or (account.get("email") and account["email"] in sender.lower()):
                 continue
-            waiting.append(_summarize(m, account))
-        return waiting
+            waiting.append((m.get("id"), _summarize(m, account)))
+        # Graph's list endpoint can't return headers, so check the newest
+        # few candidates one by one (in parallel) for bulk-mail markers --
+        # Focused Inbox alone let tour-package promos through (confirmed live).
+        waiting = waiting[: limit * 2]
+
+        def headers_of(raw_id):
+            try:
+                msg = graph.get(f"/me/messages/{quote(raw_id, safe='')}", token, params={"$select": "internetMessageHeaders"})
+            except GraphError:
+                return {}
+            return {(h.get("name") or "").lower(): h.get("value") or "" for h in msg.get("internetMessageHeaders") or []}
+
+        if not waiting:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(waiting))) as pool:
+            headers = list(pool.map(headers_of, [raw for raw, _ in waiting]))
+        return [summary for (raw, summary), h in zip(waiting, headers) if not is_bulk_mail(h)]
 
     done, broken = _MB.across(cur, db, accounts, work)
     if not done:
@@ -538,7 +558,7 @@ def _needs_reply(cur, db, accounts, args) -> dict:
     return _MB.with_failures({
         "ok": True, "days": days, "count": len(emails), "emails": emails,
         "mailboxes": [a.get("email") for a, _ in done],
-        "guidance": "Candidates only: list just the ones that actually ask the user something or expect an answer.",
+        "guidance": NEEDS_REPLY_GUIDANCE,
         "_mail_sources": [_source(e) for e in emails],
     }, broken, {"tool": "outlook_find_needs_reply", "provider": PROVIDER,
                 "label": f"Looked for Outlook emails awaiting your reply · {_plural(len(emails), 'candidate')} from the last {_plural(days, 'day')}"})

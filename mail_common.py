@@ -68,7 +68,8 @@ def pick_accounts(accounts: list[dict], wanted: str | None) -> tuple[list[dict],
 
 _AUTOMATED_SENDER_RE = re.compile(
     r"no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?@|notify@|alerts?@|newsletters?@|"
-    r"updates?@|marketing@|digest@|bounce",
+    r"updates?@|marketing@|digest@|bounce|invoice|billing@|receipts?@|statements?@|orders?@|bookings?@|"
+    r"tickets?@|info@|news@|hello@|team@|events?@|offers?@|promo",
     re.IGNORECASE,
 )
 
@@ -76,6 +77,30 @@ _AUTOMATED_SENDER_RE = re.compile(
 def is_automated_sender(sender: str) -> bool:
     """Senders nobody replies to -- excluded from "needs a reply"."""
     return bool(_AUTOMATED_SENDER_RE.search(sender or ""))
+
+
+# Headers that only bulk/automated mail carries. Confirmed live: tour-package
+# promos, Meetup event mails and course announcements all passed the sender
+# check and were listed as "needs a reply" -- every one of them carries
+# List-Unsubscribe, which person-to-person mail essentially never does.
+BULK_HEADER_NAMES = ("List-Unsubscribe", "List-Id", "Precedence", "Auto-Submitted", "X-Campaign", "Feedback-ID")
+
+
+def is_bulk_mail(headers: dict) -> bool:
+    """headers: lowercase name -> value."""
+    if any(h.lower() in headers for h in ("List-Unsubscribe", "List-Id", "X-Campaign", "Feedback-ID")):
+        return True
+    if (headers.get("precedence") or "").strip().lower() in ("bulk", "list", "junk", "auto_reply"):
+        return True
+    auto = (headers.get("auto-submitted") or "").strip().lower()
+    return bool(auto) and auto != "no"
+
+
+NEEDS_REPLY_GUIDANCE = (
+    "Candidates only, already filtered for bulk mail: list just the ones a real person wrote that ask the user "
+    "something or expect an answer. Newsletters, promotions, event invites, notifications, invoices and receipts "
+    "never need a reply -- leave them out. If none remain, say plainly that nothing is waiting on a reply."
+)
 
 
 def newest_first(emails: list[dict], limit: int) -> list[dict]:
@@ -258,7 +283,8 @@ def system_prompt_note(cur, user_id) -> str:
         "user points at: turn it into a task/reminder (create_task, using a due date written in the email) or log "
         "a bill/receipt as an expense (log_expense, amounts exactly as written) -- pass that email's id as "
         "source_email_id so it links back. Only do so when the user asks."
-        " For spending questions (\"how much did I spend on flights last year?\"), check query_spending first; if "
+        " For spending questions (\"how much did I spend on flights last year?\"), always look again with the tools "
+        "-- never repeat a total from earlier in this chat, new receipts may have arrived. Check query_spending first; if "
         "the logged expenses don't cover it, go straight on (never ask permission -- reading is read-only) to "
         "search the mailbox(es) for booking confirmations, e-tickets, invoices "
         "or receipts in that period (Gmail accepts e.g. 'flight (booking OR e-ticket OR itinerary OR invoice) "

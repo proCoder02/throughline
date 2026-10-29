@@ -1875,7 +1875,9 @@ AGENT_TOOLS = [
                 "category. Use for every spending question beyond 'this month so far' -- e.g. 'how much did I "
                 "spend on flight tickets last year' (start_date/end_date for last year, keywords like flight, "
                 "airline names, travel sites). Work out exact dates from today's date. Only covers what the user "
-                "logged in the app (receipts, stated expenses), dated by when it was logged."
+                "logged in the app (receipts, stated expenses), dated by when it was logged. Call it fresh for every "
+                "spending question -- never reuse a total from earlier in the conversation, since new expenses or "
+                "receipt emails may have arrived since."
             ),
             "parameters": {
                 "type": "object",
@@ -2156,9 +2158,10 @@ def _tool_log_expense(cur, db, user_id, args):
 
 
 def _tool_query_spending(cur, db, user_id, args):
+    local_tz = datetime.now().astimezone().tzinfo  # dates mean the user's local days, not UTC
     try:
-        start = datetime.strptime((args.get("start_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        last = datetime.strptime((args.get("end_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start = datetime.strptime((args.get("start_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=local_tz)
+        last = datetime.strptime((args.get("end_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=local_tz)
     except ValueError:
         return {"error": "start_date and end_date must be YYYY-MM-DD"}
     if last < start:
@@ -7119,14 +7122,25 @@ def chat_global():
     # gated on the intent regex, no flag needed.
     finance_context = ""
     if _FINANCE_INTENT_RE.search(prompt_lower):
-        month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        month_end = datetime.now(timezone.utc)
+        # Local time (the server runs in the users' timezone), not UTC --
+        # "this month"/"today" must flip at local midnight.
+        now_local = datetime.now().astimezone()
+        month_start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_end = now_local
         spending_rows = compute_monthly_spending_summary(cur, user_id, month_start, month_end)
         if spending_rows:
+            # Today's total computed here, not left to the model to pick out
+            # of the transaction list -- confirmed live that it otherwise
+            # reused yesterday's "today" answer from earlier in the chat.
+            day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            _, today_total, today_count, _ = query_transactions(cur, user_id, day_start, now_local + timedelta(seconds=1))
             lines = [
                 f"Real spending data for {month_start.strftime('%B %Y')} so far, by category (highest first). "
                 f"This snapshot covers THIS MONTH ONLY -- for any other period, or a specific item/merchant "
-                f"(e.g. flights last year), call the query_spending tool instead of answering from this:"
+                f"(e.g. flights last year), call the query_spending tool instead of answering from this. "
+                f"These figures are fresh as of now: never reuse a total from earlier in this chat instead.",
+                f"Today ({now_local:%Y-%m-%d}) so far: Rs {today_total:.2f} across {today_count} "
+                f"transaction{'s' if today_count != 1 else ''}.",
             ]
             for r in spending_rows:
                 lines.append(f"- {r['category']}: Rs {r['total']:.2f} across {r['count']} transaction{'s' if r['count'] != 1 else ''}")
