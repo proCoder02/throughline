@@ -246,7 +246,8 @@ PURCHASE_GUIDANCE = (
     "`purchases` is already de-duplicated by the server (emails sharing a booking ID/PNR, and a booking-site + "
     "airline email for the same trip, are one purchase; cancelled bookings, reminders and offers are left out) and "
     "`total` is their sum. Present exactly those purchases and that total -- do NOT re-add amounts from anything "
-    "else. Mention `unrelated` items only if relevant to the question (they are NOT in the total). Purchases marked "
+    "else, and never add an amount that isn't in `purchases` (an airline itinerary for a trip booked on ixigo/"
+    "MakeMyTrip is already folded into that booking). Mention `unrelated` items only if relevant to the question (they are NOT in the total). Purchases marked "
     "`already_logged` are also in the user's logged expenses: when combining with a logged total, add only "
     "`not_logged_total`. When a purchase has a `route` (from → to), show it next to that purchase so the user can "
     "see where each trip went."
@@ -513,6 +514,9 @@ def _top_amount(email: dict):
     return next((a for a in amounts if a.get("likely_total")), amounts[0] if amounts else None)
 
 
+_GENERIC_PURCHASE_WORDS = set(PURCHASE_WORDS) | {"purchase", "purchases", "bookings", "tickets", "confirmation", "paid", "spend", "spent"}
+
+
 def group_purchases(emails: list[dict], topic_words: list[str] | None = None) -> dict:
     """emails: find_purchases results (subject, from, received, booking_ids,
     amounts, promotional). Returns {purchases, total, unrelated, excluded}.
@@ -581,7 +585,9 @@ def group_purchases(emails: list[dict], topic_words: list[str] | None = None) ->
     # Booking-site names say nothing about WHAT was bought (MakeMyTrip sells
     # hotels too -- confirmed live, a hotel voucher landed in a flight total),
     # so relevance is judged on the other words, against subject + amount line.
-    item_words = [w for w in words if not _BOOKING_SITE_RE.search(w)] or words
+    # What the question is ABOUT: not the booking site (a MakeMyTrip hotel isn't a flight) and not a generic
+    # purchase word -- the model sometimes adds "booking" to a flight query, which let hotels in (confirmed live).
+    item_words = [w for w in words if not _BOOKING_SITE_RE.search(w) and w not in _GENERIC_PURCHASE_WORDS] or words
     purchases, unrelated = [], []
     for members in groups.values():
         if any(m["_void"] and _re_cancel(m) for m in members):

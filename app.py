@@ -2213,9 +2213,11 @@ def _tool_query_spending(cur, db, user_id, args):
             "In the answer, list each purchase with its amount and source, say the total comes from emails (bookings "
             "made elsewhere may be missing), "
             + ("" if not count else
-               "combine it with the logged amount above -- add only the email results' `not_logged_total` (purchases "
+               "logged matches come from keyword matching, so first drop any that aren't this item (e.g. a cab or "
+               "airport cafe for a flight question) and count only the ones that are; then "
+               "combine them with the email results -- add only the email results' `not_logged_total` (purchases "
                "marked already_logged are in the logged amount already), " if overlaps else
-               "combine it with the logged amount above, ")
+               "combine it with the logged amount above (only logged entries that are this item), ")
             + "and offer to log them as expenses."
         )
     elif count == 0:
