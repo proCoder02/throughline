@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { apiJson, post, postForm } from '../../api.js';
 import { showToast } from '../../lib/notify.js';
 import { maybeGetLocation } from '../../lib/location.js';
@@ -70,7 +70,9 @@ function CopyButton({ text }) {
   );
 }
 
-function AssistantTurn({ message, onRetry, onActionResolved }) {
+// memo: typing in the composer re-renders the screen, and without this every
+// turn's markdown was re-parsed on each keystroke.
+const AssistantTurn = memo(function AssistantTurn({ message, onRetry, onActionResolved }) {
   return (
     <div className={'ac-turn ac-assistant' + (message.error ? ' is-error' : '')}>
       <div className="ac-avatar" aria-hidden="true"><SparkleIcon /></div>
@@ -99,9 +101,9 @@ function AssistantTurn({ message, onRetry, onActionResolved }) {
       </div>
     </div>
   );
-}
+});
 
-function UserTurn({ message }) {
+const UserTurn = memo(function UserTurn({ message }) {
   return (
     <div className="ac-turn ac-user">
       <div className="ac-user-bubble">
@@ -111,7 +113,15 @@ function UserTurn({ message }) {
       </div>
     </div>
   );
-}
+});
+
+// History arrives a page at a time, newest first; older pages load as the
+// reader scrolls up.
+const HISTORY_PAGE = 50;
+const LOAD_OLDER_PX = 300;
+const fromRow = (r) => withId({ role: r.role, content: r.content, replyMeta: r.reply_meta, createdAt: r.created_at });
+// An older backend ignores ?limit and returns the whole list -- treat that as one complete page.
+const asPage = (data) => (Array.isArray(data) ? { messages: data, start: 0 } : data);
 
 export default function AssistantChat({ title = 'Ask Throughline', subtitle, userName, onBack }) {
   const mailStatus = useMailStatus();
@@ -123,6 +133,9 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [confirmQueue, setConfirmQueue] = useState([]);
   const [showJump, setShowJump] = useState(false);
+  const [olderFrom, setOlderFrom] = useState(0); // server index of the oldest loaded message; 0 = all loaded
+  const loadingOlder = useRef(false);
+  const keepScrollFrom = useRef(null); // scrollHeight before older messages were prepended
 
   const scrollRef = useRef(null);
   const textareaRef = useRef(null);
@@ -133,12 +146,36 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
 
   // ---- history ----
   useEffect(() => {
-    apiJson('/chat/global')
-      .then((rows) => setMessages(rows.map((r) => withId({
-        role: r.role, content: r.content, replyMeta: r.reply_meta, createdAt: r.created_at,
-      }))))
+    apiJson(`/chat/global?limit=${HISTORY_PAGE}`)
+      .then((data) => {
+        const page = asPage(data);
+        setMessages(page.messages.map(fromRow));
+        setOlderFrom(page.start);
+      })
       .catch(() => setMessages([]));
   }, []);
+
+  const loadOlder = useCallback(() => {
+    if (loadingOlder.current || !olderFrom) return;
+    loadingOlder.current = true;
+    apiJson(`/chat/global?limit=${HISTORY_PAGE}&before=${olderFrom}`)
+      .then((data) => {
+        const page = asPage(data);
+        keepScrollFrom.current = scrollRef.current?.scrollHeight ?? null;
+        setMessages((m) => [...page.messages.map(fromRow), ...(m || [])]);
+        setOlderFrom(page.start);
+      })
+      .catch(() => {})
+      .finally(() => { loadingOlder.current = false; });
+  }, [olderFrom]);
+
+  // Prepending older messages must not move what the reader is looking at.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (keepScrollFrom.current == null || !el) return;
+    el.scrollTop += el.scrollHeight - keepScrollFrom.current;
+    keepScrollFrom.current = null;
+  }, [messages]);
 
   useEffect(() => {
     if (!isPhone()) textareaRef.current?.focus();
@@ -157,6 +194,7 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
     stickToBottom.current = nearBottom;
     setShowJump(!nearBottom);
+    if (el.scrollTop < LOAD_OLDER_PX) loadOlder();
   };
 
   // First paint of history jumps straight to the end; later additions glide.
@@ -298,6 +336,10 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
     // The failed user turn is already on screen -- resend without a duplicate.
     run(null, failed.retryPrompt, () => askBackend(failed.retryPrompt));
   };
+  // Stable identity so the memoized turns don't all re-render on every keystroke.
+  const retryRef = useRef(retry);
+  retryRef.current = retry;
+  const onRetry = useCallback((failed) => retryRef.current(failed), []);
 
   const applyStarter = (prompt) => {
     setInput(prompt);
@@ -416,9 +458,12 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
           )}
 
           <div role="log" aria-live="polite" aria-relevant="additions">
+            {olderFrom > 0 && (
+              <button type="button" className="ac-load-older" onClick={loadOlder}>Show earlier messages</button>
+            )}
             {(messages || []).map((m) => (m.role === 'user'
               ? <UserTurn key={m.id} message={m} />
-              : <AssistantTurn key={m.id} message={m} onRetry={retry} />))}
+              : <AssistantTurn key={m.id} message={m} onRetry={onRetry} />))}
           </div>
 
           {sending && (

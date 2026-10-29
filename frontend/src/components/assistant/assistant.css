@@ -325,6 +325,20 @@
 }
 
 /* ---- jump to latest ---- */
+.ac-load-older {
+  display: block;
+  margin: 4px auto 18px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--ac-border);
+  background: var(--ac-surface);
+  color: var(--ac-soft);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.ac-load-older:hover { background: var(--ac-surface-2); color: var(--ac-text); }
+
 .ac-jump {
   position: absolute;
   left: 50%;

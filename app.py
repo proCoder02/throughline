@@ -6930,11 +6930,26 @@ GLOBAL_CHAT_CHARS_PER_CONVERSATION = 1200
 @app.route("/chat/global", methods=["GET"])
 @login_required
 def get_global_chat_history():
-    user_id = current_user_id()
+    """The whole thread, oldest first -- or, with ?limit=N, one page of it:
+    {"messages": the N before index `before` (default: the newest N),
+    "start": index of the first one}. Paged so the web chat doesn't download
+    and render ~1,000 messages just to open (confirmed live: 542 KB); the
+    full-list form stays as-is for clients that don't page (Flutter)."""
+    rows = _global_chat_rows(current_user_id())
+    limit = request.args.get("limit", type=int)
+    if not limit or limit < 1:
+        return jsonify(rows)
+    before = request.args.get("before", type=int)
+    end = len(rows) if before is None else max(0, min(before, len(rows)))
+    start = max(0, end - min(limit, 200))
+    return jsonify({"messages": rows[start:end], "start": start})
+
+
+def _global_chat_rows(user_id):
     cache_key = _messages_cache_key(user_id, None)
     cached = cache_get_json(cache_key)
     if cached is not None:
-        return jsonify(cached)
+        return cached
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
@@ -6949,7 +6964,7 @@ def get_global_chat_history():
             row.pop("reply_meta", None)  # same row shape as before for every ordinary message
         result.append(row)
     cache_set_json(cache_key, result, ttl=3600)
-    return jsonify(result)
+    return result
 
 
 @app.route("/chat/global", methods=["POST"])
