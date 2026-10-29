@@ -35,7 +35,7 @@ from functools import lru_cache
 from urllib.parse import quote
 
 from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes,
-                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, group_purchases,
+                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, group_purchases, mark_logged,
                          topic_words_of, is_automated_sender, is_bulk_mail,
                          newest_first, parse_period, prefixed_id)
 
@@ -717,7 +717,7 @@ def _find_purchases(cur, db, accounts, args) -> dict:
     emails = newest_first([e for _, found in done for e in found], 40)
     with_amounts = sum(1 for e in emails if e["amounts"] and not e["promotional"])
     last_day = end - timedelta(days=1)
-    grouped = group_purchases(emails, topic_words_of(topic))
+    grouped = mark_logged(cur, accounts[0]["user_id"], group_purchases(emails, topic_words_of(topic)))
     return _MB.with_failures({
         "ok": True, "emails_scanned": len(emails), **grouped,
         "mailboxes": [a.get("email") for a, _ in done], "guidance": PURCHASE_GUIDANCE,

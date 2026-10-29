@@ -202,7 +202,9 @@ PURCHASE_GUIDANCE = (
     "`purchases` is already de-duplicated by the server (emails sharing a booking ID/PNR, and a booking-site + "
     "airline email for the same trip, are one purchase; cancelled bookings, reminders and offers are left out) and "
     "`total` is their sum. Present exactly those purchases and that total -- do NOT re-add amounts from anything "
-    "else. Mention `unrelated` items only if relevant to the question (they are NOT in the total)."
+    "else. Mention `unrelated` items only if relevant to the question (they are NOT in the total). Purchases marked "
+    "`already_logged` are also in the user's logged expenses: when combining with a logged total, add only "
+    "`not_logged_total`."
 )
 
 
@@ -575,3 +577,18 @@ def _re_cancel(email: dict) -> bool:
 def topic_words_of(query: str) -> list[str]:
     return [w.strip('"()').lower() for w in re.split(r"\s+OR\s+|\s+AND\s+|\s+", query or "", flags=re.IGNORECASE)
             if w.strip('"()') and w.strip('"()').upper() not in ("OR", "AND")]
+
+
+def mark_logged(cur, user_id, grouped: dict) -> dict:
+    """Flags each email purchase that the user also logged as an expense
+    (same amount within 2%, logged within 3 days of the email) and adds
+    `not_logged_total`, so email + logged totals can be combined without
+    counting one payment twice."""
+    for p in grouped["purchases"]:
+        cur.execute(
+            "SELECT 1 FROM transactions WHERE user_id = %s AND abs(amount - %s) <= greatest(1, %s * 0.02) "
+            "AND created_at::date BETWEEN %s::date - 3 AND %s::date + 3 LIMIT 1",
+            (user_id, p["amount"], p["amount"], p["date"], p["date"]))
+        p["already_logged"] = cur.fetchone() is not None
+    grouped["not_logged_total"] = round(sum(p["amount"] for p in grouped["purchases"] if not p["already_logged"]), 2)
+    return grouped

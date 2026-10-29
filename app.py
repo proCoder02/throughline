@@ -2191,13 +2191,18 @@ def _tool_query_spending(cur, db, user_id, args):
 
     narrowed = bool(keywords or args.get("category"))
     # Email only when it can add something: part of the period predates
-    # logging, or a specific item found nothing logged. (A plain "today"
+    # logging, or the question is about a specific item. (A plain "today"
     # with nothing logged, inside the logged range, is just Rs 0 -- confirmed
-    # live that sending those to email only made the answer slow.)
-    if mail_linked and (uncovered or (count == 0 and narrowed)):
+    # live that sending those to email only made the answer slow.) A specific
+    # item searches email over the WHOLE period: logging only has what the
+    # user typed in, and a flight booked after logging began but never logged
+    # was missed (confirmed live). find_purchases flags the email purchases
+    # that are already logged, so nothing is counted twice.
+    if mail_linked and (uncovered or narrowed):
         gap = (f"The user only started logging expenses on {first_logged:%Y-%m-%d}, so " if first_logged and uncovered
                else "")
-        gap_last = (min(end, first_logged) if first_logged and uncovered and count else end) - timedelta(days=1)
+        gap_last = (min(end, first_logged) if first_logged and uncovered and count and not narrowed else end) - timedelta(days=1)
+        overlaps = bool(first_logged) and gap_last + timedelta(days=1) > first_logged
         words = [w for w in (keywords if isinstance(keywords, list) else []) if isinstance(w, str) and w.strip()][:8]
         topic = " OR ".join(f'"{w.strip()}"' if " " in w.strip() else w.strip() for w in words)
         call = (f"start_date={start:%Y-%m-%d}, end_date={gap_last:%Y-%m-%d}" + (f", query={topic!r}" if topic else ""))
@@ -2207,7 +2212,10 @@ def _tool_query_spending(cur, db, user_id, args):
             f"gmail_find_purchases and/or outlook_find_purchases ({call}); they open the emails and return the amounts. "
             "In the answer, list each purchase with its amount and source, say the total comes from emails (bookings "
             "made elsewhere may be missing), "
-            + ("combine it with the logged amount above, " if count else "")
+            + ("" if not count else
+               "combine it with the logged amount above -- add only the email results' `not_logged_total` (purchases "
+               "marked already_logged are in the logged amount already), " if overlaps else
+               "combine it with the logged amount above, ")
             + "and offer to log them as expenses."
         )
     elif count == 0:
