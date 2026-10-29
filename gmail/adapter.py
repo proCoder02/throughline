@@ -35,7 +35,7 @@ from functools import lru_cache
 from urllib.parse import quote
 
 from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes,
-                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, group_purchases, mark_logged,
+                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, group_purchases, mark_logged, extract_route,
                          topic_words_of, is_automated_sender, is_bulk_mail,
                          newest_first, parse_period, prefixed_id)
 
@@ -708,7 +708,8 @@ def _find_purchases(cur, db, accounts, args) -> dict:
             # backup source of amounts if the body parses oddly.
             text = summary["subject"] + "\n" + body + "\n" + (summary.get("preview") or "")
             found.append({**{k: v for k, v in summary.items() if k != "preview"},
-                          "booking_ids": booking_ids(text), "amounts": extract_amounts(text)})
+                          "booking_ids": booking_ids(text), "amounts": extract_amounts(text),
+                          "route": extract_route(text)})
         return found
 
     done, broken = _MB.across(cur, db, accounts, work)

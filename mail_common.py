@@ -153,6 +153,50 @@ def booking_ids(text: str) -> list[str]:
     return seen[:4]
 
 
+# Airport codes in booking mails ("journey BLR-IDR on 6E"), mapped to the
+# city a user would recognise. Only known codes count, so "GST-INV" style
+# tokens aren't read as a route.
+_IATA = {
+    "BLR": "Bengaluru", "BOM": "Mumbai", "DEL": "New Delhi", "MAA": "Chennai", "CCU": "Kolkata", "HYD": "Hyderabad",
+    "AMD": "Ahmedabad", "PNQ": "Pune", "GOI": "Goa", "GOX": "Goa", "COK": "Kochi", "CCJ": "Kozhikode",
+    "TRV": "Thiruvananthapuram", "IDR": "Indore", "JAI": "Jaipur", "LKO": "Lucknow", "PAT": "Patna", "BBI": "Bhubaneswar",
+    "GAU": "Guwahati", "IXC": "Chandigarh", "SXR": "Srinagar", "IXB": "Bagdogra", "NAG": "Nagpur", "BHO": "Bhopal",
+    "VNS": "Varanasi", "IXR": "Ranchi", "RPR": "Raipur", "VTZ": "Visakhapatnam", "IXE": "Mangaluru", "CJB": "Coimbatore",
+    "IXM": "Madurai", "TRZ": "Tiruchirappalli", "STV": "Surat", "BDQ": "Vadodara", "UDR": "Udaipur", "JDH": "Jodhpur",
+    "IXJ": "Jammu", "IXL": "Leh", "DED": "Dehradun", "ATQ": "Amritsar", "HBX": "Hubballi", "IXZ": "Port Blair",
+    "GWL": "Gwalior", "RAJ": "Rajkot", "AYJ": "Ayodhya",
+    "DXB": "Dubai", "AUH": "Abu Dhabi", "DOH": "Doha", "SIN": "Singapore", "BKK": "Bangkok", "KUL": "Kuala Lumpur",
+    "LHR": "London", "JFK": "New York", "SFO": "San Francisco", "CMB": "Colombo", "KTM": "Kathmandu",
+}
+_CITY = r"([A-Za-z][A-Za-z .]{1,28}?)"
+_ROUTE_RES = (
+    # ixigo subject / invoice: "Your Indore - New Delhi flight booking", "for your Bengaluru - Kolkata flight"
+    re.compile(rf"\byour\s+{_CITY}\s+[-–→]\s+{_CITY}\s+(?:flight|train|bus)\b", re.IGNORECASE),
+    # ixigo body heading: "INDORE TO NEW DELHI" on a line of its own
+    re.compile(r"^[ \t]*([A-Z][A-Z .]{1,28}?)\s+TO\s+([A-Z][A-Z .]{1,28}?)[ \t]*$", re.MULTILINE),
+    # "flight from Bengaluru to Indore"
+    re.compile(rf"\b(?:flight|trip|journey)\s+from\s+{_CITY}\s+to\s+{_CITY}(?=[\s,.;)]|$)"),
+)
+_IATA_PAIR_RE = re.compile(r"\b([A-Z]{3})\s*(?:-|–|→|>|to)\s*([A-Z]{3})\b")
+
+
+def extract_route(text: str) -> str | None:
+    """'Bengaluru → Indore' for a travel booking email, else None -- so a
+    spending answer can say where each trip went, not just what it cost."""
+    text = text or ""
+    for rx in _ROUTE_RES:
+        m = rx.search(text)
+        if m:
+            a, b = (" ".join(g.split()).strip(" .").title() for g in m.groups())
+            if a and b and a.lower() != b.lower():
+                return f"{a} → {b}"
+    for m in _IATA_PAIR_RE.finditer(text):
+        a, b = _IATA.get(m.group(1)), _IATA.get(m.group(2))
+        if a and b and a != b:
+            return f"{a} → {b}"
+    return None
+
+
 def find_purchases_tool(prefix: str, label: str) -> dict:
     return {
         "type": "function",
@@ -204,7 +248,8 @@ PURCHASE_GUIDANCE = (
     "`total` is their sum. Present exactly those purchases and that total -- do NOT re-add amounts from anything "
     "else. Mention `unrelated` items only if relevant to the question (they are NOT in the total). Purchases marked "
     "`already_logged` are also in the user's logged expenses: when combining with a logged total, add only "
-    "`not_logged_total`."
+    "`not_logged_total`. When a purchase has a `route` (from → to), show it next to that purchase so the user can "
+    "see where each trip went."
 )
 
 
@@ -555,6 +600,7 @@ def group_purchases(emails: list[dict], topic_words: list[str] | None = None) ->
             "evidence": best["_line"],
             "booking_ids": sorted({r for m in members for r in (m.get("booking_ids") or [])}),
             "emails": [m.get("subject") for m in members],
+            "route": next((m["route"] for m in [best] + members if m.get("route")), None),
             "account": best.get("account"),
         }
         if item_words and not any(w in text for w in item_words):

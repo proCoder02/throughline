@@ -32,7 +32,7 @@ from functools import lru_cache
 from urllib.parse import quote
 
 from mail_common import (NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes, account_param,
-                         TRANSACTIONAL_SUBJECT_RE, booking_ids, extract_amounts, find_purchases_tool, group_purchases, mark_logged, topic_words_of, is_automated_sender, is_bulk_mail, newest_first,
+                         TRANSACTIONAL_SUBJECT_RE, booking_ids, extract_amounts, find_purchases_tool, group_purchases, mark_logged, extract_route, topic_words_of, is_automated_sender, is_bulk_mail, newest_first,
                          parse_period, prefixed_id)
 
 from . import graph
@@ -663,7 +663,8 @@ def _find_purchases(cur, db, accounts, args) -> dict:
             summary = _summarize(m, account)
             full_text = summary["subject"] + "\n" + text + "\n" + (summary.get("preview") or "")
             found.append({**{k: v for k, v in summary.items() if k != "preview"},
-                          "booking_ids": booking_ids(full_text), "amounts": extract_amounts(full_text)})
+                          "booking_ids": booking_ids(full_text), "amounts": extract_amounts(full_text),
+                          "route": extract_route(full_text)})
         return found
 
     done, broken = _MB.across(cur, db, accounts, work)
