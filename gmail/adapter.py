@@ -34,8 +34,9 @@ from email.utils import parseaddr
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, Mailboxes, account_param, is_automated_sender,
-                         is_bulk_mail, newest_first, prefixed_id)
+from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes,
+                         account_param, extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail,
+                         newest_first, parse_period, prefixed_id)
 
 from . import google
 from .google import GoogleError
@@ -380,6 +381,7 @@ TOOLS = [
             },
         },
     },
+    find_purchases_tool("gmail", "Gmail"),
 ]
 
 
@@ -663,7 +665,48 @@ def _read(cur, db, accounts, args) -> dict:
     }
 
 
+@_MB.tool
+def _find_purchases(cur, db, accounts, args) -> dict:
+    start, end, err = parse_period(args)
+    if err:
+        return {"error": err}
+    topic = (args.get("query") or "").strip()
+    query = (f"({topic}) " if topic else "") + f"({' OR '.join(PURCHASE_WORDS)}) after:{start:%Y/%m/%d} before:{end:%Y/%m/%d}"
+
+    def work(token, account):
+        ids = _list_ids(token, query, 20)
+        if not ids:
+            return []
+
+        def full(message_id):
+            return google.get(f"/messages/{quote(message_id, safe='')}", token, params={"format": "full"})
+        with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+            messages = list(pool.map(full, ids))
+        found = []
+        for msg in messages:
+            summary = _summarize(msg, account)
+            body, _ = _body_and_attachments(msg.get("payload"))
+            found.append({**{k: v for k, v in summary.items() if k != "preview"},
+                          "amounts": extract_amounts(summary["subject"] + "\n" + body)})
+        return found
+
+    done, broken = _MB.across(cur, db, accounts, work)
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], 40)
+    with_amounts = sum(1 for e in emails if e["amounts"] and not e["promotional"])
+    last_day = end - timedelta(days=1)
+    return _MB.with_failures({
+        "ok": True, "query": query, "count": len(emails), "emails": emails,
+        "mailboxes": [a.get("email") for a, _ in done], "guidance": PURCHASE_GUIDANCE,
+        "_mail_sources": [_source(e) for e in emails if e["amounts"] and not e["promotional"]],
+    }, broken, {"tool": "gmail_find_purchases", "provider": PROVIDER,
+                "label": (f"Scanned {_plural(len(emails), 'Gmail email')} {start:%Y-%m-%d} to {last_day:%Y-%m-%d} for purchases"
+                          + (f" ({topic})" if topic else "") + f" · {with_amounts} with amounts")})
+
+
 _DISPATCH = {
+    "gmail_find_purchases": _find_purchases,
     "gmail_list_recent_emails": _list_recent,
     "gmail_search_emails": _search,
     "gmail_find_needs_reply": _needs_reply,

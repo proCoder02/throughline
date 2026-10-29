@@ -96,6 +96,89 @@ def is_bulk_mail(headers: dict) -> bool:
     return bool(auto) and auto != "no"
 
 
+_AMOUNT_RE = re.compile(r"(?:₹|\brs\.?|\binr)\s*([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]+)(?:\.([0-9]{1,2}))?", re.IGNORECASE)
+_TOTAL_WORD_RE = re.compile(
+    r"total|amount\s+paid|you\s+paid|paid|payment\s+of|fare|amount|net\s+payable|charged|price", re.IGNORECASE)
+
+
+def extract_amounts(text: str, limit: int = 6) -> list[dict]:
+    """Money amounts written in an email (Rs/₹/INR), each with the line it
+    appeared on. likely_total marks a line -- or the label line just above
+    it, since HTML tables flatten to "Total\\n₹ 7,563" -- that names a total
+    or payment. Most-likely totals first, then larger amounts."""
+    found, seen, prev = [], set(), ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()[:300]
+        if not line:
+            continue
+        for m in _AMOUNT_RE.finditer(line):
+            value = float(m.group(1).replace(",", "") + (f".{m.group(2)}" if m.group(2) else ""))
+            if value <= 0 or (value, line[:80]) in seen:
+                continue
+            seen.add((value, line[:80]))
+            found.append({
+                "amount": value,
+                "line": line[:160] if len(line) > 6 else f"{prev[:120]} {line}".strip(),
+                "likely_total": bool(_TOTAL_WORD_RE.search(line) or _TOTAL_WORD_RE.search(prev)),
+            })
+        prev = line
+    found.sort(key=lambda a: (not a["likely_total"], -a["amount"]))
+    return found[:limit]
+
+
+def find_purchases_tool(prefix: str, label: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": f"{prefix}_find_purchases",
+            "description": (
+                f"Find what the user PAID for in a period, from their {label} mail: searches booking confirmations, "
+                "e-tickets, invoices, receipts and orders, opens each one and returns the amounts written in it. Use "
+                "for spending questions the logged expenses can't answer (e.g. flights last year) -- much better than "
+                "searching and reading emails one by one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What was bought, as search words, e.g. 'flight OR airline OR indigo OR makemytrip OR ixigo'.",
+                    },
+                    "start_date": {"type": "string", "description": "First day, YYYY-MM-DD."},
+                    "end_date": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD."},
+                    "account": account_param(label),
+                },
+                "required": ["start_date", "end_date"],
+            },
+        },
+    }
+
+
+def parse_period(args: dict):
+    """(start, end_exclusive, error) as the user's local days."""
+    from datetime import datetime, timedelta
+    tz = datetime.now().astimezone().tzinfo
+    try:
+        start = datetime.strptime((args.get("start_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=tz)
+        last = datetime.strptime((args.get("end_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=tz)
+    except ValueError:
+        return None, None, "start_date and end_date must be YYYY-MM-DD"
+    if last < start:
+        start, last = last, start
+    return start, last + timedelta(days=1), None
+
+
+PURCHASE_WORDS = ("booking", "ticket", "e-ticket", "invoice", "receipt", "payment", "order", "itinerary", "confirmed")
+
+
+PURCHASE_GUIDANCE = (
+    "Each email was opened and its written amounts extracted. Count only real purchases (e-tickets, booking "
+    "confirmations, invoices, payment receipts) using the amount marked likely_total / labelled total or paid -- "
+    "one amount per booking (an invoice and a confirmation for the same booking ID are ONE purchase; don't add "
+    "both). Skip anything promotional or with no amount. List each purchase with amount, merchant and date."
+)
+
+
 NEEDS_REPLY_GUIDANCE = (
     "Candidates only, already filtered for bulk mail: list just the ones a real person wrote that ask the user "
     "something or expect an answer. Newsletters, promotions, event invites, notifications, invoices and receipts "
@@ -284,15 +367,13 @@ def system_prompt_note(cur, user_id) -> str:
         "a bill/receipt as an expense (log_expense, amounts exactly as written) -- pass that email's id as "
         "source_email_id so it links back. Only do so when the user asks."
         " For spending questions (\"how much did I spend on flights last year?\"), always look again with the tools "
-        "-- never repeat a total from earlier in this chat, new receipts may have arrived. Check query_spending first; if "
-        "the logged expenses don't cover it, go straight on (never ask permission -- reading is read-only) to "
-        "search the mailbox(es) for booking confirmations, e-tickets, invoices "
-        "or receipts in that period (Gmail accepts e.g. 'flight (booking OR e-ticket OR itinerary OR invoice) "
-        "after:2025/01/01 before:2026/01/01'), read ALL the relevant ones in a single step (several read calls at "
-        "once, not one per step), and add up only amounts the user actually PAID -- e-tickets, booking "
-        "confirmations, invoices, payment receipts. Never count a price from an offer, ad or newsletter (results "
-        "marked promotional, 'price starting at', 'deals'); if nothing confirmed is found, the answer is that "
-        "nothing was found. List each one, say the total comes from emails (so may miss bookings made elsewhere), and offer to "
+        "-- never repeat a total from earlier in this chat, new receipts may have arrived. Check query_spending first; "
+        "when it says the logged expenses can't cover it, go straight on (never ask permission -- reading is "
+        "read-only) to the *_find_purchases tools for that period: they open the booking confirmations, e-tickets, "
+        "invoices and receipts and return the amounts written in them. Add up only amounts the user actually PAID, one "
+        "per booking (an invoice and a confirmation with the same booking ID are one purchase); never count a price "
+        "from an offer, ad or newsletter (marked promotional). If nothing confirmed is found, the answer is that nothing "
+        "was found. List each purchase, say the total comes from emails (so may miss bookings made elsewhere), and offer to "
         "log them as expenses." + " " + UNTRUSTED_NOTE
     )
 

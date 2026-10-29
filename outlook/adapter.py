@@ -31,8 +31,9 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import quote
 
-from mail_common import (NEEDS_REPLY_GUIDANCE, Mailboxes, account_param, is_automated_sender, is_bulk_mail,
-                         newest_first, prefixed_id)
+from mail_common import (NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes, account_param,
+                         extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail, newest_first,
+                         parse_period, prefixed_id)
 
 from . import graph
 from .graph import GraphError
@@ -381,6 +382,7 @@ TOOLS = [
             },
         },
     },
+    find_purchases_tool("outlook", "Outlook"),
 ]
 
 
@@ -617,7 +619,67 @@ def _read(cur, db, accounts, args) -> dict:
     }
 
 
+_QUERY_SPLIT_RE = re.compile(r"\s+OR\s+|\s+AND\s+|[\s()\"]+", re.IGNORECASE)
+
+
+@_MB.tool
+def _find_purchases(cur, db, accounts, args) -> dict:
+    start, end, err = parse_period(args)
+    if err:
+        return {"error": err}
+    topic = (args.get("query") or "").strip()
+    words = [w.lower() for w in _QUERY_SPLIT_RE.split(topic) if w and w.upper() not in ("OR", "AND")]
+
+    def work(token, account):
+        # Date range via $filter (always supported); keyword match on the
+        # results here -- Graph won't combine $search with $filter.
+        since, until = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+        rows = graph.get(
+            "/me/messages", token,
+            params={"$filter": f"receivedDateTime ge {since:%Y-%m-%dT%H:%M:%SZ} and receivedDateTime lt {until:%Y-%m-%dT%H:%M:%SZ}",
+                    "$orderby": "receivedDateTime desc", "$top": 200, "$select": _LIST_SELECT},
+        ).get("value", [])
+
+        def relevant(m):
+            text = f"{m.get('subject') or ''} {m.get('bodyPreview') or ''} {_sender(m)}".lower()
+            return any(p in text for p in PURCHASE_WORDS) and (not words or any(w in text for w in words))
+        picked = [m for m in rows if relevant(m)][:20]
+        if not picked:
+            return []
+
+        def body(m):
+            try:
+                full = graph.get(f"/me/messages/{quote(m['id'], safe='')}", token, params={"$select": "body"},
+                                 headers={"Prefer": 'outlook.body-content-type="text"'})
+                return (full.get("body") or {}).get("content") or ""
+            except GraphError:
+                return m.get("bodyPreview") or ""
+        with ThreadPoolExecutor(max_workers=min(8, len(picked))) as pool:
+            bodies = list(pool.map(body, picked))
+        found = []
+        for m, text in zip(picked, bodies):
+            summary = _summarize(m, account)
+            found.append({**{k: v for k, v in summary.items() if k != "preview"},
+                          "amounts": extract_amounts(summary["subject"] + "\n" + text)})
+        return found
+
+    done, broken = _MB.across(cur, db, accounts, work)
+    if not done:
+        return _MB.with_failures({}, broken, None)
+    emails = newest_first([e for _, found in done for e in found], 40)
+    with_amounts = sum(1 for e in emails if e["amounts"] and not e["promotional"])
+    last_day = end - timedelta(days=1)
+    return _MB.with_failures({
+        "ok": True, "count": len(emails), "emails": emails,
+        "mailboxes": [a.get("email") for a, _ in done], "guidance": PURCHASE_GUIDANCE,
+        "_mail_sources": [_source(e) for e in emails if e["amounts"] and not e["promotional"]],
+    }, broken, {"tool": "outlook_find_purchases", "provider": PROVIDER,
+                "label": (f"Scanned {_plural(len(emails), 'Outlook email')} {start:%Y-%m-%d} to {last_day:%Y-%m-%d} for purchases"
+                          + (f" ({topic})" if topic else "") + f" · {with_amounts} with amounts")})
+
+
 _DISPATCH = {
+    "outlook_find_purchases": _find_purchases,
     "outlook_list_recent_emails": _list_recent,
     "outlook_search_emails": _search,
     "outlook_find_needs_reply": _needs_reply,

@@ -2189,26 +2189,30 @@ def _tool_query_spending(cur, db, user_id, args):
     except Exception:
         mail_linked = False
 
-    if mail_linked and (count == 0 or uncovered):
+    narrowed = bool(keywords or args.get("category"))
+    # Email only when it can add something: part of the period predates
+    # logging, or a specific item found nothing logged. (A plain "today"
+    # with nothing logged, inside the logged range, is just Rs 0 -- confirmed
+    # live that sending those to email only made the answer slow.)
+    if mail_linked and (uncovered or (count == 0 and narrowed)):
         gap = (f"The user only started logging expenses on {first_logged:%Y-%m-%d}, so " if first_logged and uncovered
                else "")
-        gap_end = min(end, first_logged) if first_logged and uncovered and count else end
+        gap_last = (min(end, first_logged) if first_logged and uncovered and count else end) - timedelta(days=1)
         words = [w for w in (keywords if isinstance(keywords, list) else []) if isinstance(w, str) and w.strip()][:8]
         topic = " OR ".join(f'"{w.strip()}"' if " " in w.strip() else w.strip() for w in words)
-        gmail_q = (f"({topic}) " if topic else "") + \
-            f"(booking OR ticket OR e-ticket OR invoice OR receipt OR payment) after:{start:%Y/%m/%d} before:{gap_end:%Y/%m/%d}"
+        call = (f"start_date={start:%Y-%m-%d}, end_date={gap_last:%Y-%m-%d}" + (f", query={topic!r}" if topic else ""))
         note = (
-            f"{gap}logged expenses can't answer this for {'that part of ' if count else ''}the period. A mailbox IS "
-            "connected: do NOT ask the user for permission (searching is read-only) -- in this same turn, search their "
-            f"mail for receipts/confirmations covering it (Gmail query: {gmail_q}; for Outlook use the keywords), read "
-            "the relevant ones, and add up only amounts written in them. In the answer, list each item with its amount "
-            "and source, say the total comes from emails (so bookings made elsewhere may be missing), "
+            f"{gap}logged expenses can't fully answer this{' for part of the period' if count else ''}. A mailbox IS "
+            "connected: do NOT ask the user for permission (it's read-only) -- in this same turn call "
+            f"gmail_find_purchases and/or outlook_find_purchases ({call}); they open the emails and return the amounts. "
+            "In the answer, list each purchase with its amount and source, say the total comes from emails (bookings "
+            "made elsewhere may be missing), "
             + ("combine it with the logged amount above, " if count else "")
             + "and offer to log them as expenses."
         )
     elif count == 0:
-        note = ("Nothing logged matches this period. Say so plainly; if they paid without logging it, suggest logging "
-                "it, or connecting their Gmail/Outlook in Settings so receipts there can be checked.")
+        note = ("Nothing logged matches this period. Say so plainly (Rs 0); if they paid without logging it, suggest "
+                "logging it" + ("." if mail_linked else ", or connecting Gmail/Outlook in Settings so receipts can be checked."))
     else:
         note = "These are only expenses the user logged in the app. Say so if they may have spent more without logging it."
 
