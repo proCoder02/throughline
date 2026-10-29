@@ -288,8 +288,11 @@ def system_prompt_note(cur, user_id) -> str:
         "the logged expenses don't cover it, go straight on (never ask permission -- reading is read-only) to "
         "search the mailbox(es) for booking confirmations, e-tickets, invoices "
         "or receipts in that period (Gmail accepts e.g. 'flight (booking OR e-ticket OR itinerary OR invoice) "
-        "after:2025/01/01 before:2026/01/01'), read the relevant ones, and add up only amounts actually written in "
-        "them -- list each one, say the total comes from emails (so may miss bookings made elsewhere), and offer to "
+        "after:2025/01/01 before:2026/01/01'), read ALL the relevant ones in a single step (several read calls at "
+        "once, not one per step), and add up only amounts the user actually PAID -- e-tickets, booking "
+        "confirmations, invoices, payment receipts. Never count a price from an offer, ad or newsletter (results "
+        "marked promotional, 'price starting at', 'deals'); if nothing confirmed is found, the answer is that "
+        "nothing was found. List each one, say the total comes from emails (so may miss bookings made elsewhere), and offer to "
         "log them as expenses." + " " + UNTRUSTED_NOTE
     )
 

@@ -2529,10 +2529,11 @@ AGENT_TOOL_DISPATCH = {
     "get_latest_draft": lambda cur, db, user_id, args: _tool_get_latest_draft(cur, db, user_id, args),
 }
 
-# 5, not 4: a spending question answered from email needs query_spending ->
-# mail search -> read receipts -> answer; at 4 the last step fell through
-# to the tool-less fallback call. Only chains that long ever use the 5th.
-AGENT_LOOP_MAX_TURNS = 5
+# 6: a spending question answered from email needs query_spending -> mail
+# search(es) -> read receipts -> answer, sometimes across two providers.
+# Only chains that long ever use the extra rounds; past the cap the loop
+# asks for a final answer explicitly (see run_agent_tool_loop).
+AGENT_LOOP_MAX_TURNS = 6
 
 
 def run_agent_tool_loop(cur, db, user_id, messages):
@@ -2579,7 +2580,9 @@ def run_agent_tool_loop(cur, db, user_id, messages):
         message = call_llm_with_tools(messages, tools)
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            return message.get("content") or "", action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
+            if (message.get("content") or "").strip():
+                return message.get("content"), action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
+            break  # an empty answer: ask for one explicitly below, never return a blank reply
 
         messages.append(message)
         for call in tool_calls:
@@ -2619,9 +2622,22 @@ def run_agent_tool_loop(cur, db, user_id, messages):
 
             messages.append({"role": "tool", "content": json.dumps(result)})
 
-    # Ran out of turns -- fall back to a plain call so the user still gets
-    # a reply instead of an empty response.
-    final = call_llm(messages)
+    # Ran out of turns (or got an empty answer). A bare call_llm on a transcript ending in tool
+    # results came back EMPTY (confirmed live: flight-spend questions that
+    # read several receipts showed the user a blank reply), so tell the
+    # model explicitly to answer now, and never hand back nothing.
+    messages.append({"role": "user", "content": (
+        "You've used all your tool calls. Answer my original question now, using only the tool results above. "
+        "Say what you found and what you couldn't check. Do not call any tools."
+    )})
+    final = ""
+    try:
+        final = (call_llm(messages) or "").strip()
+    except Exception as e:
+        print(f"[agent] final answer call failed: {e!r}")
+    if not final:
+        final = ("I looked through what I could, but couldn't put together a complete answer this time. "
+                 "Try asking about a narrower period or a specific merchant.")
     return final, action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
 
 

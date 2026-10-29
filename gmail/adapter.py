@@ -299,7 +299,7 @@ _FOLDER_QUERY = {
     "all": ("", "mail"),
 }
 _MAX_BODY_CHARS = 8000
-_METADATA_HEADERS = ["From", "Subject", "Date"]
+_METADATA_HEADERS = ["From", "Subject", "Date", "List-Unsubscribe", "List-Id", "Precedence", "Auto-Submitted"]
 
 TOOLS = [
     {
@@ -425,6 +425,13 @@ def _web_link(msg: dict, account_email: str | None) -> str:
     return f"https://mail.google.com/mail/u/{account}#all/{thread_id}"
 
 
+# Bulk-sent mail that is still a real transaction (e-tickets, invoices and
+# receipts usually carry List-Unsubscribe too) -- not promotional.
+_TRANSACTIONAL_RE = re.compile(
+    r"e-?ticket|invoice|receipt|booking (?:id|confirm)|confirmed|payment (?:of|received|successful)|order (?:#|id|confirm)|itinerary",
+    re.IGNORECASE)
+
+
 def _summarize(msg: dict, account: dict) -> dict:
     h = _headers(msg)
     labels = set(msg.get("labelIds") or [])
@@ -437,6 +444,10 @@ def _summarize(msg: dict, account: dict) -> dict:
         "preview": html.unescape(msg.get("snippet") or ""),
         "unread": "UNREAD" in labels,
         "important": "IMPORTANT" in labels,
+        # Marketing/bulk mail: never evidence of money spent (confirmed live:
+        # a tour-package ad's "price starting at" was counted as a purchase).
+        "promotional": bool(labels & {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"})
+                       or is_bulk_mail(h) and not _TRANSACTIONAL_RE.search(h.get("subject") or ""),
         "web_link": _web_link(msg, account.get("email")),
     }
 
@@ -520,7 +531,7 @@ def _search(cur, db, accounts, args) -> dict:
                 "label": f"Searched {where} for “{query}” · {_plural(len(emails), 'match')}"})
 
 
-_THREAD_HEADERS = _METADATA_HEADERS + list(BULK_HEADER_NAMES)
+_THREAD_HEADERS = list(dict.fromkeys(_METADATA_HEADERS + list(BULK_HEADER_NAMES)))
 # Gmail's own non-primary tabs -- belt and braces with category:primary.
 _BULK_LABELS = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "SPAM"}
 

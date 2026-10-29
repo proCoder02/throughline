@@ -24,6 +24,7 @@ mail_common.UNTRUSTED_NOTE.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -299,7 +300,7 @@ _FOLDER_LABELS = {
 _FOLDERS = set(_FOLDER_LABELS)
 _MAX_BODY_CHARS = 8000
 
-_LIST_SELECT = "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,importance,webLink"
+_LIST_SELECT = "id,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments,importance,webLink,inferenceClassification"
 
 TOOLS = [
     {
@@ -398,6 +399,13 @@ def _sender(msg: dict) -> str:
     return email or name or "unknown sender"
 
 
+# Automated senders that are still real transactions (e-tickets, invoices,
+# receipts) -- not promotional.
+_TRANSACTIONAL_RE = re.compile(
+    r"e-?ticket|invoice|receipt|booking (?:id|confirm)|confirmed|payment (?:of|received|successful)|order (?:#|id|confirm)|itinerary",
+    re.IGNORECASE)
+
+
 def _summarize(msg: dict, account: dict) -> dict:
     return {
         "id": prefixed_id(account, msg.get("id")),
@@ -409,6 +417,10 @@ def _summarize(msg: dict, account: dict) -> dict:
         "unread": not msg.get("isRead", True),
         "has_attachments": bool(msg.get("hasAttachments")),
         "important": msg.get("importance") == "high",
+        # Marketing mail is never evidence of money spent (confirmed live: a
+        # tour-package ad's "price starting at" was counted as a purchase).
+        "promotional": msg.get("inferenceClassification") == "other"
+                       or is_automated_sender(_sender(msg)) and not _TRANSACTIONAL_RE.search(msg.get("subject") or ""),
         "web_link": msg.get("webLink"),
     }
 
