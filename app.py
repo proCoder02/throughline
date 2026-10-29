@@ -7261,7 +7261,15 @@ def chat_global():
     if not transcripts_section:
         transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
-    matched_name = matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
+    if finance_context:
+        # Confirmed live: with the same question already answered earlier in
+        # the thread, the model repeated that old total without any tool
+        # call -- even with "never reuse" in the system prompt. The latest
+        # user turn is what it weighs most, so the reminder goes here (only
+        # in what the model sees; chat history stores the user's own words).
+        user_content += ("\n\n(Work this out fresh with the tools -- don't reuse an answer or total from earlier "
+                         "in this chat; new expenses or receipts may have arrived since.)")
+    matched_name =matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
     global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched_name)
     # Which mailboxes (Outlook/Gmail) this user has linked -- the base prompt
     # says to answer only from conversation excerpts, so without this the
