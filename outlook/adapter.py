@@ -32,7 +32,7 @@ from functools import lru_cache
 from urllib.parse import quote
 
 from mail_common import (NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes, account_param,
-                         extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail, newest_first,
+                         TRANSACTIONAL_SUBJECT_RE, booking_ids, extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail, newest_first,
                          parse_period, prefixed_id)
 
 from . import graph
@@ -643,7 +643,9 @@ def _find_purchases(cur, db, accounts, args) -> dict:
         def relevant(m):
             text = f"{m.get('subject') or ''} {m.get('bodyPreview') or ''} {_sender(m)}".lower()
             return any(p in text for p in PURCHASE_WORDS) and (not words or any(w in text for w in words))
-        picked = [m for m in rows if relevant(m)][:20]
+        candidates = [m for m in rows if relevant(m) and not _summarize(m, account)["promotional"]]
+        candidates.sort(key=lambda m: not TRANSACTIONAL_SUBJECT_RE.search(m.get("subject") or ""))
+        picked = candidates[:25]
         if not picked:
             return []
 
@@ -659,8 +661,9 @@ def _find_purchases(cur, db, accounts, args) -> dict:
         found = []
         for m, text in zip(picked, bodies):
             summary = _summarize(m, account)
+            full_text = summary["subject"] + "\n" + text
             found.append({**{k: v for k, v in summary.items() if k != "preview"},
-                          "amounts": extract_amounts(summary["subject"] + "\n" + text)})
+                          "booking_ids": booking_ids(full_text), "amounts": extract_amounts(full_text)})
         return found
 
     done, broken = _MB.across(cur, db, accounts, work)

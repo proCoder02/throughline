@@ -126,6 +126,27 @@ def extract_amounts(text: str, limit: int = 6) -> list[dict]:
     return found[:limit]
 
 
+_BOOKING_ID_RE = re.compile(
+    r"(?:booking\s*(?:id|ref(?:erence)?|no\.?|number)|pnr|order\s*(?:id|no\.?|number)|itinerary|invoice\s*(?:no\.?|number))"
+    r"\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{4,24})",
+    re.IGNORECASE)
+TRANSACTIONAL_SUBJECT_RE = re.compile(
+    r"e-?ticket|invoice|receipt|booking\s+(?:id|confirm)|confirmed|itinerary|payment\s+(?:of|received|successful)|"
+    r"order\s+(?:#|id|confirm)|tax\s*invoice|your\s+(?:trip|flight|order|booking)",
+    re.IGNORECASE)
+
+
+def booking_ids(text: str) -> list[str]:
+    """Booking/PNR/order/invoice references in an email -- lets the model
+    tell one trip's invoice + confirmation (same id) from two trips."""
+    seen = []
+    for m in _BOOKING_ID_RE.finditer(text or ""):
+        ref = m.group(1).upper().strip("-")
+        if any(ch.isdigit() for ch in ref) and ref not in seen:
+            seen.append(ref)
+    return seen[:4]
+
+
 def find_purchases_tool(prefix: str, label: str) -> dict:
     return {
         "type": "function",
@@ -174,8 +195,8 @@ PURCHASE_WORDS = ("booking", "ticket", "e-ticket", "invoice", "receipt", "paymen
 PURCHASE_GUIDANCE = (
     "Each email was opened and its written amounts extracted. Count only real purchases (e-tickets, booking "
     "confirmations, invoices, payment receipts) using the amount marked likely_total / labelled total or paid -- "
-    "one amount per booking (an invoice and a confirmation for the same booking ID are ONE purchase; don't add "
-    "both). Skip anything promotional or with no amount. List each purchase with amount, merchant and date."
+    "one amount per booking (emails sharing a booking_id / PNR are ONE purchase -- use the invoice or payment "
+    "amount, don't add both). Skip anything promotional or with no amount. List each purchase with amount, merchant and date."
 )
 
 

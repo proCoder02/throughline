@@ -35,7 +35,7 @@ from functools import lru_cache
 from urllib.parse import quote
 
 from mail_common import (BULK_HEADER_NAMES, NEEDS_REPLY_GUIDANCE, PURCHASE_GUIDANCE, PURCHASE_WORDS, Mailboxes,
-                         account_param, extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail,
+                         TRANSACTIONAL_SUBJECT_RE, account_param, booking_ids, extract_amounts, find_purchases_tool, is_automated_sender, is_bulk_mail,
                          newest_first, parse_period, prefixed_id)
 
 from . import google
@@ -674,20 +674,32 @@ def _find_purchases(cur, db, accounts, args) -> dict:
     query = (f"({topic}) " if topic else "") + f"({' OR '.join(PURCHASE_WORDS)}) after:{start:%Y/%m/%d} before:{end:%Y/%m/%d}"
 
     def work(token, account):
-        ids = _list_ids(token, query, 20)
+        # Stage 1 -- headers only, wide net (cheap): with lots of flight
+        # mail, the newest 20 were mostly promos and real e-tickets from
+        # months earlier fell off the end (confirmed live).
+        ids = _list_ids(token, query, 60)
         if not ids:
             return []
+        metas = [_summarize(m, account) for m in _fetch_metadata(token, ids)]
+        real = [x for x in metas if not x["promotional"]]
+        real.sort(key=lambda x: not TRANSACTIONAL_SUBJECT_RE.search(x["subject"]))  # stable: newest first within each group
+        picked = real[:25]
+        if not picked:
+            return []
 
-        def full(message_id):
-            return google.get(f"/messages/{quote(message_id, safe='')}", token, params={"format": "full"})
-        with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
-            messages = list(pool.map(full, ids))
+        # Stage 2 -- open just those and read the amounts.
+        def full(summary):
+            raw = summary["id"].split(":", 1)[1]
+            return google.get(f"/messages/{quote(raw, safe='')}", token, params={"format": "full"})
+        with ThreadPoolExecutor(max_workers=min(8, len(picked))) as pool:
+            messages = list(pool.map(full, picked))
         found = []
         for msg in messages:
             summary = _summarize(msg, account)
             body, _ = _body_and_attachments(msg.get("payload"))
+            text = summary["subject"] + "\n" + body
             found.append({**{k: v for k, v in summary.items() if k != "preview"},
-                          "amounts": extract_amounts(summary["subject"] + "\n" + body)})
+                          "booking_ids": booking_ids(text), "amounts": extract_amounts(text)})
         return found
 
     done, broken = _MB.across(cur, db, accounts, work)
