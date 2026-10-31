@@ -8526,6 +8526,21 @@ def _start_nudge_worker_safely():
         print(f"[nudges] worker not started: {e!r}")
 
 
+# Throughline Meet (meet/) -- swap personality cards by holding two phones
+# together. Self-contained package, off unless MEET_ENABLED=true; a failure
+# here must never stop the rest of the app from starting.
+try:
+    from meet import create_meet_blueprint, is_enabled as _meet_enabled
+    if _meet_enabled():
+        app.register_blueprint(create_meet_blueprint(
+            get_db=get_db, dict_cursor=dict_cursor, login_required=login_required,
+            current_user_id=current_user_id, redis_client=redis_client,
+        ))
+        print("[meet] enabled")
+except Exception as e:
+    print(f"[meet] not registered: {e!r}")
+
+
 # Under a WSGI server (gunicorn etc.) this module is imported, not run as
 # __main__ -- the dev-server startup block below never executes there, so
 # the reminder-email worker needs its own start path here instead. Only
