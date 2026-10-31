@@ -7,10 +7,13 @@ and conversation content are never read here (the optional "suggest my
 personality" draft is produced elsewhere and only ever lands in the editor,
 for the user to accept or change).
 
-Three parts, like a spoken introduction:
+Front (the first 3 seconds): face, name, role, a one-line hook, top
+traits, what the two of you have in common, and "ask me about".
+Behind "More": how I communicate, about, education, all interests/likes.
   who I am     -- headline (role), organization, city, education
-  personality  -- up to 4 traits, a "how I communicate" line, about
-  what I'm into and how to stay in touch -- interests, likes, links"""
+  personality  -- up to 4 traits, a "how I communicate" line, about, hook
+  what I'm into and how to stay in touch -- interests, likes, links, ask_me
+  look         -- color, one of COLORS (empty = picked from the name)"""
 from __future__ import annotations
 
 import re
@@ -28,8 +31,12 @@ TRAIT_OPTIONS = [
     "Driven", "Easygoing", "Introvert", "Extrovert", "Optimistic", "Practical",
 ]
 
+# Card colours (the app and web map each name to a shade that works in
+# light and dark mode).
+COLORS = ["amber", "coral", "teal", "indigo", "plum", "forest"]
+
 TEXT_FIELDS = {"headline": MAX_SHORT, "organization": MAX_SHORT, "city": MAX_SHORT, "education": MAX_SHORT,
-               "about": MAX_TEXT, "style": 160}
+               "about": MAX_TEXT, "style": 160, "hook": 90, "ask_me": MAX_SHORT}
 LIST_FIELDS = ("interests", "likes", "traits", "links")
 ALL_FIELDS = tuple(TEXT_FIELDS) + LIST_FIELDS
 
@@ -79,6 +86,7 @@ def _from_row(row: dict) -> dict:
     card = {k: row.get(k) or "" for k in TEXT_FIELDS}
     card.update({k: list(row.get(k) or []) for k in LIST_FIELDS})
     card["sharing"] = row.get("sharing", True)
+    card["color"] = row.get("color") or ""
     return card
 
 
@@ -112,7 +120,7 @@ def draft(cur, user_id: int) -> dict:
         print(f"[meet] card draft partial: {e!r}")
     card = {k: "" for k in TEXT_FIELDS}
     card.update({"headline": _clean_text(headline, MAX_SHORT), "interests": _clean_list(interests),
-                 "likes": _clean_list(likes), "traits": [], "links": [], "sharing": True})
+                 "likes": _clean_list(likes), "traits": [], "links": [], "color": "", "sharing": True})
     return card
 
 
@@ -123,12 +131,13 @@ def clean(data: dict) -> dict:
     card["traits"] = _clean_list(data.get("traits"), limit=MAX_TRAITS, item_len=24)
     card["links"] = clean_links(data.get("links"))
     card["sharing"] = bool(data.get("sharing", True))
+    card["color"] = data.get("color") if data.get("color") in COLORS else ""
     return card
 
 
 def save(cur, user_id: int, data: dict) -> dict:
     card = clean(data)
-    cols = list(ALL_FIELDS) + ["sharing"]
+    cols = list(ALL_FIELDS) + ["color", "sharing"]
     cur.execute(
         f"INSERT INTO meet_cards (user_id, {', '.join(cols)}, updated_at) VALUES (%s, {', '.join(['%s'] * len(cols))}, now()) "
         f"ON CONFLICT (user_id) DO UPDATE SET {', '.join(f'{c} = EXCLUDED.{c}' for c in cols)}, updated_at = now()",
@@ -152,7 +161,32 @@ def public_card(cur, user_id: int) -> dict | None:
     if not saved or not saved["sharing"]:
         return None
     card = {k: saved[k] for k in ALL_FIELDS}
+    card["color"] = saved["color"]
     return {**identity(cur, user_id), **card}
+
+
+def in_common(mine: dict | None, theirs: dict | None, limit: int = 4) -> list[str]:
+    """What two people share -- the best conversation starter on the card.
+    Interests/likes/traits matched case-insensitively, plus the same city,
+    organisation or education. In the order they appear on THEIR card."""
+    if not mine or not theirs:
+        return []
+    out: list[str] = []
+
+    def add(label):
+        if label and label.lower() not in (x.lower() for x in out) and len(out) < limit:
+            out.append(label)
+
+    for field in ("city", "organization", "education"):
+        a, b = (mine.get(field) or "").strip(), (theirs.get(field) or "").strip()
+        if a and b and a.lower() == b.lower():
+            add(b)
+    mine_items = {x.lower() for f in ("interests", "likes", "traits") for x in (mine.get(f) or [])}
+    for f in ("interests", "likes", "traits"):
+        for x in theirs.get(f) or []:
+            if x.lower() in mine_items:
+                add(x)
+    return out
 
 
 def clean_suggestion(raw) -> dict:

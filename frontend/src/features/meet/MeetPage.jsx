@@ -12,7 +12,18 @@ import './meet.css';
 const splitList = (text) => text.split(',').map((s) => s.trim()).filter(Boolean);
 
 const MAX_TRAITS = 4;
+const FRONT_TRAITS = 3;
 const LINK_HINTS = ['linkedin.com/in/…', 'instagram.com/…', 'Your website'];
+// Same names and shades as the app (meet_style.dart).
+const COLORS = { amber: '#D98E4A', coral: '#E0705A', teal: '#2E9C8F', indigo: '#5B6CD6', plum: '#9A5BB5', forest: '#4F8A4B' };
+
+function colorFor(chosen, name = '') {
+  if (COLORS[chosen]) return COLORS[chosen];
+  const values = Object.values(COLORS);
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) & 0x7fffffff;
+  return values[h % values.length];
+}
 
 function linkLabel(url) {
   let host = url;
@@ -25,45 +36,62 @@ function linkLabel(url) {
   return host || 'Link';
 }
 
-// Reads like an introduction: who they are, what they're like, what
-// they're into, how to stay in touch.
-function Card({ card, person }) {
-  const where = [card.organization, card.city].filter(Boolean).join(' · ');
+// Designed for the first 3 seconds: face, name, role, a one-line hook, top
+// traits, what you share, "ask me about". The rest sits behind "More".
+function Card({ card, person, inCommon = [], initiallyExpanded = false }) {
+  const [open, setOpen] = useState(initiallyExpanded);
+  const accent = colorFor(card.color, person?.name);
+  const role = [card.headline, card.organization].filter(Boolean).join(' · ');
+  const firstName = (person?.name || '').split(/\s+/)[0];
+  const extraTraits = (card.traits || []).slice(FRONT_TRAITS);
+  const hasMore = card.style || card.about || card.education || card.interests?.length || card.likes?.length || extraTraits.length;
   return (
-    <div className="meet-card">
-      <div className="meet-card-head">
-        <div className="meet-avatar" aria-hidden="true">
+    <div className="meet-card v3" style={{ '--card-accent': accent }}>
+      <div className="meet-banner" />
+      <div className="meet-face">
+        <div className="meet-avatar big" aria-hidden="true">
           {person?.photo ? <img src={person.photo} alt="" /> : (person?.name || '?').slice(0, 1).toUpperCase()}
         </div>
-        <div>
-          <div className="meet-card-name">{person?.name}</div>
-          {card.headline && <div className="meet-card-role">{card.headline}</div>}
-          {where && <div className="meet-card-headline">{where}</div>}
-        </div>
-      </div>
-      {card.education && <div className="meet-card-headline">🎓 {card.education}</div>}
-      {(card.traits?.length > 0 || card.style) && (
-        <div className="meet-chips">
-          <div className="meet-label">Personality</div>
-          {card.traits?.length > 0 && (
-            <div className="meet-chip-row">{card.traits.map((t) => <span key={t} className="meet-chip strong">{t}</span>)}</div>
-          )}
-          {card.style && <blockquote className="meet-style">“{card.style}”</blockquote>}
-        </div>
-      )}
-      {card.about && <p className="meet-card-about">{card.about}</p>}
-      {card.interests?.length > 0 && <Chips title="Into" items={card.interests} />}
-      {card.likes?.length > 0 && <Chips title="Likes" items={card.likes} />}
-      {card.links?.length > 0 && (
-        <div className="meet-chips">
-          <div className="meet-label">Stay in touch</div>
-          <div className="meet-chip-row">
+        {card.links?.length > 0 && (
+          <div className="meet-link-icons">
             {card.links.map((l) => (
-              <a key={l} className="meet-link-chip" href={l} target="_blank" rel="noopener noreferrer">{linkLabel(l)}</a>
+              <a key={l} href={l} target="_blank" rel="noopener noreferrer" title={linkLabel(l)} aria-label={linkLabel(l)}>
+                {linkLabel(l).slice(0, 2)}
+              </a>
             ))}
           </div>
-        </div>
-      )}
+        )}
+      </div>
+      <div className="meet-card-body">
+        <div className="meet-card-name">{person?.name}</div>
+        {role && <div className="meet-card-role">{role}</div>}
+        {card.city && <div className="meet-card-headline">📍 {card.city}</div>}
+        {card.hook && <p className="meet-hook">{card.hook}</p>}
+        {card.traits?.length > 0 && (
+          <div className="meet-chip-row">
+            {card.traits.slice(0, FRONT_TRAITS).map((t) => <span key={t} className="meet-trait">✦ {t}</span>)}
+          </div>
+        )}
+        {inCommon.length > 0 && (
+          <div className="meet-common"><span className="meet-soft">🤝 You both · </span><strong>{inCommon.join(', ')}</strong></div>
+        )}
+        {card.ask_me && <div className="meet-askme"><span className="meet-soft">💬 Ask me about </span><strong>{card.ask_me}</strong></div>}
+        {hasMore && (
+          <button type="button" className="meet-more" aria-expanded={open} onClick={() => setOpen(!open)}>
+            {open ? 'Less' : `More about ${firstName}`} <span className={'meet-caret' + (open ? ' up' : '')}>⌄</span>
+          </button>
+        )}
+        {hasMore && open && (
+          <div className="meet-more-body">
+            {card.style && <blockquote className="meet-style">“{card.style}”</blockquote>}
+            {card.about && <p className="meet-card-about">{card.about}</p>}
+            {card.education && <div className="meet-card-headline">🎓 {card.education}</div>}
+            {extraTraits.length > 0 && <Chips title="Also" items={extraTraits} />}
+            {card.interests?.length > 0 && <Chips title="Into" items={card.interests} />}
+            {card.likes?.length > 0 && <Chips title="Likes" items={card.likes} />}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -77,13 +105,15 @@ function Chips({ title, items }) {
   );
 }
 
-function CardEditor({ initial, me, traitOptions = [], canSuggest = false, onSaved }) {
+function CardEditor({ initial, me, traitOptions = [], colors = [], canSuggest = false, onSaved }) {
   const [f, setF] = useState({
     headline: initial.headline || '', organization: initial.organization || '', city: initial.city || '',
     education: initial.education || '', style: initial.style || '', about: initial.about || '',
+    hook: initial.hook || '', ask_me: initial.ask_me || '',
     interests: (initial.interests || []).join(', '), likes: (initial.likes || []).join(', '),
   });
   const [traits, setTraits] = useState(initial.traits || []);
+  const [color, setColor] = useState(initial.color || '');
   const [links, setLinks] = useState([0, 1, 2].map((i) => (initial.links || [])[i] || ''));
   const [custom, setCustom] = useState('');
   const [saving, setSaving] = useState(false);
@@ -92,10 +122,27 @@ function CardEditor({ initial, me, traitOptions = [], canSuggest = false, onSave
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const card = {
     headline: f.headline.trim(), organization: f.organization.trim(), city: f.city.trim(), education: f.education.trim(),
-    style: f.style.trim(), about: f.about.trim(), traits, interests: splitList(f.interests), likes: splitList(f.likes),
+    style: f.style.trim(), about: f.about.trim(), hook: f.hook.trim(), ask_me: f.ask_me.trim(), color,
+    traits, interests: splitList(f.interests), likes: splitList(f.likes),
     links: links.map((l) => l.trim()).filter(Boolean), sharing: true,
   };
   const options = [...new Set([...traitOptions, ...traits])];
+  const colorNames = colors.length ? colors : Object.keys(COLORS);
+  const effective = colorFor(color, me?.name);
+
+  // A strong first impression, most important first.
+  const checklist = [
+    [!!me?.photo, 'Add a profile photo in Settings -- faces are what people remember'],
+    [!!card.headline, 'Add your role, e.g. "Product designer"'],
+    [!!card.hook, "Write a one-line hook -- it's the first thing people read"],
+    [card.traits.length > 0, 'Pick a few traits that sound like you'],
+    [!!card.ask_me, 'Add "Ask me about" so people know how to start talking'],
+    [!!(card.organization || card.city), 'Add where you work or your city'],
+    [card.interests.length > 0, "Add a few things you're into"],
+    [card.links.length > 0, 'Add a link (LinkedIn, Instagram...) so people can stay in touch'],
+  ];
+  const done = checklist.filter(([ok]) => ok).length;
+  const tip = checklist.find(([ok]) => !ok)?.[1];
 
   const toggle = (t) => {
     if (traits.includes(t)) setTraits(traits.filter((x) => x !== t));
@@ -138,6 +185,14 @@ function CardEditor({ initial, me, traitOptions = [], canSuggest = false, onSave
     <form className="meet-editor" onSubmit={save}>
       <h2>Your Meet card</h2>
       <p className="meet-soft">This is what people see after you both tap Share. Everything is optional.</p>
+      <div className="meet-meter" style={{ '--card-accent': effective }}>
+        <div className="meet-meter-top">
+          <strong>{done === checklist.length ? 'Your card makes a great first impression' : `Your card is ${Math.round((done / checklist.length) * 100)}% done`}</strong>
+          <span className="meet-soft">{done}/{checklist.length}</span>
+        </div>
+        <div className="meet-meter-bar"><span style={{ width: `${(done / checklist.length) * 100}%` }} /></div>
+        {tip && <p className="meet-soft">Next: {tip}</p>}
+      </div>
 
       <h3>Who you are</h3>
       <label htmlFor="meet-headline">Role or headline</label>
@@ -148,6 +203,12 @@ function CardEditor({ initial, me, traitOptions = [], canSuggest = false, onSave
       <input id="meet-city" maxLength={80} value={f.city} onChange={set('city')} />
       <label htmlFor="meet-edu">Education</label>
       <input id="meet-edu" maxLength={80} value={f.education} onChange={set('education')} placeholder="e.g. MBA, IIM Indore" />
+
+      <h3>Your hook</h3>
+      <p className="meet-soft">One line people read first -- what's memorable about you, not your job title.</p>
+      <input id="meet-hook" aria-label="Hook" maxLength={90} value={f.hook} onChange={set('hook')} placeholder="e.g. Builds AI products; happiest on a mountain trail." />
+      <label htmlFor="meet-askme">Ask me about</label>
+      <input id="meet-askme" maxLength={80} value={f.ask_me} onChange={set('ask_me')} placeholder="e.g. trekking in Ladakh" />
 
       <h3>Personality</h3>
       <p className="meet-soft">Pick up to 4 traits that sound like you.</p>
@@ -185,8 +246,17 @@ function CardEditor({ initial, me, traitOptions = [], canSuggest = false, onSave
           onChange={(e) => setLinks(links.map((x, j) => (j === i ? e.target.value : x)))} />
       ))}
 
+      <h3>Card colour</h3>
+      <div className="meet-colors" role="radiogroup" aria-label="Card colour">
+        {colorNames.map((n) => (
+          <button type="button" key={n} role="radio" aria-checked={COLORS[n] === effective} aria-label={`${n} card colour`}
+            className={'meet-color' + (COLORS[n] === effective ? ' on' : '')} style={{ background: COLORS[n] }}
+            onClick={() => setColor(n)} />
+        ))}
+      </div>
+
       <div className="meet-label" style={{ marginTop: 16 }}>Preview</div>
-      <Card card={card} person={me} />
+      <Card card={card} person={me} initiallyExpanded />
       {notice && <p className="meet-soft" role="status">{notice}</p>}
       <button type="submit" className="meet-primary" disabled={saving}>{saving ? 'Saving…' : 'Save card'}</button>
     </form>
@@ -347,7 +417,7 @@ export default function MeetPage() {
 
   const addFriend = async () => {
     setBusy(true);
-    try { await meetApi.addFriend(enc.id); setMessage(`You and ${enc.other.name} are now friends.`); } catch { setMessage("Couldn't add them. Try again."); } finally { setBusy(false); }
+    try { await meetApi.addFriend(enc.id); setMessage(`Connected -- ${enc.other.name} is now in your Friends.`); } catch { setMessage("Couldn't add them. Try again."); } finally { setBusy(false); }
   };
 
   const stopSharing = async () => {
@@ -363,7 +433,7 @@ export default function MeetPage() {
   else if (phase === 'failed') body = <p className="meet-error">Couldn't reach Throughline. Check your connection and reload.</p>;
   else if (phase === 'edit') {
     body = (
-      <CardEditor initial={mine.card} me={mine.me} traitOptions={mine.trait_options} canSuggest={mine.can_suggest}
+      <CardEditor initial={mine.card} me={mine.me} traitOptions={mine.trait_options} colors={mine.colors} canSuggest={mine.can_suggest}
         onSaved={(card) => { setMine({ ...mine, saved: true, card }); setPhase('ready'); }} />
     );
   } else if (phase === 'ready') {
@@ -402,10 +472,10 @@ export default function MeetPage() {
   } else if (phase === 'shared') {
     body = (
       <div className="meet-shared">
-        {enc.card ? <div className="meet-reveal"><Card card={enc.card} person={enc.other} /></div>
+        {enc.card ? <div className="meet-reveal"><Card card={enc.card} person={enc.other} inCommon={enc.in_common || []} /></div>
           : <p className="meet-soft">{enc.other.name} has switched their card off.</p>}
         {message && <p className="meet-soft">{message}</p>}
-        <button className="meet-primary" disabled={busy} onClick={addFriend}>Add friend</button>
+        <button className="meet-primary" disabled={busy} onClick={addFriend}>Connect</button>
         <button className="meet-secondary" onClick={() => { setEnc(null); setMessage(null); setPhase('ready'); }}>Done</button>
         <button className="meet-danger" disabled={busy} onClick={stopSharing}>Stop sharing</button>
       </div>

@@ -56,6 +56,7 @@ def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_i
             card = cards.public_card(cur, other)
             view["card"] = card
             view["card_hidden"] = card is None  # they switched sharing off afterwards
+            view["in_common"] = cards.in_common(cards.get_saved(cur, user_id), card)
         return view
 
     @bp.route("/meet/card", methods=["GET"])
@@ -69,6 +70,7 @@ def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_i
             "card": saved or cards.draft(cur, user_id),
             "me": cards.identity(cur, user_id),
             "trait_options": cards.TRAIT_OPTIONS,
+            "colors": cards.COLORS,
             "can_suggest": suggest_personality is not None,
         })
 

@@ -46,6 +46,12 @@ ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS education TEXT NOT NULL DEFAULT 
 ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS traits TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS style TEXT NOT NULL DEFAULT '';
 ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS links TEXT[] NOT NULL DEFAULT '{}';
+
+-- First-impression front of the card: a one-line hook, a conversation
+-- starter, and the card's colour.
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS hook TEXT NOT NULL DEFAULT '';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS ask_me TEXT NOT NULL DEFAULT '';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS color TEXT NOT NULL DEFAULT '';
 """
 
 

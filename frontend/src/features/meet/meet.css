@@ -133,3 +133,35 @@
 .meet-inline input { flex: 1; min-width: 0; }
 .meet-inline button { width: auto; padding: 10px 16px; }
 .meet-suggest { width: auto; justify-self: start; padding: 9px 14px; }
+
+/* v3: first-impression card */
+.meet-card.v3 { padding: 0; gap: 0; overflow: hidden; border-radius: 24px;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--card-accent) 18%, transparent); }
+.meet-banner { height: 84px; background: linear-gradient(135deg, var(--card-accent), color-mix(in srgb, var(--card-accent) 65%, #fff)); }
+.meet-face { position: relative; height: 48px; padding: 0 20px; }
+.meet-avatar.big { position: absolute; top: -44px; left: 20px; width: 88px; height: 88px; font-size: 34px;
+  border: 4px solid var(--m-bg); background: var(--card-accent); }
+.meet-link-icons { position: absolute; right: 16px; top: 8px; display: flex; gap: 8px; }
+.meet-link-icons a { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-size: 12px;
+  font-weight: 700; text-decoration: none; color: var(--card-accent); background: var(--m-bg);
+  border: 1px solid color-mix(in srgb, var(--card-accent) 40%, transparent); }
+.meet-card-body { padding: 4px 20px 20px; display: grid; gap: 10px; }
+.meet-card.v3 .meet-card-name { font-size: 24px; font-weight: 800; letter-spacing: -.01em; }
+.meet-card.v3 .meet-card-role { font-size: 15px; }
+.meet-hook { margin: 4px 0 0; font-size: 17px; line-height: 1.35; font-weight: 500; }
+.meet-trait { padding: 6px 12px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  background: color-mix(in srgb, var(--card-accent) 16%, transparent); border: 1px solid color-mix(in srgb, var(--card-accent) 35%, transparent); }
+.meet-common { padding: 12px; border-radius: 14px; background: color-mix(in srgb, var(--card-accent) 12%, transparent); font-size: 14px; }
+.meet-askme { font-size: 14px; }
+.meet-more { justify-self: start; background: none; border: 0; padding: 4px 0; font: inherit; color: var(--m-soft); cursor: pointer; }
+.meet-caret { display: inline-block; transition: transform .2s; }
+.meet-caret.up { transform: rotate(180deg); }
+.meet-more-body { display: grid; gap: 10px; }
+.meet-card.v3 .meet-style { border-left-color: var(--card-accent); }
+.meet-meter { border: 1px solid var(--m-border); border-radius: 14px; padding: 14px; display: grid; gap: 8px; background: var(--m-bg); }
+.meet-meter-top { display: flex; justify-content: space-between; gap: 8px; }
+.meet-meter-bar { height: 6px; border-radius: 99px; background: var(--m-border); overflow: hidden; }
+.meet-meter-bar span { display: block; height: 100%; background: var(--card-accent); transition: width .3s; }
+.meet-colors { display: flex; flex-wrap: wrap; gap: 12px; }
+.meet-color { width: 36px; height: 36px; border-radius: 50%; border: 3px solid transparent; cursor: pointer; padding: 0; }
+.meet-color.on { border-color: var(--m-text); box-shadow: inset 0 0 0 2px var(--m-bg); }
