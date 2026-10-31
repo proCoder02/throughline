@@ -26,9 +26,13 @@ UUID_PREFIX = (os.getenv("MEET_UUID_PREFIX") or "7e1a0c4e").lower()[:8]
 RSSI_THRESHOLD = _int("MEET_RSSI_THRESHOLD", -40)
 # ... held for this long.
 TOUCH_MS = _int("MEET_TOUCH_MS", 800)
+# The server re-checks both phones' readings against the threshold, allowing
+# this much measurement noise (dB).
+RSSI_TOLERANCE = _int("MEET_RSSI_TOLERANCE", 3)
 
 CODE_TTL_SECONDS = _int("MEET_CODE_TTL_SECONDS", 300)  # a code outlives its rotation, so late sightings still resolve
 ROTATE_SECONDS = _int("MEET_ROTATE_SECONDS", 120)
 MATCH_WINDOW_SECONDS = _int("MEET_MATCH_WINDOW_SECONDS", 10)  # both sides must report each other within this
 PENDING_SECONDS = _int("MEET_PENDING_SECONDS", 120)  # time both people have to tap Share
 MAX_ENCOUNTERS_PER_HOUR = _int("MEET_MAX_ENCOUNTERS_PER_HOUR", 30)  # stops card scraping
+QR_TTL_SECONDS = _int("MEET_QR_TTL_SECONDS", 120)  # an on-screen code is refreshed by the app before this

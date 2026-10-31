@@ -9,6 +9,12 @@ const HomeIcon = () => (
   </svg>
 );
 
+const MeetIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+    <rect x="3" y="4" width="7" height="16" rx="2" /><rect x="14" y="4" width="7" height="16" rx="2" /><path d="M10 12h4" />
+  </svg>
+);
+
 // Web counterpart of the Flutter client's _AppDrawer (home_shell.dart) --
 // same destinations (Home/Chats/Tasks/Profiles/Friends/Settings, same badge
 // counts), same warm-gradient styling, and the same "Recent Conversations"
@@ -29,6 +35,7 @@ export default function AppDrawer({ open, onClose, active, notify, onOpenConvers
     { key: 'tasks', label: 'Tasks', Icon: TaskIcon, badge: notify?.taskCount || 0 },
     { key: 'profiles', label: 'Profiles', Icon: ProfileIcon, badge: 0 },
     { key: 'friends', label: 'Friends', Icon: FriendIcon, badge: 0 },
+    { key: 'meet', label: 'Meet', Icon: MeetIcon, badge: 0 },
     { key: 'settings', label: 'Settings', Icon: SettingsIcon, badge: 0 },
   ];
 

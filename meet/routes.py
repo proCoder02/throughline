@@ -4,12 +4,15 @@ which takes the host app's helpers instead of importing app.py.
   GET    /meet/card                      my card (a draft if never saved)
   PUT    /meet/card                      save / edit my card, switch sharing
   POST   /meet/session                   start broadcasting: code + tunables
-  POST   /meet/encounter                 {code, seen_code} -> waiting | matched
+  POST   /meet/encounter                 {code, seen_code, rssi} -> waiting | matched | too_far
   GET    /meet/encounter/<id>            status; the other card once both shared
   POST   /meet/encounter/<id>/confirm    {accept: true|false}
   POST   /meet/encounter/<id>/add-friend become friends after sharing
   DELETE /meet/encounter/<id>            stop sharing with this person
-  GET    /meet/encounters                everyone I've met ("who has my card")"""
+  GET    /meet/encounters                everyone I've met ("who has my card")
+  POST   /meet/qr                        show-a-code: a short-lived QR payload
+  GET    /meet/qr/<token>                for the phone showing it: scanned yet?
+  POST   /meet/qr/scan                   {payload} -> matched (then the same confirm step)"""
 from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
@@ -39,7 +42,10 @@ def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_i
             "other": cards.identity(cur, other),
             "i_confirmed": encounters.i_confirmed(row, user_id),
             "they_confirmed": encounters.they_confirmed(row, user_id),
+            "method": row.get("method") or "bluetooth",
         }
+        if status == "pending":
+            view["expires_in"] = encounters.seconds_left(row)
         if status == "shared":
             card = cards.public_card(cur, other)
             view["card"] = card
@@ -70,21 +76,60 @@ def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_i
     def start_session():
         conn, cur = db_cur()
         user_id = current_user_id()
-        saved = cards.get_saved(cur, user_id)
-        if not saved or not saved["sharing"]:
-            return jsonify({"error": "card_required", "message": "Set up your card before using Meet."}), 409
-        return jsonify(encounters.start_session(store, user_id))
+        return card_required(cur, user_id) or jsonify(encounters.start_session(store, user_id))
 
     @bp.route("/meet/encounter", methods=["POST"])
     @login_required
     def report():
         conn, cur = db_cur()
         data = request.get_json(silent=True) or {}
-        result = encounters.report_sighting(cur, conn, store, current_user_id(), data.get("code"), data.get("seen_code"))
+        result = encounters.report_sighting(cur, conn, store, current_user_id(), data.get("code"), data.get("seen_code"),
+                                            data.get("rssi"))
         if result["status"] == "matched":
             row = encounters.get_for(cur, result["encounter_id"], current_user_id())
             result["encounter"] = encounter_view(cur, row, current_user_id())
         code = {"invalid": 409, "limited": 429}.get(result["status"], 200)
+        return jsonify(result), code
+
+    def card_required(cur, user_id):
+        saved = cards.get_saved(cur, user_id)
+        if not saved or not saved["sharing"]:
+            return jsonify({"error": "card_required", "message": "Set up your card before using Meet."}), 409
+        return None
+
+    @bp.route("/meet/qr", methods=["POST"])
+    @login_required
+    def start_qr():
+        conn, cur = db_cur()
+        user_id = current_user_id()
+        return card_required(cur, user_id) or jsonify(encounters.start_qr(store, user_id))
+
+    @bp.route("/meet/qr/<token>", methods=["GET"])
+    @login_required
+    def qr_status(token):
+        conn, cur = db_cur()
+        user_id = current_user_id()
+        result = encounters.qr_status(store, user_id, token)
+        if result["status"] == "scanned":
+            row = encounters.get_for(cur, result["encounter_id"], user_id)
+            if not row:  # someone else's code id -- never leak it
+                return jsonify({"status": "expired"})
+            result["encounter"] = encounter_view(cur, row, user_id)
+        return jsonify(result)
+
+    @bp.route("/meet/qr/scan", methods=["POST"])
+    @login_required
+    def scan_qr():
+        conn, cur = db_cur()
+        user_id = current_user_id()
+        blocked = card_required(cur, user_id)
+        if blocked:
+            return blocked
+        result = encounters.scan_qr(cur, conn, store, user_id, (request.get_json(silent=True) or {}).get("payload"))
+        if result["status"] == "matched":
+            row = encounters.get_for(cur, result["encounter_id"], user_id)
+            result["encounter"] = encounter_view(cur, row, user_id)
+        code = {"expired": 410, "unknown": 400, "limited": 429}.get(result["status"], 200)
         return jsonify(result), code
 
     def load(encounter_id):

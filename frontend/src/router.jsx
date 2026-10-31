@@ -47,6 +47,8 @@ const SettingsSection = lazy(() => import('./components/SettingsSection.jsx'));
 // fix is changing the redirects below back to /app/chats, not restoring
 // deleted code.
 const OsApp = lazy(() => import('./os/OsApp.jsx'));
+// Throughline Meet (QR on the web) -- self-contained in features/meet/.
+const MeetPage = lazy(() => import('./features/meet/MeetPage.jsx'));
 
 // Same fallback markup App.jsx's old shared <Suspense> used, per-route now
 // instead of one boundary wrapping all four -- no observable difference
@@ -163,6 +165,7 @@ export const router = createBrowserRouter([
       { path: 'friends', element: <FriendsRoute /> },
       { path: 'settings', element: <SettingsRoute /> },
       { path: 'os', element: <OsRoute /> },
+      { path: 'meet', element: <Suspense fallback={LAZY_FALLBACK}><MeetPage /></Suspense> },
       // Anything unrecognized under /app (including a stale bookmark to a
       // future IA path not built yet) falls back to the default section
       // rather than a blank/error screen.

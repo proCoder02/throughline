@@ -19,7 +19,7 @@ import { MenuIcon } from './icons.jsx';
 
 const SECTION_TITLES = {
   home: 'Home', chats: 'Chats', tasks: 'Tasks', profiles: 'Profiles',
-  friends: 'Friends', settings: 'Settings', os: 'Throughline',
+  friends: 'Friends', settings: 'Settings', os: 'Throughline', meet: 'Meet',
 };
 
 /// Root layout route (see router.jsx) -- rendered once and never unmounted

@@ -442,6 +442,10 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
             <NavItem icon="✦" label="Home" screenKey="home" navActive={navActive} go={go} />
             <NavItem icon="◉" label="Conversations" screenKey="conversations" navActive={navActive} go={go} />
             <NavItem icon="◎" label="People" screenKey="people" navActive={navActive} go={go} />
+            <button className="nav-item" onClick={() => navigate('/app/meet')}>
+              <span className="nav-icon">⇄</span>
+              <span>Meet</span>
+            </button>
             <NavItem icon="□" label="Tasks" screenKey="tasks" navActive={navActive} go={go} />
             <NavItem icon="☎" label="Calls" screenKey="calls" navActive={navActive} go={go} />
           </div>
