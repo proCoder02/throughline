@@ -11,7 +11,24 @@ import './meet.css';
 
 const splitList = (text) => text.split(',').map((s) => s.trim()).filter(Boolean);
 
+const MAX_TRAITS = 4;
+const LINK_HINTS = ['linkedin.com/in/…', 'instagram.com/…', 'Your website'];
+
+function linkLabel(url) {
+  let host = url;
+  try { host = new URL(url).host; } catch { /* keep as typed */ }
+  host = host.toLowerCase().replace(/^www\./, '');
+  if (host.includes('linkedin.')) return 'LinkedIn';
+  if (host.includes('instagram.')) return 'Instagram';
+  if (host === 'x.com' || host.includes('twitter.')) return 'X';
+  if (host.includes('github.')) return 'GitHub';
+  return host || 'Link';
+}
+
+// Reads like an introduction: who they are, what they're like, what
+// they're into, how to stay in touch.
 function Card({ card, person }) {
+  const where = [card.organization, card.city].filter(Boolean).join(' · ');
   return (
     <div className="meet-card">
       <div className="meet-card-head">
@@ -20,12 +37,33 @@ function Card({ card, person }) {
         </div>
         <div>
           <div className="meet-card-name">{person?.name}</div>
-          {card.headline && <div className="meet-card-headline">{card.headline}</div>}
+          {card.headline && <div className="meet-card-role">{card.headline}</div>}
+          {where && <div className="meet-card-headline">{where}</div>}
         </div>
       </div>
+      {card.education && <div className="meet-card-headline">🎓 {card.education}</div>}
+      {(card.traits?.length > 0 || card.style) && (
+        <div className="meet-chips">
+          <div className="meet-label">Personality</div>
+          {card.traits?.length > 0 && (
+            <div className="meet-chip-row">{card.traits.map((t) => <span key={t} className="meet-chip strong">{t}</span>)}</div>
+          )}
+          {card.style && <blockquote className="meet-style">“{card.style}”</blockquote>}
+        </div>
+      )}
       {card.about && <p className="meet-card-about">{card.about}</p>}
       {card.interests?.length > 0 && <Chips title="Into" items={card.interests} />}
       {card.likes?.length > 0 && <Chips title="Likes" items={card.likes} />}
+      {card.links?.length > 0 && (
+        <div className="meet-chips">
+          <div className="meet-label">Stay in touch</div>
+          <div className="meet-chip-row">
+            {card.links.map((l) => (
+              <a key={l} className="meet-link-chip" href={l} target="_blank" rel="noopener noreferrer">{linkLabel(l)}</a>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -39,24 +77,59 @@ function Chips({ title, items }) {
   );
 }
 
-function CardEditor({ initial, me, onSaved }) {
-  const [headline, setHeadline] = useState(initial.headline || '');
-  const [about, setAbout] = useState(initial.about || '');
-  const [interests, setInterests] = useState((initial.interests || []).join(', '));
-  const [likes, setLikes] = useState((initial.likes || []).join(', '));
+function CardEditor({ initial, me, traitOptions = [], canSuggest = false, onSaved }) {
+  const [f, setF] = useState({
+    headline: initial.headline || '', organization: initial.organization || '', city: initial.city || '',
+    education: initial.education || '', style: initial.style || '', about: initial.about || '',
+    interests: (initial.interests || []).join(', '), likes: (initial.likes || []).join(', '),
+  });
+  const [traits, setTraits] = useState(initial.traits || []);
+  const [links, setLinks] = useState([0, 1, 2].map((i) => (initial.links || [])[i] || ''));
+  const [custom, setCustom] = useState('');
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState(null);
-  const card = { headline: headline.trim(), about: about.trim(), interests: splitList(interests), likes: splitList(likes), sharing: true };
+  const [suggesting, setSuggesting] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const card = {
+    headline: f.headline.trim(), organization: f.organization.trim(), city: f.city.trim(), education: f.education.trim(),
+    style: f.style.trim(), about: f.about.trim(), traits, interests: splitList(f.interests), likes: splitList(f.likes),
+    links: links.map((l) => l.trim()).filter(Boolean), sharing: true,
+  };
+  const options = [...new Set([...traitOptions, ...traits])];
 
+  const toggle = (t) => {
+    if (traits.includes(t)) setTraits(traits.filter((x) => x !== t));
+    else if (traits.length < MAX_TRAITS) setTraits([...traits, t]);
+    else setNotice('Pick up to 4 -- remove one first.');
+  };
+  const addCustom = () => {
+    const t = custom.trim();
+    if (t && !traits.some((x) => x.toLowerCase() === t.toLowerCase())) toggle(t);
+    setCustom('');
+  };
+  const suggest = async () => {
+    setSuggesting(true);
+    setNotice(null);
+    try {
+      const s = await meetApi.suggest();
+      if (s.traits?.length) setTraits(s.traits.slice(0, MAX_TRAITS));
+      if (s.style) setF((prev) => ({ ...prev, style: s.style }));
+      setNotice('Suggested from what Throughline knows about you. Change anything before saving.');
+    } catch (e) {
+      setNotice(e?.data?.error || "Couldn't make a suggestion right now. Try again in a moment.");
+    } finally {
+      setSuggesting(false);
+    }
+  };
   const save = async (e) => {
     e.preventDefault();
     setSaving(true);
-    setError(null);
+    setNotice(null);
     try {
       const r = await meetApi.saveCard(card);
       onSaved(r.card);
     } catch {
-      setError("Couldn't save your card. Check your connection and try again.");
+      setNotice("Couldn't save your card. Check your connection and try again.");
       setSaving(false);
     }
   };
@@ -64,18 +137,57 @@ function CardEditor({ initial, me, onSaved }) {
   return (
     <form className="meet-editor" onSubmit={save}>
       <h2>Your Meet card</h2>
-      <p className="meet-soft">This is what people see after you both tap Share. You choose everything on it.</p>
-      <label htmlFor="meet-headline">Headline</label>
-      <input id="meet-headline" maxLength={80} value={headline} onChange={(e) => setHeadline(e.target.value)} placeholder="e.g. Product designer, trekker" />
+      <p className="meet-soft">This is what people see after you both tap Share. Everything is optional.</p>
+
+      <h3>Who you are</h3>
+      <label htmlFor="meet-headline">Role or headline</label>
+      <input id="meet-headline" maxLength={80} value={f.headline} onChange={set('headline')} placeholder="e.g. Product designer" />
+      <label htmlFor="meet-org">Company or organisation</label>
+      <input id="meet-org" maxLength={80} value={f.organization} onChange={set('organization')} />
+      <label htmlFor="meet-city">City</label>
+      <input id="meet-city" maxLength={80} value={f.city} onChange={set('city')} />
+      <label htmlFor="meet-edu">Education</label>
+      <input id="meet-edu" maxLength={80} value={f.education} onChange={set('education')} placeholder="e.g. MBA, IIM Indore" />
+
+      <h3>Personality</h3>
+      <p className="meet-soft">Pick up to 4 traits that sound like you.</p>
+      {canSuggest && (
+        <button type="button" className="meet-secondary meet-suggest" onClick={suggest} disabled={suggesting}>
+          {suggesting ? 'Thinking…' : '✨ Suggest from Throughline'}
+        </button>
+      )}
+      <div className="meet-chip-row">
+        {options.map((t) => (
+          <button type="button" key={t} className={'meet-chip-toggle' + (traits.includes(t) ? ' on' : '')}
+            aria-pressed={traits.includes(t)} onClick={() => toggle(t)}>{t}</button>
+        ))}
+      </div>
+      <div className="meet-inline">
+        <input id="meet-custom-trait" maxLength={24} value={custom} onChange={(e) => setCustom(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustom(); } }} placeholder="Add your own trait" aria-label="Add your own trait" />
+        <button type="button" className="meet-secondary" onClick={addCustom}>Add</button>
+      </div>
+      <label htmlFor="meet-style">How you communicate</label>
+      <input id="meet-style" maxLength={160} value={f.style} onChange={set('style')} placeholder="e.g. I think out loud and like getting to the point." />
       <label htmlFor="meet-about">About you</label>
-      <textarea id="meet-about" maxLength={280} rows={3} value={about} onChange={(e) => setAbout(e.target.value)} placeholder="A line or two about how you think, work or spend your time" />
+      <textarea id="meet-about" maxLength={280} rows={3} value={f.about} onChange={set('about')} placeholder="A line or two about what drives you" />
+
+      <h3>What you're into</h3>
       <label htmlFor="meet-interests">Interests <span className="meet-soft">(comma separated)</span></label>
-      <input id="meet-interests" value={interests} onChange={(e) => setInterests(e.target.value)} />
+      <input id="meet-interests" value={f.interests} onChange={set('interests')} />
       <label htmlFor="meet-likes">Things you like <span className="meet-soft">(comma separated)</span></label>
-      <input id="meet-likes" value={likes} onChange={(e) => setLikes(e.target.value)} />
+      <input id="meet-likes" value={f.likes} onChange={set('likes')} />
+
+      <h3>Stay in touch</h3>
+      <p className="meet-soft">Optional. Only people you both share with can see these.</p>
+      {links.map((l, i) => (
+        <input key={i} id={`meet-link-${i}`} aria-label={`Link ${i + 1}`} type="url" inputMode="url" value={l} placeholder={LINK_HINTS[i]}
+          onChange={(e) => setLinks(links.map((x, j) => (j === i ? e.target.value : x)))} />
+      ))}
+
       <div className="meet-label" style={{ marginTop: 16 }}>Preview</div>
       <Card card={card} person={me} />
-      {error && <p className="meet-error">{error}</p>}
+      {notice && <p className="meet-soft" role="status">{notice}</p>}
       <button type="submit" className="meet-primary" disabled={saving}>{saving ? 'Saving…' : 'Save card'}</button>
     </form>
   );
@@ -250,7 +362,10 @@ export default function MeetPage() {
   else if (phase === 'unavailable') body = <p className="meet-soft">Meet isn't switched on yet.</p>;
   else if (phase === 'failed') body = <p className="meet-error">Couldn't reach Throughline. Check your connection and reload.</p>;
   else if (phase === 'edit') {
-    body = <CardEditor initial={mine.card} me={mine.me} onSaved={(card) => { setMine({ ...mine, saved: true, card }); setPhase('ready'); }} />;
+    body = (
+      <CardEditor initial={mine.card} me={mine.me} traitOptions={mine.trait_options} canSuggest={mine.can_suggest}
+        onSaved={(card) => { setMine({ ...mine, saved: true, card }); setPhase('ready'); }} />
+    );
   } else if (phase === 'ready') {
     body = (
       <>

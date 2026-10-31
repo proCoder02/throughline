@@ -19,6 +19,7 @@ async function meetJson(path, options) {
 export const meetApi = {
   myCard: () => meetJson('/meet/card'),
   saveCard: (card) => apiJson('/meet/card', { method: 'PUT', body: JSON.stringify(card) }),
+  suggest: () => post('/meet/card/suggest', {}),
   startQr: () => meetJson('/meet/qr', { method: 'POST' }),
   qrStatus: (token) => meetJson(`/meet/qr/${token}`),
   scanQr: (payload) => meetJson('/meet/qr/scan', { method: 'POST', body: JSON.stringify({ payload }) }),

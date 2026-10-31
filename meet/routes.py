@@ -3,6 +3,7 @@ which takes the host app's helpers instead of importing app.py.
 
   GET    /meet/card                      my card (a draft if never saved)
   PUT    /meet/card                      save / edit my card, switch sharing
+  POST   /meet/card/suggest              draft traits + "how I communicate" (editor only; not saved)
   POST   /meet/session                   start broadcasting: code + tunables
   POST   /meet/encounter                 {code, seen_code, rssi} -> waiting | matched | too_far
   GET    /meet/encounter/<id>            status; the other card once both shared
@@ -22,7 +23,12 @@ from .ephemeral import Ephemeral
 from .schema import ensure_meet_schema
 
 
-def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_id, redis_client=None) -> Blueprint:
+def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_id, redis_client=None,
+                          suggest_personality=None) -> Blueprint:
+    """suggest_personality(user_id) -> {"traits": [...], "style": "..."} is
+    optional: the host app's way of drafting the personality part of a card
+    from what it knows. Without it, the suggest endpoint says it's
+    unavailable and the rest of Meet is unaffected."""
     bp = Blueprint("meet", __name__)
     store = Ephemeral(redis_client)
 
@@ -58,10 +64,13 @@ def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_i
         conn, cur = db_cur()
         user_id = current_user_id()
         saved = cards.get_saved(cur, user_id)
-        if saved:
-            return jsonify({"saved": True, "card": {k: saved[k] for k in ("headline", "about", "interests", "likes", "sharing")},
-                            "me": cards.identity(cur, user_id)})
-        return jsonify({"saved": False, "card": cards.draft(cur, user_id), "me": cards.identity(cur, user_id)})
+        return jsonify({
+            "saved": bool(saved),
+            "card": saved or cards.draft(cur, user_id),
+            "me": cards.identity(cur, user_id),
+            "trait_options": cards.TRAIT_OPTIONS,
+            "can_suggest": suggest_personality is not None,
+        })
 
     @bp.route("/meet/card", methods=["PUT"])
     @login_required
@@ -70,6 +79,20 @@ def create_meet_blueprint(*, get_db, dict_cursor, login_required, current_user_i
         card = cards.save(cur, current_user_id(), request.get_json(silent=True) or {})
         conn.commit()
         return jsonify({"saved": True, "card": card})
+
+    @bp.route("/meet/card/suggest", methods=["POST"])
+    @login_required
+    def suggest_card():
+        if suggest_personality is None:
+            return jsonify({"error": "Suggestions aren't available right now."}), 503
+        try:
+            suggestion = cards.clean_suggestion(suggest_personality(current_user_id()))
+        except Exception as e:
+            print(f"[meet] suggest failed: {e!r}")
+            return jsonify({"error": "Couldn't make a suggestion right now. Try again in a moment."}), 503
+        if not suggestion["traits"] and not suggestion["style"]:
+            return jsonify({"error": "Throughline doesn't know enough about you yet to suggest this. Add it yourself."}), 422
+        return jsonify(suggestion)
 
     @bp.route("/meet/session", methods=["POST"])
     @login_required

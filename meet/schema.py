@@ -37,6 +37,15 @@ CREATE TABLE IF NOT EXISTS meet_encounters (
 );
 CREATE INDEX IF NOT EXISTS idx_meet_encounters_pair ON meet_encounters (user_lo, user_hi, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_meet_encounters_hi ON meet_encounters (user_hi, created_at DESC);
+
+-- Richer card (who I am / personality / stay in touch). Added columns, so
+-- cards saved before this keep working with empty values.
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS organization TEXT NOT NULL DEFAULT '';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT '';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS education TEXT NOT NULL DEFAULT '';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS traits TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS style TEXT NOT NULL DEFAULT '';
+ALTER TABLE meet_cards ADD COLUMN IF NOT EXISTS links TEXT[] NOT NULL DEFAULT '{}';
 """
 
 

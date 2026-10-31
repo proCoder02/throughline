@@ -8529,12 +8529,44 @@ def _start_nudge_worker_safely():
 # Throughline Meet (meet/) -- swap personality cards by holding two phones
 # together. Self-contained package, off unless MEET_ENABLED=true; a failure
 # here must never stop the rest of the app from starting.
+def _meet_suggest_personality(user_id):
+    """Drafts the personality part of a Meet card -- up to 4 traits and a
+    one-line "how I communicate" -- from what Throughline has learned about
+    the user. Only ever shown in the card editor, for the user to keep, edit
+    or discard; it's a stranger-facing card, so the prompt rules out
+    anything private."""
+    from meet.cards import TRAIT_OPTIONS
+    cur = dict_cursor(get_db())
+    persona = build_persona_context(get_user_persona(cur, user_id))
+    try:
+        from emotional_intelligence.ei_adapter import get_user_cognitive_context
+        ei = get_user_cognitive_context(user_id, question="my personality, how I communicate, how I work with people")
+    except Exception:
+        ei = ""
+    if not (persona or ei):
+        return {}
+    prompt = (
+        "Draft the personality section of this person's introduction card -- shown to someone they have just met.\n"
+        f"Pick up to 4 traits, preferably from: {', '.join(TRAIT_OPTIONS)}.\n"
+        "Write 'style': one short first-person sentence on how they communicate or work with people "
+        "(e.g. \"I think out loud and like getting straight to the point.\").\n"
+        "Only use what the notes below support; if they don't support a trait, leave it out. NEVER mention health, "
+        "relationships, family, money, religion, politics, named people or anything private.\n"
+        'Reply with JSON only: {"traits": [...], "style": "..."}\n\n'
+        f"{persona}\n\n{ei}"
+    )
+    text = call_llm([{"role": "user", "content": prompt}])
+    match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    return json.loads(match.group(0)) if match else {}
+
+
 try:
     from meet import create_meet_blueprint, is_enabled as _meet_enabled
     if _meet_enabled():
         app.register_blueprint(create_meet_blueprint(
             get_db=get_db, dict_cursor=dict_cursor, login_required=login_required,
             current_user_id=current_user_id, redis_client=redis_client,
+            suggest_personality=_meet_suggest_personality,
         ))
         print("[meet] enabled")
 except Exception as e:

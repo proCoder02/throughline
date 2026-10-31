@@ -113,3 +113,23 @@
 @media (prefers-reduced-motion: reduce) {
   .meet-merge::before, .meet-merge .me, .meet-merge .them, .meet-reveal { animation: none; }
 }
+
+/* Richer card + editor */
+.meet-card-role { font-weight: 600; font-size: 14px; }
+.meet-chip.strong { background: color-mix(in srgb, var(--m-accent) 24%, transparent); font-weight: 600; }
+.meet-style { margin: 4px 0 0; padding: 6px 12px; border-left: 3px solid var(--m-accent); font-style: italic; }
+.meet-link-chip {
+  border: 1px solid var(--m-border); border-radius: 999px; padding: 5px 12px; font-size: 13px;
+  color: var(--m-text); text-decoration: none;
+}
+.meet-link-chip:hover { border-color: var(--m-accent); }
+.meet-editor h3 { margin: 18px 0 0; font-size: 16px; }
+.meet-chip-toggle {
+  font: inherit; font-size: 13px; border-radius: 999px; padding: 6px 12px; cursor: pointer;
+  border: 1px solid var(--m-border); background: var(--m-bg); color: var(--m-text);
+}
+.meet-chip-toggle.on { background: color-mix(in srgb, var(--m-accent) 25%, transparent); border-color: var(--m-accent); font-weight: 600; }
+.meet-inline { display: flex; gap: 8px; }
+.meet-inline input { flex: 1; min-width: 0; }
+.meet-inline button { width: auto; padding: 10px 16px; }
+.meet-suggest { width: auto; justify-self: start; padding: 9px 14px; }
