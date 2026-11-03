@@ -620,11 +620,17 @@ def query_transactions(cur, user_id, start, end, keywords=None, category=None, l
         # Payment app too: confirmed live that "how much through GPay?" was
         # answered Rs 0 -- the model searched keywords=['GPay'], which only
         # ever looked at item/payee/category.
-        where.append("(" + " OR ".join(
-            ["COALESCE(item,'') ILIKE %s OR COALESCE(payee,'') ILIKE %s OR COALESCE(category,'') ILIKE %s "
-             "OR lower(COALESCE(payment_method,'')) = ANY(%s)"] * len(words)) + ")")
+        # A multi-word keyword ("Gopal Pan Shop") matches when every word
+        # appears somewhere in item/payee/category, not only as that exact
+        # phrase -- so "GOPAL PAN SHOP UPI" or payee "Gopal" + item "pan" count.
+        text = "(COALESCE(item,'') || ' ' || COALESCE(payee,'') || ' ' || COALESCE(category,''))"
+        clauses = []
         for w in words:
-            params += [f"%{w}%"] * 3 + [_payment_method_names(w)]
+            parts = w.split()
+            clauses.append("(" + " AND ".join([f"{text} ILIKE %s"] * len(parts))
+                           + " OR lower(COALESCE(payment_method,'')) = ANY(%s))")
+            params += [f"%{p}%" for p in parts] + [_payment_method_names(w)]
+        where.append("(" + " OR ".join(clauses) + ")")
     if category:
         where.append("lower(category) = lower(%s)")
         params.append(category.strip())
@@ -1895,7 +1901,9 @@ AGENT_TOOLS = [
                 "Look up the user's LOGGED expenses for any period, optionally narrowed to an item/merchant/"
                 "category. Use for every spending question beyond 'this month so far' -- e.g. 'how much did I "
                 "spend on flight tickets last year' (start_date/end_date for last year, keywords like flight, "
-                "airline names, travel sites). Work out exact dates from today's date. Only covers what the user "
+                "airline names, travel sites). Work out exact dates from today's date. If the user names NO period "
+                "('how much have I paid to Gopal Pan Shop?'), leave start_date and end_date out: that searches "
+                "everything they've logged -- never assume 'this month' for them. Only covers what the user "
                 "logged in the app (receipts, stated expenses), dated by when it was logged. Call it fresh for every "
                 "spending question -- never reuse a total from earlier in the conversation, since new expenses or "
                 "receipt emails may have arrived since."
@@ -1903,8 +1911,8 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start_date": {"type": "string", "description": "First day, YYYY-MM-DD."},
-                    "end_date": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD."},
+                    "start_date": {"type": "string", "description": "First day, YYYY-MM-DD. Omit (with end_date) for all time."},
+                    "end_date": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD. Omit for up to today."},
                     "keywords": {
                         "type": "array", "items": {"type": "string"},
                         "description": (
@@ -1918,7 +1926,7 @@ AGENT_TOOLS = [
                         "description": "Optional: only payments made through this app/rail, e.g. 'GPay', 'PhonePe', 'Paytm', 'Credit Card'.",
                     },
                 },
-                "required": ["start_date", "end_date"],
+                "required": [],
             },
         },
     },
@@ -2184,11 +2192,27 @@ def _tool_log_expense(cur, db, user_id, args):
 
 def _tool_query_spending(cur, db, user_id, args):
     local_tz = datetime.now().astimezone().tzinfo  # dates mean the user's local days, not UTC
-    try:
-        start = datetime.strptime((args.get("start_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=local_tz)
-        last = datetime.strptime((args.get("end_date") or "").strip(), "%Y-%m-%d").replace(tzinfo=local_tz)
-    except ValueError:
-        return {"error": "start_date and end_date must be YYYY-MM-DD"}
+    start_arg = (args.get("start_date") or "").strip()
+    end_arg = (args.get("end_date") or "").strip()
+    today = datetime.now(local_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    if not start_arg and not end_arg:
+        # No period named ("how much have I paid to Gopal Pan Shop?") means
+        # everything logged -- confirmed live that the model otherwise picked
+        # "this month" on its own and reported 1 payment out of many.
+        cur.execute("SELECT min(created_at) AS first FROM transactions WHERE user_id = %s", (user_id,))
+        first = cur.fetchone()["first"]
+        start = first.astimezone(local_tz).replace(hour=0, minute=0, second=0, microsecond=0) if first else today
+        last = today
+    else:
+        try:
+            start = datetime.strptime(start_arg, "%Y-%m-%d").replace(tzinfo=local_tz) if start_arg else None
+            last = datetime.strptime(end_arg, "%Y-%m-%d").replace(tzinfo=local_tz) if end_arg else today
+        except ValueError:
+            return {"error": "start_date and end_date must be YYYY-MM-DD"}
+        if start is None:
+            cur.execute("SELECT min(created_at) AS first FROM transactions WHERE user_id = %s", (user_id,))
+            first = cur.fetchone()["first"]
+            start = first.astimezone(local_tz).replace(hour=0, minute=0, second=0, microsecond=0) if first else last
     if last < start:
         start, last = last, start
     end = last + timedelta(days=1)  # end_date is inclusive
