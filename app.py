@@ -45,6 +45,8 @@ from ops import db as ops_db
 from ops import job_control as ops_job_control
 from ops.actions import register_nudge_runner
 from ops.alerts import ops_alert_worker
+import chat_followup
+import chat_summary
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
 from ops.tracking import record_fcm_send, record_heartbeat
@@ -594,22 +596,41 @@ def compute_monthly_payment_method_summary(cur, user_id, start, end):
     return [{"payment_method": r["payment_method"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
 
 
-def query_transactions(cur, user_id, start, end, keywords=None, category=None, limit=50):
+def _payment_method_names(name):
+    """Every spelling a payment app is stored under: what was asked
+    ("GPay") plus the canonical label receipts are saved with ("Google
+    Pay", see _normalize_payment_method)."""
+    names = {name.strip().lower()}
+    canonical = _normalize_payment_method(name)
+    if canonical:
+        names.add(canonical.lower())
+    return sorted(n for n in names if n)
+
+
+def query_transactions(cur, user_id, start, end, keywords=None, category=None, limit=50, payment_method=None):
     """Logged expenses in [start, end), optionally narrowed to ones whose
-    item/payee/category matches ANY keyword (case-insensitive substring) or
-    an exact category. Returns (rows newest-first capped at limit, total,
+    item/payee/category/payment app matches ANY keyword (case-insensitive
+    substring), an exact category, and/or a payment app ("GPay" also finds
+    "Google Pay"). Returns (rows newest-first capped at limit, total,
     count, by_category) -- totals cover every match, not just the rows
     returned."""
     where, params = ["user_id = %s", "created_at >= %s", "created_at < %s"], [user_id, start, end]
     words = [w.strip() for w in (keywords or []) if isinstance(w, str) and w.strip()][:15]
     if words:
+        # Payment app too: confirmed live that "how much through GPay?" was
+        # answered Rs 0 -- the model searched keywords=['GPay'], which only
+        # ever looked at item/payee/category.
         where.append("(" + " OR ".join(
-            ["COALESCE(item,'') ILIKE %s OR COALESCE(payee,'') ILIKE %s OR COALESCE(category,'') ILIKE %s"] * len(words)) + ")")
+            ["COALESCE(item,'') ILIKE %s OR COALESCE(payee,'') ILIKE %s OR COALESCE(category,'') ILIKE %s "
+             "OR lower(COALESCE(payment_method,'')) = ANY(%s)"] * len(words)) + ")")
         for w in words:
-            params += [f"%{w}%"] * 3
+            params += [f"%{w}%"] * 3 + [_payment_method_names(w)]
     if category:
         where.append("lower(category) = lower(%s)")
         params.append(category.strip())
+    if isinstance(payment_method, str) and payment_method.strip():
+        where.append("lower(COALESCE(payment_method,'')) = ANY(%s)")
+        params.append(_payment_method_names(payment_method))
     clause = " AND ".join(where)
     cur.execute(f"SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n FROM transactions WHERE {clause}", params)
     agg = cur.fetchone()
@@ -1892,6 +1913,10 @@ AGENT_TOOLS = [
                         ),
                     },
                     "category": {"type": "string", "description": "Optional exact category, e.g. 'Travel'."},
+                    "payment_method": {
+                        "type": "string",
+                        "description": "Optional: only payments made through this app/rail, e.g. 'GPay', 'PhonePe', 'Paytm', 'Credit Card'.",
+                    },
                 },
                 "required": ["start_date", "end_date"],
             },
@@ -2170,7 +2195,8 @@ def _tool_query_spending(cur, db, user_id, args):
     keywords = args.get("keywords")
     if isinstance(keywords, str):
         keywords = [keywords]
-    rows, total, count, by_category = query_transactions(cur, user_id, start, end, keywords, args.get("category"))
+    rows, total, count, by_category = query_transactions(cur, user_id, start, end, keywords, args.get("category"),
+                                                         payment_method=args.get("payment_method"))
     period = f"{start:%Y-%m-%d} to {last:%Y-%m-%d}"
     label = (f"Checked your logged expenses ({period}) · "
              f"{count} {'match' if count == 1 else 'matches'}{' · Rs ' + format(total, ',.0f') if count else ''}")
@@ -2611,7 +2637,7 @@ def run_agent_tool_loop(cur, db, user_id, messages):
             else:
                 args = raw_args or {}
 
-            args = _attach_source_email(args, mail_sources)
+            args = _attach_source_email(_strip_nul(args), mail_sources)
             handler = AGENT_TOOL_DISPATCH.get(name) or extra_handler(name)
             if not handler:
                 result = {"error": f"Unknown tool '{name}'"}
@@ -2666,7 +2692,7 @@ def _build_reply_meta(tool_activity, mail_sources):
 
 
 # Strips a leading <think>...</think> reasoning block some models (e.g. Groq's
-# qwen/qwen3.6-27b, used by call_groq_vision below) prepend to their own
+# qwen/qwen3.8-27b, used by call_groq_vision below) prepend to their own
 # answer -- confirmed via a live test call that the chain-of-thought lands
 # inline in the same content string, not a separate field. Without this, that
 # reasoning monologue would end up stored as part of raw_transcript/the chat
@@ -2698,7 +2724,7 @@ def call_groq_vision(image_bytes, mimetype, instruction):
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
     payload = {
-        "model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b"),
+        "model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b"),
         "messages": [{
             "role": "user",
             "content": [
@@ -3404,7 +3430,10 @@ _NEARBY_INTENT_RE = re.compile(
 # _NEARBY_INTENT_RE above rather than a full intent classifier.
 _FINANCE_INTENT_RE = re.compile(
     r"\bspending\b|\bspent\b|\bexpenses?\b|\bpurchas(?:e|ing|es)\b|\bwhere.*money.*go\b|"
-    r"\bhow\s+much.*(?:spend|spent)\b|\btransactions?\b",
+    r"\bhow\s+much.*(?:spend|spent)\b|\btransactions?\b|"
+    # "what did I spend today?" -- bare "spend" only as a money question, not
+    # "how should I spend my weekend".
+    r"\b(?:did|do|have|will)\s+i\s+spend\b|\bspend\s+(?:on|today|yesterday|this|last)\b",
     re.IGNORECASE,
 )
 
@@ -6588,7 +6617,22 @@ def load_chat_context(cur, user_id, conversation_id):
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+def _strip_nul(value):
+    """Postgres TEXT/JSONB can't hold NUL (0x00) -- confirmed live that the
+    model occasionally emits one, and the INSERT then failed the whole
+    request ("A string literal cannot contain NUL"). Drops it from strings,
+    recursively through lists/dicts."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    return value
+
+
 def append_chat_messages(cur, user_id, conversation_id, prompt, reply, reply_meta=None):
+    prompt, reply, reply_meta = _strip_nul(prompt), _strip_nul(reply), _strip_nul(reply_meta)
     if reply_meta:
         # Only this branch touches the reply_meta column -- every ordinary
         # reply keeps using the exact INSERT below.
@@ -6998,9 +7042,10 @@ def chat_global():
     # appear there) -- matched_friend below covers real friendships instead,
     # which is what unlocks the direct-message content further down.
     cur.execute("SELECT id, name FROM speaker_profiles WHERE user_id = %s", (user_id,))
+    speaker_rows = cur.fetchall()
     matched = None
     prompt_lower = prompt.lower()
-    for p in cur.fetchall():
+    for p in speaker_rows:
         if re.search(r"\b" + re.escape(p["name"].lower()) + r"\b", prompt_lower):
             matched = p
             break
@@ -7010,11 +7055,63 @@ def chat_global():
         "JOIN users u ON u.id = f.friend_id WHERE f.user_id = %s",
         (user_id,),
     )
+    friend_rows = cur.fetchall()
     matched_friend = None
-    for f in cur.fetchall():
+    for f in friend_rows:
         if re.search(r"\b" + re.escape(f["name"].lower()) + r"\b", prompt_lower):
             matched_friend = f
             break
+
+    # Prior exchanges in this thread, read back from the DB -- same
+    # follow-up-resolution role load_chat_context plays for /chat. Read here
+    # (not just before the final call) because the resolver below needs it.
+    history = load_global_chat_context(cur, user_id)
+    # Everything older than that window, kept as a running summary
+    # (chat_summary.py) -- '' when off or nothing has scrolled out yet.
+    thread_summary = chat_summary.load(cur, db, user_id) if chat_summary.enabled() else ""
+
+    # Resolver (chat_followup.py): for a follow-up, a small model rewrites the
+    # message into a standalone question; names and the spending topic are
+    # then also looked for in that rewrite. Fetch decisions only -- the user's
+    # own words are still what gets saved and answered.
+    resolved = None
+    if chat_followup.resolver_enabled() and chat_followup.needs_resolution(prompt, history):
+        known_people = [r["name"] for r in speaker_rows] + [r["name"] for r in friend_rows]
+        resolved = chat_followup.resolve_with_llm(history, prompt, known_people, thread_summary=thread_summary)
+    if resolved:
+        resolved_lower = resolved["standalone"].lower()
+        hinted = {n.lower() for n in resolved["people"]}
+
+        def _named(rows):
+            return next((r for r in rows if r["name"].lower() in hinted
+                         or re.search(r"\b" + re.escape(r["name"].lower()) + r"\b", resolved_lower)), None)
+
+        matched = matched or _named(speaker_rows)
+        matched_friend = matched_friend or _named(friend_rows)
+
+    # Follow-ups that don't name anyone ("and what did he say?") pick up the
+    # person/spending topic the previous turn was about -- see
+    # chat_followup.py. Carried ids are only used if they're still among this
+    # user's own rows above.
+    followup_on = chat_followup.enabled()
+    followup_state = cache_get_json(chat_followup.state_key(user_id)) if followup_on else None
+    carried = {}
+    if followup_state:
+        try:
+            from mail_common import mentions_mail as _mentions_mail_fu
+            mail_fresh = _mentions_mail_fu(prompt_lower)
+        except Exception:
+            mail_fresh = False
+        carried = chat_followup.resolve(
+            prompt, followup_state,
+            named_person_found=bool(matched or matched_friend),
+            fresh_topic_found=bool(_FINANCE_INTENT_RE.search(prompt_lower) or _NEARBY_INTENT_RE.search(prompt_lower)
+                                   or _detect_nearby_category(prompt_lower) or mail_fresh),
+        )
+        if carried.get("speaker"):
+            matched = next((p for p in speaker_rows if p["id"] == carried["speaker"]["id"]), None)
+        if carried.get("friend"):
+            matched_friend = next((f for f in friend_rows if f["id"] == carried["friend"]["id"]), None)
 
     remember_ei_recent_statement(user_id, prompt)
 
@@ -7166,7 +7263,8 @@ def chat_global():
     # purchasing habits this month". Cheap (one indexed GROUP BY), so just
     # gated on the intent regex, no flag needed.
     finance_context = ""
-    if _FINANCE_INTENT_RE.search(prompt_lower):
+    if (_FINANCE_INTENT_RE.search(prompt_lower) or carried.get("finance")
+            or (resolved and ("spending" in resolved["topics"] or _FINANCE_INTENT_RE.search(resolved_lower)))):
         # Local time (the server runs in the users' timezone), not UTC --
         # "this month"/"today" must flip at local midnight.
         now_local = datetime.now().astimezone()
@@ -7260,10 +7358,6 @@ def chat_global():
         when = c["created_at"].strftime("%A, %Y-%m-%d %H:%M") if isinstance(c["created_at"], datetime) else str(c["created_at"])
         blocks.append(f"[{when} - {c['title'] or 'Untitled'} ({c['category']})]\n{excerpt}")
 
-    # Prior exchanges in this thread, read back from the DB -- same
-    # follow-up-resolution role load_chat_context plays for /chat.
-    history = load_global_chat_context(cur, user_id)
-
     # Built up rather than defaulting to the "(No saved conversation
     # transcripts available.)" placeholder up front -- that literal string,
     # sitting right next to real data from personal_notes/direct_messages/
@@ -7290,6 +7384,8 @@ def chat_global():
     if not transcripts_section:
         transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
+    if resolved and resolved["standalone"].strip().lower() != prompt.strip().lower():
+        user_content += f"\n\n(In the context of this chat, this most likely means: {resolved['standalone']})"
     if finance_context:
         # Confirmed live: with the same question already answered earlier in
         # the thread, the model repeated that old total without any tool
@@ -7308,6 +7404,9 @@ def chat_global():
         global_chat_system_prompt += _mail_prompt_note(cur, user_id)
     except Exception:
         pass  # optional and additive
+    if followup_on:
+        global_chat_system_prompt += chat_followup.PROMPT_NOTE
+    global_chat_system_prompt += chat_summary.prompt_block(thread_summary)
     if ei_context:
         global_chat_system_prompt = f"{global_chat_system_prompt}\n\n{ei_context}"
     messages = [{"role": "system", "content": global_chat_system_prompt}]
@@ -7339,6 +7438,12 @@ def chat_global():
     # every one of them needs its own card, not just whichever ran last.
     action_cards = ([action_card] if action_card else []) + tool_action_cards
 
+    # How the resolver read a follow-up, shown as a small "Understood as"
+    # line under the reply (both clients) so a wrong reading is easy to
+    # spot. Saved in reply_meta, so it survives a reload of the thread.
+    if resolved and resolved["standalone"].strip().lower() != prompt.strip().lower():
+        reply_meta = {**(reply_meta or {}), "understood_as": resolved["standalone"]}
+
     # Deterministic backstop, not just a prompt instruction -- confirmed
     # live that telling the model not to fabricate drafted content (and
     # even giving it get_latest_draft, a real tool to fetch the ground
@@ -7368,6 +7473,17 @@ def chat_global():
         # every turn already, so saving it too would duplicate it forever.
         append_chat_messages(cur, user_id, None, prompt, reply, reply_meta=reply_meta)
         db.commit()
+        if followup_on:
+            cache_set_json(
+                chat_followup.state_key(user_id),
+                chat_followup.next_state(followup_state, matched, matched_friend, bool(finance_context)),
+                ttl=chat_followup.STATE_TTL_SECONDS,
+            )
+        if chat_summary.enabled():
+            # Background: folds whatever just scrolled out of the history
+            # window into the running summary; the reply never waits on it.
+            _spawn_background(chat_summary.update, get_raw_connection, release_raw_connection,
+                              user_id, CHAT_HISTORY_MAX_TURNS * 2)
 
     try:
         from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction

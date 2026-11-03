@@ -43,6 +43,10 @@
   margin-bottom: 4px;
 }
 .mail-activity.error { color: var(--mail-danger); }
+/* "Understood as: …" -- how a follow-up question was read. Quieter than
+   the activity lines: it's a check for the reader, not an action. */
+.reply-understood { align-items: flex-start; font-style: italic; }
+.reply-understood q { font-style: normal; color: var(--mail-text); }
 .mail-activity-action {
   margin-left: 4px;
   font-weight: 600;

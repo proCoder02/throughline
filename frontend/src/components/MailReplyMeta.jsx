@@ -65,11 +65,20 @@ export default function MailReplyMeta({ meta }) {
   if (!meta) return null;
   const activity = meta.tool_activity || [];
   const sources = meta.mail_sources || [];
-  if (!activity.length && !sources.length) return null;
+  // How a follow-up ("and what did he say?") was read -- set by the server's
+  // follow-up resolver only when it rewrote the question.
+  const understood = typeof meta.understood_as === 'string' ? meta.understood_as.trim() : '';
+  if (!activity.length && !sources.length && !understood) return null;
   const shown = expanded ? sources : sources.slice(0, VISIBLE_SOURCES);
 
   return (
     <div className="mail-ui mail-reply-meta">
+      {understood && (
+        <div className="mail-activity reply-understood" title="How I read your follow-up">
+          <span aria-hidden="true">↪</span>
+          <span>Understood as: <q>{understood}</q></span>
+        </div>
+      )}
       {activity.map((a, i) => (
         <div key={i} className={'mail-activity' + (a.error ? ' error' : '')}>
           <span aria-hidden="true">{a.error ? '⚠️' : a.icon === 'spending' ? '📊' : '📧'}</span>

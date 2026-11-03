@@ -3,6 +3,7 @@ import { apiJson, post, postForm } from '../../api.js';
 import { showToast } from '../../lib/notify.js';
 import { maybeGetLocation } from '../../lib/location.js';
 import { useMailStatus, pendingReplyLabel } from '../../lib/mail.js';
+import { FOLLOWUP_PENDING_LABEL, looksLikeFollowUp } from '../../lib/followup.js';
 import FormattedText from '../FormattedText.jsx';
 import ActionCard from '../ActionCard.jsx';
 import MailReplyMeta from '../MailReplyMeta.jsx';
@@ -119,6 +120,15 @@ const UserTurn = memo(function UserTurn({ message }) {
 // reader scrolls up.
 const HISTORY_PAGE = 50;
 const LOAD_OLDER_PX = 300;
+// Mail questions keep "Checking your inbox…"; a follow-up in a thread with
+// earlier replies says it's looking back, since it waits a little longer.
+function pendingLabelFor(mailStatus, text, messages) {
+  const label = pendingReplyLabel(mailStatus, text);
+  if (label !== 'Thinking…') return label;
+  const hasEarlierReplies = (messages || []).some((m) => m.role === 'assistant' && !m.error);
+  return looksLikeFollowUp(text, hasEarlierReplies) ? FOLLOWUP_PENDING_LABEL : label;
+}
+
 const fromRow = (r) => withId({ role: r.role, content: r.content, replyMeta: r.reply_meta, createdAt: r.created_at });
 // An older backend ignores ?limit and returns the whole list -- treat that as one complete page.
 const asPage = (data) => (Array.isArray(data) ? { messages: data, start: 0 } : data);
@@ -471,7 +481,7 @@ export default function AssistantChat({ title = 'Ask Throughline', subtitle, use
               <div className="ac-avatar is-thinking" aria-hidden="true"><SparkleIcon /></div>
               <div className="ac-thinking">
                 <span className="ac-dots" aria-hidden="true"><i /><i /><i /></span>
-                {pendingReplyLabel(mailStatus, pendingText)}
+                {pendingLabelFor(mailStatus, pendingText, messages)}
               </div>
             </div>
           )}
