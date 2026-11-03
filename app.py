@@ -5806,6 +5806,26 @@ def list_direct_messages(friend_id):
     return jsonify(messages)
 
 
+_dm_client_id_ready = False
+_dm_client_id_lock = threading.Lock()
+
+
+def _ensure_dm_client_id_column(cur, db):
+    """Lazy, idempotent: direct_messages.client_id + its per-sender unique
+    index (see send_direct_message). Same pattern as meet/schema.py."""
+    global _dm_client_id_ready
+    if _dm_client_id_ready:
+        return
+    with _dm_client_id_lock:
+        if _dm_client_id_ready:
+            return
+        cur.execute("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS client_id TEXT")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_messages_sender_client "
+                    "ON direct_messages (sender_id, client_id) WHERE client_id IS NOT NULL")
+        db.commit()
+        _dm_client_id_ready = True
+
+
 @app.route("/friends/<int:friend_id>/messages", methods=["POST"])
 @login_required
 def send_direct_message(friend_id):
@@ -5827,6 +5847,12 @@ def send_direct_message(friend_id):
     if thumbnail_data_url and len(thumbnail_data_url) > 60_000:
         return jsonify({"error": "thumbnail_data_url is too large"}), 400
 
+    # Idempotency key from the client (the web outbox's localId): a retry of
+    # a send that actually reached the server returns the original row
+    # instead of storing -- and pushing -- the message a second time.
+    # Confirmed live: messages arrived twice at the recipient.
+    client_id = (data.get("client_id") or "").strip()[:64] or None
+
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
@@ -5834,14 +5860,31 @@ def send_direct_message(friend_id):
     if not cur.fetchone():
         return jsonify({"error": "Not friends with that user"}), 403
 
-    cur.execute(
-        "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, thumbnail_data_url) "
-        "VALUES (%s, %s, %s, %s, %s, %s) "
-        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
-        "attachment_url, attachment_type, thumbnail_data_url",
-        (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url),
-    )
-    message = serialize_row(cur.fetchone())
+    columns = ("id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
+               "attachment_url, attachment_type, thumbnail_data_url")
+    if client_id:
+        _ensure_dm_client_id_column(cur, db)
+        cur.execute(
+            "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, "
+            "thumbnail_data_url, client_id) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (sender_id, client_id) WHERE client_id IS NOT NULL DO NOTHING "
+            f"RETURNING {columns}",
+            (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url, client_id),
+        )
+        row = cur.fetchone()
+        if row is None:  # already stored by an earlier attempt -- hand that back, no second push
+            db.commit()
+            cur.execute(f"SELECT {columns} FROM direct_messages WHERE sender_id = %s AND client_id = %s",
+                        (user_id, client_id))
+            return jsonify(serialize_row(cur.fetchone()))
+    else:
+        cur.execute(
+            "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, thumbnail_data_url) "
+            f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {columns}",
+            (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url),
+        )
+        row = cur.fetchone()
+    message = serialize_row(row)
     db.commit()
 
     # Cognitive Sharing attachment summary -- only for a real document (not
