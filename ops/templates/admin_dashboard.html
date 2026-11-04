@@ -5,13 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Throughline Ops</title>
 <script>
-  // Set the theme attribute before first paint, same reasoning as the
-  // main app's useTheme.js -- otherwise the page flashes the wrong theme
-  // for a frame on load. Own localStorage key (not the main app's "theme")
-  // since this is a separate audience/credential -- picking a theme here
-  // shouldn't silently change the consumer app's theme too.
+  // Theme before first paint (no flash); own key so it never changes the
+  // consumer app's theme.
   (function () {
-    var saved = localStorage.getItem('admin_theme');
+    var saved = null;
+    try { saved = localStorage.getItem('admin_theme'); } catch (e) {}
     var theme = saved === 'light' || saved === 'dark' ? saved
       : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     document.documentElement.dataset.theme = theme;
@@ -19,927 +17,1010 @@
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  /* Same design tokens as frontend/src/theme.css -- kept in sync by value,
-     not by sharing the file, since this is a plain server-rendered page
-     with no build step. Dark is the bare :root default, same as the main
-     app; [data-theme="light"] overrides every color token. Only the
-     subset this page actually uses is reproduced here. */
+  /* Layout and reading order follow ops-dashboard practice: overall verdict
+     first, then what needs attention, then the detail -- worst first in
+     every list. Status is never colour alone (icon + word too). Nothing
+     re-animates on the 30s refresh, and expanded rows survive it. Tokens
+     are the main app's (frontend/src/theme.css), kept in sync by value. */
   :root {
-    --wa-bg-app: #313338;
-    --wa-panel: #2b2d31;
-    --wa-hover: #35373c;
-    --wa-border: #1f2023;
-    --wa-text: #f2f3f5;
-    --wa-text-soft: #a0a2a7;
-    --wa-accent: #1FC8B4;
-    --wa-accent-dark: #16A192;
-    --wa-accent-solid: #128176;
-    --wa-accent-solid-hover: #107066;
-    --wa-danger: #da373c;
-    --wa-online: #23a55a;
-    --wa-warn-bg: #3d3720;
-    --wa-warn-text: #f2d585;
+    --bg: #1e1f22;
+    --panel: #2b2d31;
+    --panel-2: #313338;
+    --hover: #35373c;
+    --border: #3a3c42;
+    --border-soft: #2f3136;
+    --text: #f2f3f5;
+    --text-soft: #b5b7bc;
+    --text-faint: #8a8d93;
+    --accent: #1FC8B4;
+    --accent-solid: #128176;
 
-    --pill-ok-bg: rgba(35,165,90,0.18); --pill-ok-text: #4fd189;
-    --pill-warn-bg: rgba(242,213,133,0.18); --pill-warn-text: #f2d585;
-    --pill-bad-bg: rgba(218,55,60,0.18); --pill-bad-text: #f3787c;
+    --ok: #3ccf7f;      --ok-bg: rgba(60,207,127,0.14);
+    --warn: #f0c35b;    --warn-bg: rgba(240,195,91,0.14);
+    --crit: #f2686c;    --crit-bg: rgba(242,104,108,0.15);
+    --paused: #7ec8e3;  --paused-bg: rgba(126,200,227,0.15);
+    --info: #9aa4ff;
 
-    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
-    --space-5: 20px; --space-6: 24px;
-
-    --radius-xs: 4px; --radius-sm: 6px; --radius-md: 8px; --radius-lg: 10px; --radius-pill: 999px; --radius-round: 50%;
-
-    --text-xs: 12px; --text-sm: 13px; --text-base: 14px; --text-md: 15px; --text-lg: 16px; --text-xl: 18px; --text-2xl: 20px;
-
-    --duration-fast: 120ms; --duration-base: 180ms; --duration-slow: 240ms;
-    --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); --ease-out: cubic-bezier(0, 0, 0.2, 1);
-
-    --shadow-sm: 0 2px 8px rgba(0,0,0,0.28);
-    --shadow-md: 0 4px 14px rgba(0,0,0,0.32);
+    --radius-sm: 6px; --radius-md: 10px; --radius-pill: 999px;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3);
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    color-scheme: dark;
   }
   :root[data-theme="light"] {
-    --wa-bg-app: #ffffff;
-    --wa-panel: #f2f3f5;
-    --wa-hover: #e3e5e8;
-    --wa-border: #e3e4e8;
-    --wa-text: #060607;
-    --wa-text-soft: #5c5e66;
-    --wa-accent: #0F9C8C;
-    --wa-accent-dark: #0C7E72;
-    --wa-accent-solid: #0e816f;
-    --wa-accent-solid-hover: #0c6e5f;
-    --wa-danger: #da373c;
-    --wa-online: #1f8a4c;
-    --wa-warn-bg: #FFF3CD;
-    --wa-warn-text: #7A5B00;
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --panel-2: #f7f8fa;
+    --hover: #eef0f3;
+    --border: #dfe2e7;
+    --border-soft: #eceef1;
+    --text: #15171a;
+    --text-soft: #4f535b;
+    --text-faint: #6f737b;
+    --accent: #0F9C8C;
+    --accent-solid: #0e816f;
 
-    --pill-ok-bg: rgba(31,138,76,0.14); --pill-ok-text: #1f8a4c;
-    --pill-warn-bg: rgba(122,91,0,0.14); --pill-warn-text: #7A5B00;
-    --pill-bad-bg: rgba(218,55,60,0.12); --pill-bad-text: #b7282c;
-
-    --shadow-sm: 0 2px 8px rgba(20,20,30,0.08);
-    --shadow-md: 0 4px 14px rgba(20,20,30,0.10);
+    --ok: #1b7f47;      --ok-bg: rgba(27,127,71,0.10);
+    --warn: #8a6200;    --warn-bg: rgba(186,134,0,0.12);
+    --crit: #b4232a;    --crit-bg: rgba(180,35,42,0.09);
+    --paused: #1d6d8c;  --paused-bg: rgba(29,109,140,0.10);
+    --info: #4450c8;
+    --shadow: 0 1px 2px rgba(20,20,30,0.06);
+    color-scheme: light;
   }
   * { box-sizing: border-box; }
-  html, body { height: 100%; }
+  html { scroll-behavior: smooth; scroll-padding-top: 80px; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
   body {
-    margin: 0; background: var(--wa-bg-app); color: var(--wa-text);
-    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  body, .card, .btn-secondary, a.logout, .theme-toggle, .nav-item {
-    transition: background-color var(--duration-slow) var(--ease-standard),
-                color var(--duration-slow) var(--ease-standard),
-                border-color var(--duration-slow) var(--ease-standard);
+  .num, td, .kpi-value, .meta, time { font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  /* ---------- shell ---------- */
+  .shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100vh; }
+  .sidebar {
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    background: var(--panel); border-right: 1px solid var(--border-soft); padding: 18px 0;
   }
-
-  /* ---------- Left nav drawer -- same shape as the main app's icon-rail/
-     app-shell (frontend/src/theme.css): a fixed-width panel pinned to the
-     left, sections grouped by a small uppercase label, one highlighted
-     active item. "Jobs" is this same page (the only internal screen so
-     far); Grafana/CostLens are external tools, opened in a new tab so the
-     ops session here stays open. ---------- */
-  .app-shell { display: flex; min-height: 100%; }
-  .sidebar { width: 220px; flex-shrink: 0; background: var(--wa-panel); border-right: 1px solid var(--wa-border); padding: var(--space-4) 0; }
-  .sidebar-brand { font-size: var(--text-lg); font-weight: 800; padding: 0 var(--space-4) var(--space-4); }
-  /* Parent category (Infra/Finance) is itself a clickable tree-collapse
-     toggle, not just a label -- the chevron rotates to reflect state,
-     persisted in localStorage so a collapsed section stays collapsed
-     across reloads. */
-  .nav-parent {
-    width: 100%; display: flex; align-items: center; gap: var(--space-2); text-align: left;
-    background: none; border: 0; font-family: inherit; cursor: pointer;
-    font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); font-weight: 700;
-    padding: var(--space-4) var(--space-4) var(--space-1);
+  .brand { display: flex; align-items: center; gap: 10px; padding: 0 18px 18px; font-weight: 800; font-size: 15px; }
+  .brand-mark { width: 26px; height: 26px; border-radius: 7px; background: var(--accent-solid); display: grid; place-items: center; color: #fff; font-size: 13px; }
+  .nav-label { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); padding: 14px 18px 6px; }
+  .nav a, .nav span.disabled {
+    display: flex; align-items: center; gap: 8px; padding: 7px 18px; font-size: 13px; font-weight: 500;
+    color: var(--text-soft); text-decoration: none; border-left: 2px solid transparent;
   }
-  .nav-parent:hover { color: var(--wa-text); }
-  .nav-chevron { display: inline-block; font-size: 9px; transition: transform var(--duration-base) var(--ease-standard); }
-  .nav-chevron.collapsed { transform: rotate(-90deg); }
-  .nav-children { display: flex; flex-direction: column; overflow: hidden; }
-  .nav-children.collapsed { display: none; }
-  .nav-item {
-    display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4);
-    color: var(--wa-text-soft); text-decoration: none; font-size: var(--text-sm); font-weight: 500;
-    border-right: 2px solid transparent;
+  .nav a:hover { background: var(--hover); color: var(--text); }
+  .nav a.active { color: var(--text); border-left-color: var(--accent); background: var(--hover); }
+  .nav span.disabled { opacity: .5; cursor: not-allowed; }
+  .nav .count { margin-left: auto; font-size: 11px; font-weight: 700; min-width: 18px; text-align: center; padding: 0 6px; border-radius: var(--radius-pill); }
+  .nav .count.crit { background: var(--crit-bg); color: var(--crit); }
+  .nav .count.warn { background: var(--warn-bg); color: var(--warn); }
+  .ext { margin-left: auto; font-size: 11px; opacity: .7; }
+
+  .main { min-width: 0; }
+  .topbar {
+    position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px); border-bottom: 1px solid var(--border-soft);
+    display: flex; align-items: center; gap: 12px; padding: 12px 28px; flex-wrap: wrap;
   }
-  .nav-item:hover { background: var(--wa-hover); color: var(--wa-text); }
-  .nav-item.active { background: color-mix(in srgb, var(--wa-accent) 16%, var(--wa-panel)); color: var(--wa-accent); border-right-color: var(--wa-accent); }
-  .nav-item.disabled { color: var(--wa-text-soft); opacity: 0.45; cursor: default; }
-  .nav-item.disabled:hover { background: none; color: var(--wa-text-soft); }
-  .nav-item-ext { margin-left: auto; font-size: 11px; opacity: 0.7; }
-
-  .main-content { flex: 1; min-width: 0; padding: var(--space-6) var(--space-4) 60px; }
-  .wrap { max-width: 980px; margin: 0 auto; }
-  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-6); flex-wrap: wrap; gap: var(--space-3); }
-  h1 { font-size: var(--text-2xl); margin: 0; font-weight: 700; }
-  .meta { font-size: var(--text-xs); color: var(--wa-text-soft); }
-  a.logout { color: var(--wa-text-soft); font-size: var(--text-sm); text-decoration: none; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); }
-  a.logout:hover { background: var(--wa-hover); color: var(--wa-text); }
-
-  .theme-toggle {
-    width: 36px; height: 36px; border-radius: var(--radius-round);
-    border: 1px solid var(--wa-border); background: var(--wa-panel); color: var(--wa-text-soft);
-    display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer;
+  .topbar h1 { font-size: 17px; margin: 0; font-weight: 700; }
+  .env { font-size: 11px; font-weight: 700; letter-spacing: .05em; padding: 2px 8px; border-radius: var(--radius-pill); background: var(--crit-bg); color: var(--crit); }
+  .spacer { flex: 1; }
+  .freshness { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-soft); }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-bg); }
+  .live-dot.paused { background: var(--text-faint); box-shadow: none; }
+  .live-dot.stale { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-bg); }
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
+    border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--panel);
+    font-size: 13px; font-weight: 600; cursor: pointer; color: var(--text); text-decoration: none;
   }
-  .theme-toggle:hover { background: var(--wa-hover); }
+  .btn:hover { background: var(--hover); }
+  .btn:disabled { opacity: .55; cursor: default; }
+  .btn.icon { width: 32px; padding: 0; justify-content: center; }
+  .btn.small { height: 28px; font-size: 12px; padding: 0 10px; }
+  .btn.danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--border)); }
+  .btn.danger:hover { background: var(--crit-bg); }
+  .btn.primary { background: var(--accent-solid); border-color: var(--accent-solid); color: #fff; }
 
-  .btn-secondary {
-    background: var(--wa-hover); color: var(--wa-text); border: 0; font-family: inherit;
-    font-size: var(--text-sm); font-weight: 500; padding: var(--space-2) var(--space-4); border-radius: var(--radius-sm); cursor: pointer;
+  .content { padding: 22px 28px 64px; max-width: 1280px; }
+  .banner { display: none; align-items: center; gap: 10px; padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 16px; font-size: 13px; font-weight: 500; }
+  .banner.show { display: flex; }
+  .banner.crit { background: var(--crit-bg); color: var(--crit); }
+
+  section.block { margin-bottom: 30px; }
+  .block-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .block-head h2 { font-size: 15px; font-weight: 700; margin: 0; }
+  .block-head .sub { font-size: 12.5px; color: var(--text-faint); }
+  .block-head .tools { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  .panel { background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius-md); box-shadow: var(--shadow); }
+
+  /* ---------- status vocabulary ---------- */
+  .st { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+  .st-ico { width: 18px; height: 18px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 11px; font-weight: 800; flex-shrink: 0; }
+  .st.crit { color: var(--crit); }  .st.crit .st-ico { background: var(--crit-bg); }
+  .st.warn { color: var(--warn); }  .st.warn .st-ico { background: var(--warn-bg); }
+  .st.ok { color: var(--ok); }      .st.ok .st-ico { background: var(--ok-bg); }
+  .st.paused { color: var(--paused); } .st.paused .st-ico { background: var(--paused-bg); }
+  .st.none { color: var(--text-faint); } .st.none .st-ico { background: var(--hover); }
+
+  /* ---------- overall verdict + attention ---------- */
+  .verdict { display: flex; align-items: center; gap: 16px; padding: 16px 18px; }
+  .verdict-ico { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; font-size: 20px; font-weight: 800; flex-shrink: 0; }
+  .verdict.ok .verdict-ico { background: var(--ok-bg); color: var(--ok); }
+  .verdict.warn .verdict-ico { background: var(--warn-bg); color: var(--warn); }
+  .verdict.crit .verdict-ico { background: var(--crit-bg); color: var(--crit); }
+  .verdict-title { font-size: 16px; font-weight: 700; }
+  .verdict-sub { font-size: 13px; color: var(--text-soft); margin-top: 2px; }
+  .verdict-counts { margin-left: auto; display: flex; gap: 18px; }
+  .vc { text-align: right; }
+  .vc b { display: block; font-size: 20px; line-height: 1.1; }
+  .vc span { font-size: 11.5px; color: var(--text-faint); }
+  .vc.crit b { color: var(--crit); } .vc.warn b { color: var(--warn); } .vc.ok b { color: var(--ok); }
+
+  .attention { border-top: 1px solid var(--border-soft); }
+  .att-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 11px 18px; border-top: 1px solid var(--border-soft); }
+  .att-item:first-child { border-top: none; }
+  .att-name { font-weight: 600; font-size: 13.5px; }
+  .att-area { font-size: 11.5px; color: var(--text-faint); margin-left: 6px; font-weight: 500; }
+  .att-msg { font-size: 13px; color: var(--text-soft); margin-top: 2px; overflow-wrap: anywhere; }
+  .att-go { font-size: 12.5px; font-weight: 600; text-decoration: none; white-space: nowrap; }
+
+  /* ---------- KPI strip ---------- */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .kpi { padding: 12px 14px; }
+  .kpi-label { font-size: 12px; color: var(--text-faint); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .kpi-value { font-size: 22px; font-weight: 700; margin-top: 4px; line-height: 1.15; }
+  .kpi-value small { font-size: 13px; color: var(--text-faint); font-weight: 600; }
+  .kpi-foot { font-size: 12px; color: var(--text-soft); margin-top: 2px; }
+  .kpi.crit .kpi-value { color: var(--crit); } .kpi.warn .kpi-value { color: var(--warn); }
+  .meter { height: 5px; border-radius: 3px; background: var(--hover); margin-top: 8px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  .meter.warn > i { background: var(--warn); } .meter.crit > i { background: var(--crit); }
+
+  /* ---------- tables ---------- */
+  .tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .tbl th {
+    text-align: left; font-size: 11.5px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+    color: var(--text-faint); padding: 10px 14px; border-bottom: 1px solid var(--border-soft); white-space: nowrap;
   }
-  .btn-secondary:hover { filter: brightness(1.1); }
-  .btn-secondary:disabled { opacity: 0.6; cursor: default; }
+  .tbl td { padding: 10px 14px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl .r { text-align: right; }
+  .tbl .group-row td { background: var(--panel-2); font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--text-faint); padding: 7px 14px; }
+  .job-row { cursor: pointer; }
+  .job-row:hover td { background: var(--hover); }
+  .job-row.open td { background: var(--hover); border-bottom-color: transparent; }
+  .job-name { font-weight: 600; }
+  .job-id { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); }
+  .muted { color: var(--text-faint); }
+  .chev { display: inline-block; width: 14px; color: var(--text-faint); transition: transform .15s; }
+  .open .chev { transform: rotate(90deg); }
+  .badge { font-size: 10.5px; font-weight: 700; letter-spacing: .03em; padding: 1px 7px; border-radius: var(--radius-pill); margin-left: 6px; vertical-align: 1px; }
+  .badge.running { background: var(--ok-bg); color: var(--ok); }
+  .badge.custom { background: var(--hover); color: var(--text-soft); }
+  .hist { display: inline-flex; gap: 3px; }
+  .hist i { width: 7px; height: 16px; border-radius: 2px; background: var(--hover); display: inline-block; }
+  .hist i.ok { background: var(--ok); } .hist i.warn { background: var(--warn); } .hist i.crit { background: var(--crit); }
 
-  section { margin-bottom: var(--space-6); }
-  h2 { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--wa-text-soft); margin: 0 0 var(--space-3); font-weight: 700; }
+  .detail-row td { padding: 0 14px 14px; background: var(--hover); }
+  .detail { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; padding: 12px 14px; background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+  .problem { color: var(--crit); font-weight: 600; font-size: 13px; margin-bottom: 8px; overflow-wrap: anywhere; }
+  .problem.warn { color: var(--warn); }
+  .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--text-faint); }
+  .kv dd { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+  .detail-side { display: flex; flex-direction: column; gap: 10px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .note { font-size: 12px; color: var(--text-faint); }
+  .logbox { display: flex; align-items: center; gap: 6px; }
+  .logbox code { flex: 1; min-width: 0; font-family: var(--mono); font-size: 11.5px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--panel-2); border: 1px solid var(--border-soft); overflow-x: auto; white-space: nowrap; }
 
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-3); }
+  .filters { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+  .filters button { border: 0; background: var(--panel); padding: 0 11px; height: 30px; font-size: 12.5px; font-weight: 600; cursor: pointer; color: var(--text-soft); }
+  .filters button + button { border-left: 1px solid var(--border); }
+  .filters button[aria-pressed="true"] { background: var(--hover); color: var(--text); }
+  .search { height: 30px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); padding: 0 10px; font-size: 13px; color: var(--text); width: 180px; }
 
-  @keyframes cardIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-  .card {
-    background: var(--wa-panel); border: 1px solid transparent; border-radius: var(--radius-md); padding: var(--space-4);
-    animation: cardIn var(--duration-slow) var(--ease-out) both;
+  .rate { display: flex; align-items: center; gap: 8px; }
+  .rate .meter { width: 70px; margin: 0; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .tile { padding: 12px 14px; }
+  .tile h3 { margin: 0 0 6px; font-size: 12px; color: var(--text-faint); font-weight: 600; }
+  .tile .big { font-size: 22px; font-weight: 700; }
+  .tile .line { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; color: var(--text-soft); padding: 2px 0; }
+  .tile .line b { color: var(--text); font-weight: 600; }
+  .tile.crit .big { color: var(--crit); } .tile.warn .big { color: var(--warn); }
+  .two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 14px; }
+
+  .empty { padding: 18px; color: var(--text-faint); font-size: 13px; }
+  .err-text { color: var(--crit); font-size: 13px; }
+
+  details.form-wrap > summary { cursor: pointer; font-weight: 600; font-size: 13px; padding: 12px 16px; list-style: none; display: flex; align-items: center; gap: 8px; }
+  details.form-wrap > summary::-webkit-details-marker { display: none; }
+  details.form-wrap[open] > summary .chev { transform: rotate(90deg); }
+  .form { padding: 0 16px 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .form label { display: block; font-size: 12px; font-weight: 600; color: var(--text-soft); margin-bottom: 4px; }
+  .form input, .form select { width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel-2); color: var(--text); font: inherit; font-size: 13px; }
+  .form .hint { font-size: 11.5px; color: var(--text-faint); margin-top: 3px; }
+  .form .full { grid-column: 1 / -1; display: flex; gap: 10px; align-items: center; }
+  .form-msg { font-size: 13px; }
+  .form-msg.error { color: var(--crit); } .form-msg.ok { color: var(--ok); }
+
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 14px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 20; }
+  .toast.show { opacity: 1; }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    .sidebar { position: static; height: auto; display: flex; flex-wrap: wrap; align-items: center; padding: 10px 16px; gap: 2px; border-right: 0; border-bottom: 1px solid var(--border-soft); }
+    .brand { padding: 0 12px 0 0; }
+    .nav-label { display: none; }
+    .nav { display: contents; }
+    .nav a, .nav span.disabled { padding: 6px 10px; border-left: 0; border-radius: var(--radius-sm); }
+    .topbar { padding: 10px 16px; }
+    .content { padding: 16px 16px 48px; }
+    .detail { grid-template-columns: 1fr; }
+    .verdict { flex-wrap: wrap; }
+    .verdict-counts { margin-left: 0; width: 100%; justify-content: flex-start; }
+    .vc { text-align: left; }
   }
-  .card:hover { border-color: var(--wa-border); box-shadow: var(--shadow-sm); }
-  .card .title { font-size: var(--text-sm); color: var(--wa-text); font-weight: 600; margin-bottom: var(--space-2); display: flex; align-items: center; gap: var(--space-2); }
-
-  .dot { width: 8px; height: 8px; border-radius: var(--radius-round); display: inline-block; flex-shrink: 0; }
-  .dot.ok { background: var(--wa-online); }
-  .dot.warn { background: var(--wa-warn-text); }
-  .dot.bad { background: var(--wa-danger); }
-
-  .row { display: flex; justify-content: space-between; align-items: center; font-size: var(--text-sm); color: var(--wa-text-soft); padding: 3px 0; gap: var(--space-2); }
-  .row b { color: var(--wa-text); font-weight: 500; }
-
-  .bar-track { height: 6px; background: var(--wa-bg-app); border-radius: var(--radius-xs); overflow: hidden; margin-top: var(--space-2); }
-  .bar-fill { height: 100%; border-radius: var(--radius-xs); background: var(--wa-accent); transition: width var(--duration-slow) var(--ease-standard); }
-  .bar-fill.warn { background: var(--wa-warn-text); }
-  .bar-fill.bad { background: var(--wa-danger); }
-
-  table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
-  table th { text-align: left; color: var(--wa-text-soft); font-weight: 500; padding: var(--space-2); border-bottom: 1px solid var(--wa-border); }
-  table td { padding: var(--space-2); border-bottom: 1px solid var(--wa-border); color: var(--wa-text); }
-
-  .pill { font-size: var(--text-xs); padding: 2px var(--space-2); border-radius: var(--radius-pill); font-weight: 600; }
-  .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-text); }
-  .pill.warn { background: var(--pill-warn-bg); color: var(--pill-warn-text); }
-  .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-text); }
-
-  /* Job cards specifically -- an Autosys-style field list (schedule / last
-     run / run time / next run as clearly labeled rows) instead of the
-     generic metric-card shape used elsewhere on this page. */
-  .jobs-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-  .job-card .job-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
-  .job-card .job-name { font-size: var(--text-md); color: var(--wa-text); font-weight: 700; display: flex; align-items: center; gap: var(--space-2); }
-  .job-fields { display: flex; flex-direction: column; gap: 1px; }
-  .job-field { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); padding: 5px 0; border-bottom: 1px dashed var(--wa-border); }
-  .job-field:last-child { border-bottom: none; }
-  .job-field-label { font-size: var(--text-xs); color: var(--wa-text-soft); text-transform: uppercase; letter-spacing: 0.03em; flex-shrink: 0; }
-  .job-field-value { font-size: var(--text-sm); color: var(--wa-text); font-weight: 500; text-align: right; }
-  .job-field-value.muted { color: var(--wa-text-soft); font-weight: 400; }
-  .job-history { display: flex; align-items: center; justify-content: space-between; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--wa-border); }
-  .job-history-label { font-size: var(--text-xs); color: var(--wa-text-soft); }
-  .job-history-dots { display: flex; gap: 4px; }
-
-  /* Job control actions -- on ice/off ice/start/stop/restart, varying by
-     control_kind (see ops/jobs.py's JOB_CONTROL_KIND). Small, secondary-
-     looking buttons since these are occasional admin actions, not the
-     primary thing the card communicates. */
-  .job-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--wa-border); }
-  .job-action-btn {
-    font-family: inherit; font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: var(--radius-pill);
-    border: 1px solid var(--wa-border); background: var(--wa-bg-app); color: var(--wa-text-soft); cursor: pointer;
-  }
-  .job-action-btn:hover { background: var(--wa-hover); color: var(--wa-text); }
-  .job-action-btn:disabled { opacity: 0.4; cursor: default; }
-  .job-action-btn.ice { color: #7ec8e3; border-color: #7ec8e3; }
-  .job-action-btn.danger { color: var(--pill-bad-text); border-color: var(--pill-bad-text); }
-  .job-action-btn.danger:hover { background: var(--pill-bad-bg); }
-  .job-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.03em; padding: 2px 7px; border-radius: var(--radius-pill); }
-  .job-badge.ice { background: rgba(126,200,227,0.18); color: #7ec8e3; }
-  .job-badge.running { background: var(--pill-ok-bg); color: var(--pill-ok-text); }
-  .job-delete-btn { font-size: 11px; color: var(--wa-text-soft); background: none; border: none; cursor: pointer; margin-left: auto; }
-  .job-delete-btn:hover { color: var(--wa-danger); }
-
-  /* Custom job creation form */
-  .custom-job-form { display: flex; flex-direction: column; gap: var(--space-3); max-width: 480px; }
-  .custom-job-form label { font-size: var(--text-xs); color: var(--wa-text-soft); text-transform: uppercase; letter-spacing: 0.03em; display: block; margin-bottom: 4px; }
-  .custom-job-form input, .custom-job-form select {
-    width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--wa-border); border-radius: var(--radius-sm);
-    background: var(--wa-bg-app); color: var(--wa-text); font-size: var(--text-sm); font-family: inherit;
-  }
-  .custom-job-form input:focus, .custom-job-form select:focus { outline: none; border-color: var(--wa-accent); }
-  .custom-job-form-row { display: flex; gap: var(--space-3); }
-  .custom-job-form-row > div { flex: 1; }
-  .form-msg { font-size: var(--text-sm); margin-top: var(--space-2); }
-  .form-msg.error { color: var(--wa-danger); }
-  .form-msg.ok { color: var(--wa-online); }
-
-  /* Where to actually look when a card shows an error -- a file path for
-     ei_pipeline (it writes a real per-day log file), a journalctl filter
-     for everything else (no dedicated file exists; it only ever prints to
-     stdout, captured by journald under the throughline unit). */
-  .log-hint {
-    font-size: 11px; color: var(--wa-text-soft); font-family: "SF Mono", Menlo, Consolas, monospace;
-    background: var(--wa-bg-app); border: 1px solid var(--wa-border); border-radius: var(--radius-xs);
-    padding: 3px 6px; margin-top: var(--space-2); word-break: break-all;
-  }
-  .log-hint b { color: var(--wa-text-soft); font-family: inherit; font-weight: 600; }
-  .section-log-hint { margin: calc(-1 * var(--space-2)) 0 var(--space-3); }
-
-  .empty { color: var(--wa-text-soft); font-size: var(--text-sm); padding: var(--space-2) 0; }
-  .err { color: var(--wa-danger); font-size: var(--text-sm); }
-
-  @media (max-width: 720px) {
-    /* Sidebar becomes a horizontal top bar below this width -- a 220px
-       fixed rail has no room to coexist with content on a phone screen. */
-    .app-shell { flex-direction: column; }
-    .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--wa-border); display: flex; flex-wrap: wrap; align-items: center; padding: var(--space-3) var(--space-4); gap: var(--space-1); }
-    .sidebar-brand { padding: 0 var(--space-3) 0 0; }
-    .nav-parent { display: none; }
-    .nav-children, .nav-children.collapsed { display: flex; flex-direction: row; }
-    .nav-item { padding: var(--space-2) var(--space-3); border-right: none; border-radius: var(--radius-sm); }
-    .nav-item.active { border-right: none; }
+  @media (max-width: 680px) {
+    /* Tables become stacked rows: label from data-label. */
+    .tbl.stack, .tbl.stack tbody { display: block; width: 100%; }
+    .tbl.stack thead { display: none; }
+    .tbl.stack tr { display: block; border-bottom: 1px solid var(--border-soft); padding: 8px 0; }
+    .tbl.stack td { display: flex; justify-content: space-between; align-items: center; gap: 12px; border: 0; padding: 4px 14px; text-align: right; overflow-wrap: anywhere; }
+    .tbl.stack td > * { min-width: 0; }
+    .tbl.stack td.lead .job-id { margin-left: 18px; }
+    .tbl.stack td[data-label="Last error"] { max-width: none !important; }
+    .topbar .freshness { order: 10; width: 100%; }
+    .verdict-sub { overflow-wrap: anywhere; }
+    .kpis, .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .tbl.stack td::before { content: attr(data-label); color: var(--text-faint); font-size: 12px; text-align: left; flex-shrink: 0; }
+    .tbl.stack .group-row td { text-align: left; }
+    .tbl.stack td.phone-hide { display: none; }
+    .tbl.stack td.lead { display: block; text-align: left; }
+    .tbl.stack td.lead::before { content: none; }
+    .tbl.stack .group-row td { display: block; }
+    .tbl.stack .group-row td::before, .tbl.stack .detail-row td::before { content: none; }
+    .tbl.stack .detail-row td { display: block; }
+    .search { width: 100%; }
+    .block-head .tools { margin-left: 0; width: 100%; }
   }
 </style>
 </head>
 <body>
-<div class="app-shell">
-  <nav class="sidebar">
-    <div class="sidebar-brand">Throughline Ops</div>
-
-    <button class="nav-parent" onclick="toggleNavGroup('infra')" aria-expanded="true">
-      <span class="nav-chevron" id="chevron-infra">▾</span><span>Infra</span>
-    </button>
-    <div class="nav-children" id="children-infra">
-      <a class="nav-item active" href="/admin">Jobs</a>
+<div class="shell">
+  <nav class="sidebar" aria-label="Sections">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">T</span>Throughline Ops</div>
+    <div class="nav">
+      <div class="nav-label">Monitor</div>
+      <a href="#overview" data-nav="overview">Overview <span class="count" id="nav-count-overview"></span></a>
+      <a href="#jobs" data-nav="jobs">Jobs &amp; workers <span class="count" id="nav-count-jobs"></span></a>
+      <a href="#tasks" data-nav="tasks">Background tasks <span class="count" id="nav-count-tasks"></span></a>
+      <a href="#delivery" data-nav="delivery">Email &amp; push <span class="count" id="nav-count-delivery"></span></a>
+      <a href="#pipelines" data-nav="pipelines">EI &amp; digest <span class="count" id="nav-count-pipelines"></span></a>
+      <a href="#infra" data-nav="infra">Database &amp; compute <span class="count" id="nav-count-infra"></span></a>
+      <div class="nav-label">External</div>
       {% if grafana_url %}
-      <a class="nav-item" href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana Dashboard<span class="nav-item-ext">↗</span></a>
+      <a href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana<span class="ext">↗</span></a>
       {% else %}
-      <span class="nav-item disabled" title="GRAFANA_DASHBOARD_URL not set yet">Grafana Dashboard</span>
+      <span class="disabled" title="GRAFANA_DASHBOARD_URL is not set">Grafana</span>
       {% endif %}
-    </div>
-
-    <button class="nav-parent" onclick="toggleNavGroup('finance')" aria-expanded="true">
-      <span class="nav-chevron" id="chevron-finance">▾</span><span>Finance</span>
-    </button>
-    <div class="nav-children" id="children-finance">
       {% if costlens_url %}
-      <a class="nav-item" href="{{ costlens_url }}" target="_blank" rel="noopener noreferrer">CostLens<span class="nav-item-ext">↗</span></a>
+      <a href="{{ costlens_url }}" target="_blank" rel="noopener noreferrer">CostLens<span class="ext">↗</span></a>
       {% else %}
-      <span class="nav-item disabled" title="COSTLENS_DASHBOARD_URL not set yet">CostLens</span>
+      <span class="disabled" title="COSTLENS_DASHBOARD_URL is not set">CostLens</span>
       {% endif %}
     </div>
   </nav>
 
-  <div class="main-content">
-  <div class="wrap">
-  <header>
-    <h1>Throughline Ops</h1>
-    <div style="display:flex; align-items:center; gap:var(--space-3);">
-      <span class="meta" id="generated-at">loading...</span>
-      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light/dark theme">🌙</button>
-      <button class="btn-secondary" id="refresh-btn" onclick="refresh()">Refresh</button>
-      <a class="logout" href="/admin/logout">Log out</a>
-    </div>
-  </header>
-
-  <section>
-    <h2>Cron / Background Jobs</h2>
-    <div class="grid jobs-grid" id="jobs-grid"><div class="empty">Loading...</div></div>
-  </section>
-
-  <section>
-    <h2>Schedule a New Job</h2>
-    <div class="card custom-job-form">
-      <div>
-        <label for="cj-name">Job name</label>
-        <input id="cj-name" type="text" placeholder="cleanup_old_logs" maxlength="64">
+  <div class="main">
+    <header class="topbar">
+      <h1>Operations</h1>
+      <span class="env" title="This dashboard reads live production data">PROD</span>
+      <span class="spacer"></span>
+      <div class="freshness" aria-live="polite">
+        <span class="live-dot" id="live-dot" aria-hidden="true"></span>
+        <span id="freshness-text">Loading…</span>
       </div>
-      <div>
-        <label for="cj-script">Script path (on the server)</label>
-        <input id="cj-script" type="text" placeholder="/opt/throughline/app/scripts/cleanup.py">
-      </div>
-      <div class="custom-job-form-row">
-        <div>
-          <label for="cj-kind">Schedule</label>
-          <select id="cj-kind" onchange="toggleScheduleFields()">
-            <option value="cron">Daily at specific hour(s) UTC</option>
-            <option value="interval">Every N minutes</option>
-          </select>
+      <button class="btn small" id="pause-btn" type="button" aria-pressed="false" title="Auto-refresh every 30 seconds">Pause</button>
+      <button class="btn small" id="refresh-btn" type="button">Refresh</button>
+      <button class="btn icon small" id="theme-btn" type="button" aria-label="Switch light/dark theme">◐</button>
+      <a class="btn small" href="/admin/logout">Log out</a>
+    </header>
+
+    <div class="content">
+      <div class="banner crit" id="fetch-banner" role="alert"></div>
+
+      <!-- Overview: verdict, what needs attention, headline numbers -->
+      <section class="block" id="overview" aria-labelledby="h-overview">
+        <h2 id="h-overview" class="sr-only">Overview</h2>
+        <div class="panel" id="verdict-panel">
+          <div class="verdict ok" id="verdict"><div class="verdict-ico">…</div><div><div class="verdict-title">Loading status…</div></div></div>
+          <div class="attention" id="attention"></div>
         </div>
-      </div>
-      <div id="cj-cron-fields">
-        <label for="cj-hours">Hour(s) UTC, comma-separated (0-23)</label>
-        <input id="cj-hours" type="text" placeholder="2  or  2,14">
-      </div>
-      <div id="cj-interval-fields" style="display:none;">
-        <label for="cj-interval">Every how many minutes</label>
-        <input id="cj-interval" type="number" min="1" placeholder="60">
-      </div>
-      <div>
-        <label for="cj-logdir">Log directory (optional -- defaults next to the script)</label>
-        <input id="cj-logdir" type="text" placeholder="/opt/throughline/app/scripts/logs">
-      </div>
-      <div>
-        <button class="btn-secondary" onclick="createCustomJob()" id="cj-submit">Create Job</button>
-      </div>
-      <div class="form-msg" id="cj-msg"></div>
+        <div class="kpis" id="kpis" style="margin-top:12px;"></div>
+      </section>
+
+      <section class="block" id="jobs" aria-labelledby="h-jobs">
+        <div class="block-head">
+          <h2 id="h-jobs">Jobs &amp; workers</h2>
+          <span class="sub" id="jobs-sub"></span>
+          <div class="tools">
+            <div class="filters" role="group" aria-label="Filter jobs">
+              <button type="button" data-filter="all" aria-pressed="true">All</button>
+              <button type="button" data-filter="attention" aria-pressed="false">Needs attention</button>
+              <button type="button" data-filter="ok" aria-pressed="false">Healthy</button>
+            </div>
+            <input class="search" id="job-search" type="search" placeholder="Filter by name" aria-label="Filter jobs by name">
+          </div>
+        </div>
+        <div class="panel" style="overflow-x:auto;">
+          <table class="tbl stack" id="jobs-table">
+            <thead><tr>
+              <th scope="col">Status</th><th scope="col">Job</th><th scope="col">Schedule</th>
+              <th scope="col">Last run</th><th scope="col" class="r">Took</th><th scope="col">Next run</th><th scope="col">Last 5</th>
+            </tr></thead>
+            <tbody id="jobs-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <details class="panel form-wrap" style="margin-top:12px;">
+          <summary><span class="chev">›</span> Schedule a custom job</summary>
+          <div class="form">
+            <div><label for="cj-name">Job name</label><input id="cj-name" type="text" placeholder="cleanup_old_logs" maxlength="64"><div class="hint">Letters, digits and underscores.</div></div>
+            <div><label for="cj-script">Script path on the server</label><input id="cj-script" type="text" placeholder="/opt/throughline/app/scripts/cleanup.py"></div>
+            <div><label for="cj-kind">Schedule</label>
+              <select id="cj-kind"><option value="cron">Daily at set hour(s), UTC</option><option value="interval">Every N minutes</option></select></div>
+            <div id="cj-cron-fields"><label for="cj-hours">Hour(s) UTC</label><input id="cj-hours" type="text" placeholder="2 or 2,14"><div class="hint">0–23, comma-separated.</div></div>
+            <div id="cj-interval-fields" hidden><label for="cj-interval">Every how many minutes</label><input id="cj-interval" type="number" min="1" placeholder="60"></div>
+            <div><label for="cj-logdir">Log directory (optional)</label><input id="cj-logdir" type="text" placeholder="defaults next to the script"></div>
+            <div class="full"><button class="btn primary" type="button" id="cj-submit">Create job</button><span class="form-msg" id="cj-msg" role="status"></span></div>
+          </div>
+        </details>
+      </section>
+
+      <section class="block" id="tasks" aria-labelledby="h-tasks">
+        <div class="block-head">
+          <h2 id="h-tasks">Background tasks</h2>
+          <span class="sub">Per-request work, last 24 hours · worst first</span>
+        </div>
+        <div class="panel" style="overflow-x:auto;">
+          <table class="tbl stack">
+            <thead><tr>
+              <th scope="col">Status</th><th scope="col">Task</th><th scope="col" class="r">Runs</th>
+              <th scope="col">Failure rate</th><th scope="col" class="r">Median</th><th scope="col" class="r">p95</th>
+              <th scope="col">Last run</th><th scope="col">Last error</th>
+            </tr></thead>
+            <tbody id="tasks-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+          </table>
+          <div class="note" id="tasks-foot" style="padding:8px 14px; border-top:1px solid var(--border-soft);"></div>
+        </div>
+      </section>
+
+      <section class="block" id="delivery" aria-labelledby="h-delivery">
+        <div class="block-head"><h2 id="h-delivery">Email &amp; push</h2><span class="sub">Email: last 7 days · Push: last 24 hours</span></div>
+        <div class="tiles" id="delivery-tiles"></div>
+      </section>
+
+      <section class="block" id="pipelines" aria-labelledby="h-pipelines">
+        <div class="block-head"><h2 id="h-pipelines">EI extraction &amp; weekly digest</h2><span class="sub">Last 24 hours</span></div>
+        <div class="two-col">
+          <div class="panel" style="overflow-x:auto;">
+            <table class="tbl stack">
+              <thead><tr><th scope="col">Status</th><th scope="col">Run type</th><th scope="col" class="r">OK</th><th scope="col" class="r">Errors</th><th scope="col">Last run</th></tr></thead>
+              <tbody id="ei-body"></tbody>
+            </table>
+          </div>
+          <div class="tiles" id="digest-tiles"></div>
+        </div>
+      </section>
+
+      <section class="block" id="infra" aria-labelledby="h-infra">
+        <div class="block-head"><h2 id="h-infra">Database &amp; compute</h2><span class="sub">Single production VM (app + Postgres + Redis)</span></div>
+        <div class="tiles" id="compute-tiles"></div>
+        <div class="panel" style="margin-top:12px; overflow-x:auto;">
+          <table class="tbl stack">
+            <thead><tr><th scope="col">Largest tables</th><th scope="col" class="r">Size</th><th scope="col">Share of largest</th></tr></thead>
+            <tbody id="db-body"></tbody>
+          </table>
+        </div>
+      </section>
     </div>
-  </section>
-
-  <section>
-    <h2>Background Tasks (last 24h)</h2>
-    <div id="tasks-table"><div class="empty">Loading...</div></div>
-  </section>
-
-  <section>
-    <h2>Email Sends (last 7 days)</h2>
-    <div class="grid" id="email-grid"></div>
-  </section>
-
-  <section>
-    <h2>Live</h2>
-    <div class="grid" id="gauges-grid"></div>
-  </section>
-
-  <section>
-    <h2>EI Extraction (last 24h)</h2>
-    <div id="ei-table"><div class="empty">Loading...</div></div>
-  </section>
-
-  <section>
-    <h2>Weekly Digest</h2>
-    <div class="grid" id="digest-grid"></div>
-  </section>
-
-  <section>
-    <h2>FCM Push (last 24h)</h2>
-    <div class="grid" id="fcm-grid"></div>
-  </section>
-
-  <section>
-    <h2>Database</h2>
-    <div class="grid" id="db-grid"></div>
-  </section>
-
-  <section>
-    <h2>Compute</h2>
-    <div class="grid" id="system-grid"></div>
-  </section>
-  </div>
   </div>
 </div>
+<div class="toast" id="toast" role="status"></div>
 
 <script>
 const REFRESH_MS = 30000;
+const SEV_ORDER = { crit: 0, warn: 1, paused: 2, none: 3, ok: 4 };
+const SEV_ICON = { crit: "✕", warn: "!", ok: "✓", paused: "❚❚", none: "–" };
+const SEV_WORD = { crit: "Failing", warn: "Warning", ok: "Healthy", paused: "Paused", none: "No data" };
 
-function fmtAge(hours) {
-  if (hours === null || hours === undefined) return "never";
-  if (hours < 1) return Math.round(hours * 60) + "m ago";
-  if (hours < 48) return hours.toFixed(1) + "h ago";
-  return (hours / 24).toFixed(1) + "d ago";
-}
-
-function fmtDuration(seconds) {
-  if (seconds === null || seconds === undefined) return "—";
-  if (seconds < 60) return seconds.toFixed(1) + "s";
-  const m = Math.floor(seconds / 60), s = Math.round(seconds % 60);
-  return `${m}m ${s}s`;
-}
-
-function fmtNextRun(iso) {
-  if (!iso) return "—";
-  const next = new Date(iso);
-  const diffMs = next.getTime() - Date.now();
-  const diffH = diffMs / 3600000;
-  const relative = diffH < 1 ? Math.max(0, Math.round(diffH * 60)) + "m" : diffH.toFixed(1) + "h";
-  const clock = next.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return `in ${relative} (${clock})`;
-}
-
-function statusDot(job) {
-  if (job.status === "never_run" || job.stale) return "bad";
-  if (job.status === "success") return "ok";
-  if (job.status === "partial") return "warn";
-  return "bad";
-}
-
-function statusPillClass(job) {
-  if (job.status === "never_run" || job.stale) return "bad";
-  if (job.status === "success") return "ok";
-  if (job.status === "partial") return "warn";
-  return "bad";
-}
-
-function historyDot(status) {
-  if (status === "success") return "ok";
-  if (status === "partial") return "warn";
-  return "bad";
-}
-
-function renderHistoryDots(history) {
-  if (!history || !history.length) return '<span class="job-field-value muted">no runs yet</span>';
-  // Oldest first, left to right, so the most recent run is the rightmost
-  // dot -- matches how a sparkline/heartbeat strip reads.
-  return history.slice().reverse().map(h => {
-    const when = h.started_at ? new Date(h.started_at).toLocaleString() : "unknown";
-    return `<span class="dot ${historyDot(h.status)}" title="${h.status} -- ${when}"></span>`;
-  }).join("");
-}
-
-// Where this job's own output actually lands -- ei_pipeline writes a real
-// per-day file (path comes straight from its own tracking row's detail
-// when available, so it's the exact file that run used, not a guess);
-// nudge_cycle never writes a file, only prints to stdout under the
-// throughline systemd unit, so a journalctl filter is the real answer.
-const JOB_LOG_HINTS = {
+// Plain-language names and what each job is for -- the raw job_name stays
+// visible underneath for grep/journalctl.
+const JOBS = {
+  ei_pipeline:              { name: "EI pipeline",              group: "Scheduled jobs",     about: "Twice-daily emotional-intelligence batch (personality, relationships, fact dedup)." },
+  nudge_cycle:              { name: "Nudge cycle",              group: "Scheduled jobs",     about: "Hourly check that sends nudges and overdue-task pushes." },
+  ops_alert_check:          { name: "Alert checker",            group: "Scheduled jobs",     about: "Emails ADMIN_ALERT_EMAIL when a job goes stale or a health check fails." },
+  email_reminder_worker:    { name: "Email reminders",          group: "Always-on workers",  about: "Sends task reminder emails (with .ics) when they come due." },
+  call_ring_timeout_worker: { name: "Call ring timeout",        group: "Always-on workers",  about: "Ends unanswered calls and sends missed-call pushes." },
+  custom_job_scheduler:     { name: "Custom job scheduler",     group: "Always-on workers",  about: "Fires the custom jobs below on their schedule." },
+  notify_pubsub_listener:   { name: "Live event listener",      group: "Always-on workers",  about: "Redis pub/sub: delivers live events between server processes." },
+  rq_worker_calls:          { name: "Call-recording worker",    group: "Always-on workers",  about: "RQ worker for the 'calls' queue: turns uploaded call recordings into conversations." },
+  costlens_flush:           { name: "CostLens upload",          group: "Always-on workers",  about: "Sends API/DB usage records to CostLens every 5 seconds." },
+  redis:                    { name: "Redis",                    group: "Infrastructure",     about: "Cache, live-event queue and job queue." },
+};
+const GROUP_ORDER = ["Scheduled jobs", "Always-on workers", "Infrastructure", "Custom jobs"];
+const JOB_LOGS = {
+  ei_pipeline: null, // file path from detail.log_file, below
   nudge_cycle: 'journalctl -u throughline -g "nudge_engine"',
   email_reminder_worker: 'journalctl -u throughline -g "email_reminder_worker"',
   call_ring_timeout_worker: 'journalctl -u throughline -g "call_ring_timeout_worker"',
   custom_job_scheduler: 'journalctl -u throughline -g "ops.scheduler"',
   notify_pubsub_listener: 'journalctl -u throughline -g "notify pubsub listener"',
-  redis: 'journalctl -u redis-server',
-  costlens_flush: 'journalctl -u throughline -g "CostLens"',
   rq_worker_calls: 'journalctl -u throughline -g "ops.probe"',
+  costlens_flush: 'journalctl -u throughline -g "CostLens"',
+  redis: 'journalctl -u redis-server',
+  ops_alert_check: 'journalctl -u throughline -g "ops_alert_worker"',
+};
+const TASKS = {
+  chat_resolver:        { name: "Chat follow-up resolver", about: "Groq call on the chat request path -- its latency is felt by the user." },
+  chat_summary:         { name: "Chat thread summary",     about: "Folds old messages into the running thread summary." },
+  transcript_analysis:  { name: "Live transcript analysis", about: "Tasks, mood and speaker notes from live transcripts." },
+  conversation_titling: { name: "Conversation titling",    about: "Names a conversation when it ends." },
+  call_titling:         { name: "Call titling",            about: "One shared title for every participant of a call." },
+  reminder_extraction:  { name: "Reminder extraction",     about: "Turns 'remind me…' chat messages into tasks." },
+};
+const TASK_LOG = 'journalctl -u throughline -g "chat-resolver|chat-summary|run_background_analysis|titling|trigger_reminder_extraction"';
+
+const state = {
+  data: null, lastOkAt: null, lastTryFailed: false, paused: false, timer: null,
+  expanded: new Set(), filter: "all", search: "",
 };
 
-// Probe-backed cards (ops/checks.py) carry their findings in detail --
-// show the problem line plus the scalar numbers, so the card answers
-// "why red?" without opening the logs.
-function renderDetail(j) {
-  const d = j.detail;
-  if (!d || typeof d !== "object" || j.control_kind !== "none" || j.job_name === "ops_alert_check") return "";
-  const problem = d.problem || (j.status === "error" && d.error) || "";
-  const rows = Object.entries(d)
-    .filter(([k, v]) => k !== "problem" && k !== "error" && v !== null && typeof v !== "object")
-    .slice(0, 7)
-    .map(([k, v]) => `<div class="job-field"><span class="job-field-label">${esc(k.replace(/_/g, " "))}</span><span class="job-field-value">${esc(String(v))}</span></div>`)
-    .join("");
-  const problemHtml = problem ? `<div class="err" style="margin-top:var(--space-2);">${esc(problem)}</div>` : "";
-  return problemHtml + (rows ? `<div class="job-fields" style="margin-top:var(--space-2);">${rows}</div>` : "");
-}
-
+/* ---------- helpers ---------- */
 function esc(s) {
-  return String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function ago(iso) {
+  if (!iso) return "never";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 0) return "just now";
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+function until(iso) {
+  if (!iso) return "—";
+  const s = (new Date(iso).getTime() - Date.now()) / 1000;
+  if (s <= 0) return "due now";
+  if (s < 3600) return "in " + Math.max(1, Math.round(s / 60)) + "m";
+  return "in " + (s / 3600).toFixed(1) + "h";
+}
+function abs(iso) { return iso ? new Date(iso).toLocaleString() : ""; }
+function timeEl(iso, text) { return iso ? `<time datetime="${esc(iso)}" title="${esc(abs(iso))}">${esc(text)}</time>` : `<span class="muted">${esc(text)}</span>`; }
+function dur(sec) {
+  if (sec === null || sec === undefined) return "—";
+  if (sec < 1) return Math.round(sec * 1000) + "ms";
+  if (sec < 60) return sec.toFixed(1) + "s";
+  return Math.floor(sec / 60) + "m " + Math.round(sec % 60) + "s";
+}
+function ms(v) { return v === null || v === undefined ? "—" : v >= 1000 ? (v / 1000).toFixed(1) + "s" : v + "ms"; }
+function bytes(b) { if (b == null) return "—"; return b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : (b / 1e6).toFixed(1) + " MB"; }
+function pct(n) { return (Math.round(n * 10) / 10) + "%"; }
+function statusBadge(sev, word) {
+  return `<span class="st ${sev}"><span class="st-ico" aria-hidden="true">${SEV_ICON[sev]}</span>${esc(word || SEV_WORD[sev])}</span>`;
+}
+function meter(p, sev) { return `<div class="meter ${sev === "ok" ? "" : sev}" aria-hidden="true"><i style="width:${Math.max(0, Math.min(100, p))}%"></i></div>`; }
+function toast(msg) {
+  const t = document.getElementById("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 1800);
+}
+function copy(text) {
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(() => toast("Copied"), () => toast("Copy failed — select the text instead"));
+}
+function humanKey(k) { return k.replace(/_/g, " ").replace(/^./, c => c.toUpperCase()); }
+
+/* ---------- severity rules (one place) ---------- */
+// Jobs whose feature flag is off aren't expected to run -- "Off", not "Failing".
+const JOB_FLAG = { nudge_cycle: "nudge_feature_enabled", ei_pipeline: "emotional_intelligence_enabled" };
+function jobDisabled(j) {
+  const flag = JOB_FLAG[j.job_name], flags = (state.data && state.data.flags) || {};
+  return flag && flags[flag] === false;
+}
+function jobSev(j) {
+  if (j.on_ice) return "paused";
+  if (jobDisabled(j)) return "none";
+  if (j.status === "never_run" || j.stale || j.status === "error" || j.status === "failed") return "crit";
+  if (j.status === "partial") return "warn";
+  if (j.status === "success" || j.status === "skipped") return "ok";
+  if (j.status === "running") return "ok";
+  return "warn";
+}
+function jobWord(j, sev) {
+  if (sev === "paused") return "Paused";
+  if (sev === "none") return "Off";
+  if (j.status === "never_run") return "Never ran";
+  if (j.stale) return "Stale";
+  return SEV_WORD[sev];
+}
+function jobProblem(j) {
+  const d = j.detail || {};
+  if (j.on_ice) return "Paused from this dashboard — not running until resumed.";
+  if (jobDisabled(j)) return `Turned off by its feature flag (${JOB_FLAG[j.job_name]}) — not expected to run.`;
+  if (d.problem) return d.problem;
+  if (j.status === "never_run") return "Has never reported a run.";
+  if (j.stale) return `No run reported for ${ago(j.finished_at || j.started_at).replace(" ago", "")} (expected: ${j.cadence_label}).`;
+  if (j.status === "error" || j.status === "failed") return d.error || "Last run failed.";
+  if (j.status === "partial") return d.error || "Last run partly failed.";
+  return "";
+}
+function taskSev(t) {
+  const total = t.success + t.error;
+  if (!total) return "none";
+  const rate = t.error / total;
+  if (t.error >= 3 && rate >= 0.5) return "crit";
+  if (rate >= 0.2 || t.error >= 5) return "warn";
+  return "ok";
+}
+function usageSev(p, warnAt, critAt) { return p >= critAt ? "crit" : p >= warnAt ? "warn" : "ok"; }
+
+/* ---------- attention list: every problem across the page ---------- */
+function collectAttention(d) {
+  const items = [];
+  for (const j of d.jobs || []) {
+    const sev = jobSev(j);
+    if (sev === "crit" || sev === "warn") {
+      items.push({ sev, area: "Job", name: (JOBS[j.job_name] || {}).name || j.job_name, msg: jobProblem(j), href: "#job-" + j.job_name, key: "jobs", job: j.job_name });
+    }
+  }
+  for (const [k, t] of Object.entries(d.tasks || {})) {
+    const sev = taskSev(t);
+    if (sev === "crit" || sev === "warn") {
+      const total = t.success + t.error;
+      items.push({ sev, area: "Task", name: (TASKS[k] || {}).name || k, msg: `${t.error} of ${total} runs failed in 24h${t.last_error ? " — last: " + t.last_error : ""}`, href: "#tasks", key: "tasks" });
+    }
+  }
+  const e = d.email || {};
+  if (e.error) items.push({ sev: "warn", area: "Email", name: "Email stats", msg: e.error, href: "#delivery", key: "delivery" });
+  if (e.failed_waiting > 0) items.push({ sev: "crit", area: "Email", name: "Failed email sends", msg: `${e.failed_waiting} email(s) failed to send and are still waiting${e.last_error ? " — " + e.last_error : ""}`, href: "#delivery", key: "delivery" });
+  if (e.sent_unverified > 0) items.push({ sev: "warn", area: "Email", name: "Unconfirmed emails", msg: `${e.sent_unverified} sent email(s) could not be found in the Sent folder`, href: "#delivery", key: "delivery" });
+  if (e.sending > 0) items.push({ sev: "warn", area: "Email", name: "Emails mid-send", msg: `${e.sending} email(s) stuck in 'sending'`, href: "#delivery", key: "delivery" });
+  const f = (d.fcm || {}).last_24h || {};
+  if ((f.error || 0) > 0) items.push({ sev: "warn", area: "Push", name: "Push errors", msg: `${f.error} push(es) rejected by Firebase in 24h`, href: "#delivery", key: "delivery" });
+  for (const [k, v] of Object.entries(d.ei_realtime || {})) {
+    if (v.error > 0) items.push({ sev: "warn", area: "EI", name: k, msg: `${v.error} error(s) in 24h`, href: "#pipelines", key: "pipelines" });
+  }
+  const sys = d.system || {};
+  if (sys.disk && !sys.disk.error) {
+    const s = usageSev(sys.disk.percent_used, 80, 92);
+    if (s !== "ok") items.push({ sev: s, area: "Compute", name: "Disk", msg: `${pct(sys.disk.percent_used)} used — ${sys.disk.free_gb} GB free`, href: "#infra", key: "infra" });
+  }
+  if (sys.memory && !sys.memory.error) {
+    const s = usageSev(sys.memory.percent_used, 85, 95);
+    if (s !== "ok") items.push({ sev: s, area: "Compute", name: "Memory", msg: `${pct(sys.memory.percent_used)} used`, href: "#infra", key: "infra" });
+  }
+  if (sys.cpu && !sys.cpu.error && sys.cpu.load_5m > sys.cpu.core_count) {
+    items.push({ sev: "warn", area: "Compute", name: "CPU load", msg: `5-min load ${sys.cpu.load_5m} on ${sys.cpu.core_count} cores`, href: "#infra", key: "infra" });
+  }
+  items.sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev]);
+  return items;
 }
 
-function logHintForJob(j) {
-  // Any subprocess-kind job (ei_pipeline, every custom job) gets a real
-  // per-run log file via ops/runner.py -- detail.log_file is the exact
-  // file the most recent run actually wrote, when there's been one yet.
+/* ---------- renderers ---------- */
+function renderOverview(d, items) {
+  const crit = items.filter(i => i.sev === "crit").length;
+  const warn = items.filter(i => i.sev === "warn").length;
+  const jobs = d.jobs || [];
+  const healthyJobs = jobs.filter(j => jobSev(j) === "ok").length;
+  const paused = jobs.filter(j => j.on_ice).length;
+  const sev = crit ? "crit" : warn ? "warn" : "ok";
+  const title = crit ? `${crit} problem${crit > 1 ? "s" : ""} need${crit > 1 ? "" : "s"} attention`
+    : warn ? `${warn} warning${warn > 1 ? "s" : ""} to review` : "All systems operational";
+  const offCount = jobs.filter(j => jobSev(j) === "none").length;
+  const sub = `${healthyJobs} of ${jobs.length - paused - offCount} jobs and workers healthy` + (paused ? ` · ${paused} paused` : "") + (offCount ? ` · ${offCount} off` : "") +
+    ` · EI ${d.flags && d.flags.emotional_intelligence_enabled ? "on" : "off"} · Nudges ${d.flags && d.flags.nudge_feature_enabled ? "on" : "off"}`;
+  document.getElementById("verdict").className = "verdict " + sev;
+  document.getElementById("verdict").innerHTML = `
+    <div class="verdict-ico" aria-hidden="true">${SEV_ICON[sev]}</div>
+    <div><div class="verdict-title">${esc(title)}</div><div class="verdict-sub">${esc(sub)}</div></div>
+    <div class="verdict-counts">
+      <div class="vc crit"><b>${crit}</b><span>failing</span></div>
+      <div class="vc warn"><b>${warn}</b><span>warnings</span></div>
+      <div class="vc ok"><b>${healthyJobs}</b><span>healthy jobs</span></div>
+    </div>`;
+  document.getElementById("attention").innerHTML = items.map(i => `
+    <div class="att-item">
+      ${statusBadge(i.sev, "")}
+      <div><div class="att-name">${esc(i.name)}<span class="att-area">${esc(i.area)}</span></div><div class="att-msg">${esc(i.msg)}</div></div>
+      <a class="att-go" href="${esc(i.href)}" ${i.job ? `data-open-job="${esc(i.job)}"` : ""}>View →</a>
+    </div>`).join("");
+
+  // Headline numbers
+  const tasks = Object.values(d.tasks || {});
+  const tRuns = tasks.reduce((a, t) => a + t.success + t.error, 0), tErr = tasks.reduce((a, t) => a + t.error, 0);
+  const e = d.email || {}, f = (d.fcm || {}).last_24h || {}, sys = d.system || {};
+  const live = ((d.gauges || {}).live_transcription_sessions) || {};
+  const k = [];
+  const off = jobs.filter(j => jobSev(j) === "none").length;
+  const expected = jobs.length - paused - off;
+  k.push({ label: "Jobs healthy", value: `${healthyJobs}<small> / ${expected}</small>`,
+           foot: [paused ? `${paused} paused` : "", off ? `${off} off by flag` : ""].filter(Boolean).join(" · ") || "scheduled + always-on",
+           sev: healthyJobs < expected ? "crit" : "ok" });
+  k.push({ label: "Task success · 24h", value: tRuns ? pct((1 - tErr / tRuns) * 100) : "—", foot: tRuns ? `${tErr} failed of ${tRuns}` : "no runs yet", sev: tRuns && tErr / tRuns >= 0.2 ? "warn" : "ok" });
+  k.push({ label: "Emails sent · 7d", value: e.error ? "—" : (e.sent ?? 0), foot: e.error ? "unavailable" : `${e.sent_verified ?? 0} confirmed in Sent folder`, sev: e.failed_waiting > 0 ? "crit" : e.sent_unverified > 0 ? "warn" : "ok" });
+  k.push({ label: "Push sent · 24h", value: f.sent || 0, foot: `${f.error || 0} errors · ${f.no_token || 0} no device`, sev: (f.error || 0) > 0 ? "warn" : "ok" });
+  k.push({ label: "Live sessions", value: live.open_now ?? "—", foot: live.peak_since_start != null ? `peak ${live.peak_since_start} since restart` : "", sev: "ok" });
+  if (sys.disk && !sys.disk.error) k.push({ label: "Disk", value: pct(sys.disk.percent_used), foot: `${sys.disk.free_gb} GB free`, sev: usageSev(sys.disk.percent_used, 80, 92), meter: sys.disk.percent_used });
+  if (sys.memory && !sys.memory.error) k.push({ label: "Memory", value: pct(sys.memory.percent_used), foot: `${(sys.memory.available_mb / 1024).toFixed(1)} GB available`, sev: usageSev(sys.memory.percent_used, 85, 95), meter: sys.memory.percent_used });
+  document.getElementById("kpis").innerHTML = k.map(x => `
+    <div class="panel kpi ${x.sev === "ok" ? "" : x.sev}">
+      <div class="kpi-label">${esc(x.label)}</div>
+      <div class="kpi-value">${x.value}</div>
+      ${x.meter != null ? meter(x.meter, x.sev) : ""}
+      <div class="kpi-foot">${esc(x.foot)}</div>
+    </div>`).join("");
+
+  // Sidebar counts (worst severity per section)
+  for (const key of ["overview", "jobs", "tasks", "delivery", "pipelines", "infra"]) {
+    const mine = key === "overview" ? items : items.filter(i => i.key === key);
+    const el = document.getElementById("nav-count-" + key);
+    if (!el) continue;
+    const c = mine.filter(i => i.sev === "crit").length, w = mine.filter(i => i.sev === "warn").length;
+    el.className = "count" + (c ? " crit" : w ? " warn" : "");
+    el.textContent = c || w ? String(c || w) : "";
+    el.title = c ? `${c} failing` : w ? `${w} warnings` : "";
+  }
+}
+
+function jobActions(j) {
+  if (j.control_kind === "none") return `<div class="note">Health check — read-only. Fix the cause, the card turns green on the next check (≤ 30 s).</div>`;
+  const out = [];
+  out.push(j.on_ice
+    ? `<button class="btn small" data-act="unice" data-job="${esc(j.job_name)}">Resume</button>`
+    : `<button class="btn small" data-act="ice" data-job="${esc(j.job_name)}" data-confirm="Pause ${esc(j.job_name)}? It stops doing real work until resumed.">Pause</button>`);
+  const sub = j.control_kind === "subprocess";
+  if (sub || j.job_name === "nudge_cycle") out.push(`<button class="btn small" data-act="start" data-job="${esc(j.job_name)}" ${j.running ? "disabled" : ""}>Run now</button>`);
+  if (sub) {
+    out.push(`<button class="btn small danger" data-act="stop" data-job="${esc(j.job_name)}" data-confirm="Stop ${esc(j.job_name)} now?" ${j.running ? "" : "disabled"}>Stop</button>`);
+    out.push(`<button class="btn small" data-act="restart" data-job="${esc(j.job_name)}" data-confirm="Restart ${esc(j.job_name)} now?">Restart</button>`);
+  }
+  if (j.is_custom) out.push(`<button class="btn small danger" data-delete="${esc(j.job_name)}">Delete job</button>`);
+  const note = sub ? "" : `<div class="note">Runs inside the app process — it can be paused, not stopped or restarted.</div>`;
+  return `<div class="actions">${out.join("")}</div>${note}`;
+}
+
+function jobLog(j) {
   if (j.detail && j.detail.log_file) return j.detail.log_file;
-  if (j.job_name === "ei_pipeline") {
-    const today = new Date().toISOString().slice(0, 10);
-    return `emotional_intelligence/logs/ei_pipeline_${today}.log`;
-  }
-  if (j.is_custom) return "no runs yet -- log file will appear here after the first run";
-  return JOB_LOG_HINTS[j.job_name] || "journalctl -u throughline";
+  if (j.job_name === "ei_pipeline") return `emotional_intelligence/logs/ei_pipeline_${new Date().toISOString().slice(0, 10)}.log`;
+  if (j.is_custom) return "log file appears after the first run";
+  return JOB_LOGS[j.job_name] || "journalctl -u throughline";
 }
 
-async function callJobAction(jobName, action, confirmMsg) {
-  if (confirmMsg && !confirm(confirmMsg)) return;
-  try {
-    const res = await fetch(`/admin/api/jobs/${encodeURIComponent(jobName)}/${action}`, {
-      method: "POST", credentials: "same-origin",
-    });
-    const data = await res.json();
-    if (!data.ok) { alert(`${action} failed: ${data.error || "unknown error"}`); }
-    refresh();
-  } catch (e) {
-    alert(`${action} failed: ${e}`);
-  }
+function jobDetail(j, sev) {
+  const d = j.detail && typeof j.detail === "object" ? j.detail : {};
+  const problem = sev !== "ok" ? jobProblem(j) : "";
+  const pairs = Object.entries(d).filter(([k, v]) => k !== "problem" && k !== "log_file" && v !== null && typeof v !== "object").slice(0, 10);
+  const kv = pairs.length ? `<dl class="kv">${pairs.map(([k, v]) => `<dt>${esc(humanKey(k))}</dt><dd>${esc(String(v))}</dd>`).join("")}</dl>` : `<div class="note">No details reported by the last run.</div>`;
+  const info = JOBS[j.job_name];
+  const log = jobLog(j);
+  return `<div class="detail">
+      <div>
+        ${problem ? `<div class="problem ${sev === "warn" ? "warn" : ""}">${esc(problem)}</div>` : ""}
+        ${info ? `<div class="note" style="margin-bottom:8px;">${esc(info.about)}</div>` : ""}
+        <div class="note" style="margin-bottom:6px;">Last run ${j.started_at ? esc(abs(j.started_at)) : "never"}${j.status ? " · reported " + esc(j.status) : ""}</div>
+        ${kv}
+      </div>
+      <div class="detail-side">
+        <div><div class="note" style="margin-bottom:4px;">Logs</div>
+          <div class="logbox"><code>${esc(log)}</code><button class="btn small" data-copy="${esc(log)}" aria-label="Copy log command">Copy</button></div></div>
+        ${jobActions(j)}
+      </div>
+    </div>`;
 }
 
-async function deleteCustomJob(jobName) {
-  if (!confirm(`Delete custom job "${jobName}"? This removes its schedule -- any log files it already wrote are kept.`)) return;
-  try {
-    const res = await fetch(`/admin/api/custom-jobs/${encodeURIComponent(jobName)}`, { method: "DELETE", credentials: "same-origin" });
-    const data = await res.json();
-    if (!data.ok) alert(`delete failed: ${data.error || "unknown error"}`);
-    refresh();
-  } catch (e) {
-    alert(`delete failed: ${e}`);
-  }
-}
-
-// All 4 actions (On Ice/Off Ice, Start, Stop, Restart) always render on
-// every card for consistency -- one that doesn't apply to a given job's
-// control_kind (ops/jobs.py's JOB_CONTROL_KIND) shows disabled with a
-// tooltip explaining why, rather than being omitted outright. Reason:
-// an in-process job (nudge_cycle, the two heartbeat workers) is a thread
-// inside the main app, not a separate OS process -- there is nothing a
-// web request can kill or restart without killing the whole app, so
-// Stop/Restart (and Start, except nudge_cycle specifically) can't
-// actually do anything real for those three.
-function renderJobActions(j) {
-  if (j.control_kind === "none") return "";
-  const canStartStop = j.control_kind === "subprocess";
-  const canStart = canStartStop || j.job_name === "nudge_cycle";
-  const inProcessNote = "This runs as a thread inside the main app process, not a separate process -- it can't be stopped/restarted without stopping the whole app. Use On Ice/Off Ice instead.";
-
-  const iceBtn = j.on_ice
-    ? `<button class="job-action-btn ice" onclick="callJobAction('${j.job_name}','unice')">Off Ice</button>`
-    : `<button class="job-action-btn ice" onclick="callJobAction('${j.job_name}','ice')">On Ice</button>`;
-
-  const startBtn = canStart
-    ? `<button class="job-action-btn" ${j.running ? "disabled" : ""} onclick="callJobAction('${j.job_name}','start')">Start</button>`
-    : `<button class="job-action-btn" disabled title="${inProcessNote}">Start</button>`;
-
-  const stopBtn = canStartStop
-    ? `<button class="job-action-btn danger" ${j.running ? "" : "disabled"} onclick="callJobAction('${j.job_name}','stop','Stop ${j.job_name} now?')">Stop</button>`
-    : `<button class="job-action-btn danger" disabled title="${inProcessNote}">Stop</button>`;
-
-  const restartBtn = canStartStop
-    ? `<button class="job-action-btn" onclick="callJobAction('${j.job_name}','restart','Restart ${j.job_name} now?')">Restart</button>`
-    : `<button class="job-action-btn" disabled title="${inProcessNote}">Restart</button>`;
-
-  const deleteBtn = j.is_custom
-    ? `<button class="job-action-btn danger" onclick="deleteCustomJob('${j.job_name}')">🗑 Delete</button>`
-    : "";
-
-  return `<div class="job-actions">${iceBtn}${startBtn}${stopBtn}${restartBtn}${deleteBtn}</div>`;
-}
-
-// Autosys-style job card: a status badge up top, then a clean label/value
-// field list (Schedule / Last Run / Run Time / Next Run) -- the layout
-// an ops person checking "did this run, and when's it due next" actually
-// scans for, instead of a loose stack of rows.
 function renderJobs(jobs) {
-  const el = document.getElementById("jobs-grid");
-  if (!jobs || !jobs.length) { el.innerHTML = '<div class="empty">No jobs recorded yet.</div>'; return; }
-  el.innerHTML = jobs.map(j => {
-    const lastRunValue = j.started_at
-      ? `${fmtAge(j.age_hours)} <span class="job-field-value muted">(${j.status})</span>`
-      : "never run";
-    const statusBadge = j.on_ice ? `<span class="job-badge ice">ON ICE</span>`
-      : `<span class="pill ${statusPillClass(j)}">${j.stale ? "STALE" : j.status.toUpperCase()}</span>`;
-    const runningBadge = j.running ? `<span class="job-badge running">RUNNING</span>` : "";
-    return `
-      <div class="card job-card">
-        <div class="job-header">
-          <div class="job-name"><span class="dot ${j.on_ice ? '' : statusDot(j)}" style="${j.on_ice ? 'background:#7ec8e3;' : ''}"></span>${j.job_name}${j.is_custom ? ' <span class="job-field-value muted" style="font-size:10px;">(custom)</span>' : ''}</div>
-          <div style="display:flex; gap:6px;">${runningBadge}${statusBadge}</div>
-        </div>
-        <div class="job-fields">
-          <div class="job-field"><span class="job-field-label">Schedule</span><span class="job-field-value">${j.cadence_label}</span></div>
-          <div class="job-field"><span class="job-field-label">Last run</span><span class="job-field-value">${lastRunValue}</span></div>
-          <div class="job-field"><span class="job-field-label">Run time</span><span class="job-field-value">${fmtDuration(j.duration_seconds)}</span></div>
-          <div class="job-field"><span class="job-field-label">Next run</span><span class="job-field-value">${j.on_ice ? "— (on ice)" : fmtNextRun(j.next_run_at)}</span></div>
-        </div>
-        ${renderDetail(j)}
-        <div class="job-history">
-          <span class="job-history-label">Last ${(j.history||[]).length || 0} runs</span>
-          <span class="job-history-dots">${renderHistoryDots(j.history)}</span>
-        </div>
-        <div class="log-hint"><b>Log:</b> ${logHintForJob(j)}</div>
-        ${renderJobActions(j)}
-      </div>`;
-  }).join("");
-}
-
-// Shared per-section log pointers -- these cards don't each have their own
-// distinct source (unlike the job cards above), they're all different
-// views of the same underlying prints/rows, so one hint string per
-// section, repeated on every card in it per the "every card" ask.
-const EI_LOG_HINT = 'journalctl -u throughline -g "ei_adapter"';
-const DIGEST_LOG_HINT = 'journalctl -u throughline -g "nudge_engine"';
-const FCM_LOG_HINT = 'journalctl -u throughline -g "fcm"';
-const DB_LOG_HINT = 'journalctl -u throughline';
-const SYSTEM_LOG_HINT = 'journalctl -u throughline';
-
-const TASK_LABELS = {
-  chat_resolver: "Chat follow-up resolver (Groq, on the request path)",
-  chat_summary: "Chat thread summary",
-  transcript_analysis: "Live transcript analysis",
-  conversation_titling: "Conversation titling",
-  call_titling: "Call titling",
-  reminder_extraction: "Reminder extraction from chat",
-};
-const TASK_LOG_HINT = 'journalctl -u throughline -g "chat-resolver|chat-summary|run_background_analysis|titling|trigger_reminder_extraction"';
-
-function fmtMs(ms) {
-  if (ms === null || ms === undefined) return "-";
-  return ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
+  const body = document.getElementById("jobs-body");
+  const all = (jobs || []).map(j => ({ j, sev: jobSev(j), info: JOBS[j.job_name] || {} }));
+  const attentionCount = all.filter(x => x.sev === "crit" || x.sev === "warn").length;
+  document.getElementById("jobs-sub").textContent = `${all.length} total · ${attentionCount} need attention · click a row for details`;
+  const q = state.search.trim().toLowerCase();
+  const shown = all.filter(x => {
+    if (state.filter === "attention" && !(x.sev === "crit" || x.sev === "warn" || x.sev === "paused")) return false;
+    if (state.filter === "ok" && x.sev !== "ok") return false;
+    if (q && !(x.j.job_name.toLowerCase().includes(q) || (x.info.name || "").toLowerCase().includes(q))) return false;
+    return true;
+  });
+  if (!shown.length) { body.innerHTML = `<tr><td colspan="7" class="empty">${all.length ? "No jobs match this filter." : "No jobs recorded yet."}</td></tr>`; return; }
+  const groups = {};
+  for (const x of shown) {
+    const g = x.j.is_custom ? "Custom jobs" : (x.info.group || (x.j.control_kind === "none" ? "Always-on workers" : "Scheduled jobs"));
+    (groups[g] = groups[g] || []).push(x);
+  }
+  let html = "";
+  for (const g of GROUP_ORDER.concat(Object.keys(groups).filter(k => !GROUP_ORDER.includes(k)))) {
+    const rows = groups[g];
+    if (!rows) continue;
+    rows.sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev] || (a.info.name || a.j.job_name).localeCompare(b.info.name || b.j.job_name));
+    html += `<tr class="group-row"><td colspan="7">${esc(g)} · ${rows.length}</td></tr>`;
+    for (const { j, sev, info } of rows) {
+      const open = state.expanded.has(j.job_name);
+      const hist = (j.history || []).slice().reverse();
+      const histHtml = hist.length
+        ? `<span class="hist" role="img" aria-label="Last ${hist.length} runs: ${esc(hist.map(h => h.status).join(", "))}">${hist.map(h => `<i class="${h.status === "success" ? "ok" : h.status === "partial" ? "warn" : "crit"}" title="${esc(h.status + " · " + abs(h.started_at))}"></i>`).join("")}</span>`
+        : `<span class="muted">—</span>`;
+      html += `<tr class="job-row ${open ? "open" : ""}" id="job-${esc(j.job_name)}" data-job-row="${esc(j.job_name)}" tabindex="0" role="button" aria-expanded="${open}">
+        <td data-label="Status">${statusBadge(sev, jobWord(j, sev))}</td>
+        <td class="lead"><span class="chev" aria-hidden="true">›</span> <span class="job-name">${esc(info.name || j.job_name)}</span>${j.running ? `<span class="badge running">RUNNING</span>` : ""}${j.is_custom ? `<span class="badge custom">custom</span>` : ""}<div class="job-id" style="margin-left:18px;">${esc(j.job_name)}</div></td>
+        <td data-label="Schedule">${esc(j.cadence_label || "—")}</td>
+        <td data-label="Last run">${timeEl(j.finished_at || j.started_at, j.started_at ? ago(j.finished_at || j.started_at) : "never")}</td>
+        <td data-label="Took" class="r phone-hide">${j.duration_seconds ? esc(dur(j.duration_seconds)) : `<span class="muted">—</span>`}</td>
+        <td data-label="Next run">${sev === "none" ? `<span class="muted">off</span>` : j.on_ice ? `<span class="muted">paused</span>` : timeEl(j.next_run_at, until(j.next_run_at))}</td>
+        <td data-label="Last 5" class="phone-hide">${histHtml}</td>
+      </tr>`;
+      if (open) html += `<tr class="detail-row"><td colspan="7">${jobDetail(j, sev)}</td></tr>`;
+    }
+  }
+  body.innerHTML = html;
 }
 
 function renderTasks(tasks, buf) {
-  const el = document.getElementById("tasks-table");
-  const keys = Object.keys(tasks || {}).sort();
-  const bufNote = buf ? `<div class="meta" style="padding:var(--space-2) var(--space-3);">${buf.buffered} waiting to be written · ${buf.dropped_total} dropped since start (written every 30s)</div>` : "";
-  if (!keys.length) { el.innerHTML = `<div class="card"><div class="empty">No background task runs recorded in the last 24h.</div>${bufNote}</div>`; return; }
-  const rows = keys.map(k => {
-    const v = tasks[k];
-    const total = v.success + v.error;
-    const errRate = total ? v.error / total : 0;
-    const pill = errRate >= 0.2 ? "bad" : v.error > 0 ? "warn" : "ok";
-    const lastErr = v.last_error
-      ? `<span title="${esc(v.last_error)}">${esc(v.last_error.slice(0, 60))}${v.last_error.length > 60 ? "…" : ""}</span><br><span class="meta">${new Date(v.last_error_at).toLocaleString()}</span>`
-      : '<span class="meta">-</span>';
-    return `<tr><td>${esc(TASK_LABELS[k] || k)}<br><span class="meta">${esc(k)}</span></td><td>${v.success}</td>
-      <td><span class="pill ${pill}">${v.error}</span></td><td>${fmtMs(v.p50_ms)} / ${fmtMs(v.p95_ms)}</td>
-      <td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td><td style="font-size:12px;">${lastErr}</td></tr>`;
+  const body = document.getElementById("tasks-body");
+  const rows = Object.entries(tasks || {}).map(([k, t]) => ({ k, t, sev: taskSev(t) }));
+  rows.sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev] || ((b.t.error / Math.max(1, b.t.success + b.t.error)) - (a.t.error / Math.max(1, a.t.success + a.t.error))));
+  if (!rows.length) body.innerHTML = `<tr><td colspan="8" class="empty">No background task runs in the last 24 hours.</td></tr>`;
+  else body.innerHTML = rows.map(({ k, t, sev }) => {
+    const total = t.success + t.error, rate = total ? (t.error / total) * 100 : 0;
+    const info = TASKS[k] || {};
+    return `<tr>
+      <td data-label="Status">${statusBadge(sev)}</td>
+      <td class="lead"><span class="job-name">${esc(info.name || k)}</span><div class="job-id">${esc(k)}</div>${info.about ? `<div class="note">${esc(info.about)}</div>` : ""}</td>
+      <td data-label="Runs" class="r">${total}</td>
+      <td data-label="Failure rate"><div class="rate"><span class="num">${pct(rate)}</span>${meter(rate, sev === "ok" ? "ok" : sev)}</div><div class="note">${t.error} failed</div></td>
+      <td data-label="Median" class="r">${esc(ms(t.p50_ms))}</td>
+      <td data-label="p95" class="r">${esc(ms(t.p95_ms))}</td>
+      <td data-label="Last run">${timeEl(t.last_at, ago(t.last_at))}</td>
+      <td data-label="Last error" style="max-width:280px;">${t.last_error ? `<div title="${esc(t.last_error)}" style="overflow-wrap:anywhere;">${esc(t.last_error.length > 90 ? t.last_error.slice(0, 90) + "…" : t.last_error)}</div><div class="note">${timeEl(t.last_error_at, ago(t.last_error_at))}</div>` : `<span class="muted">none</span>`}</td>
+    </tr>`;
   }).join("");
-  el.innerHTML = `<div class="card" style="padding:0; overflow-x:auto;">
-    <table><tr><th>task</th><th>ok</th><th>error</th><th>median / p95</th><th>last run</th><th>last error</th></tr>${rows}</table>
-    ${bufNote}
-    <div class="log-hint" style="margin:0; border:none; border-top:1px solid var(--wa-border); border-radius:0;"><b>Log:</b> ${TASK_LOG_HINT}</div>
-  </div>`;
+  document.getElementById("tasks-foot").innerHTML = buf
+    ? `Counts are written every 30 s (${buf.buffered} waiting, ${buf.dropped_total} dropped since restart). Logs: <code style="font-family:var(--mono);font-size:11.5px;">${esc(TASK_LOG)}</code> <button class="btn small" data-copy="${esc(TASK_LOG)}">Copy</button>`
+    : "";
 }
 
-const EMAIL_LOG_HINT = 'journalctl -u throughline -g "email|sent-box"';
-
-function renderEmail(e) {
-  const el = document.getElementById("email-grid");
-  if (!e || e.error) { el.innerHTML = `<div class="card"><div class="err">${esc((e && e.error) || "no data")}</div></div>`; return; }
-  const unverifiedPill = e.sent_unverified > 0 ? "warn" : "ok";
-  const failedPill = e.failed_waiting > 0 ? "bad" : "ok";
-  el.innerHTML = `
-    <div class="card">
-      <div class="title">Sent</div>
-      <div class="row"><b style="font-size:22px;">${e.sent}</b></div>
-      <div class="row" style="font-size:11px;"><span>Last sent</span><span>${e.last_sent_at ? new Date(e.last_sent_at).toLocaleString() : "never"}</span></div>
-      <div class="log-hint"><b>Log:</b> ${EMAIL_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">Found in Sent folder</div>
-      <div class="row"><span>Confirmed</span><b>${e.sent_verified}</b></div>
-      <div class="row"><span>Not confirmed</span><span class="pill ${unverifiedPill}">${e.sent_unverified}</span></div>
-      <div class="log-hint"><b>Log:</b> ${EMAIL_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">Failed sends (still pending)</div>
-      <div class="row"><span class="pill ${failedPill}">${e.failed_waiting}</span></div>
-      ${e.last_error ? `<div class="row" style="font-size:11px;" title="${esc(e.last_error)}"><span>Last error</span><span>${esc(e.last_error.slice(0, 50))}</span></div>` : ""}
-      <div class="log-hint"><b>Log:</b> ${EMAIL_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">Drafts</div>
-      <div class="row"><span>Waiting for the user</span><b>${e.drafts_waiting}</b></div>
-      <div class="row"><span>Cancelled</span><b>${e.dismissed}</b></div>
-      <div class="row"><span>Mid-send</span><b>${e.sending}</b></div>
-    </div>`;
+function tile(title, big, lines, sev, meterPct) {
+  return `<div class="panel tile ${sev && sev !== "ok" ? sev : ""}"><h3>${esc(title)}</h3><div class="big num">${big}</div>${meterPct != null ? meter(meterPct, sev) : ""}${lines.map(([a, b]) => `<div class="line"><span>${esc(a)}</span><b>${b}</b></div>`).join("")}</div>`;
 }
 
-const GAUGE_LABELS = { live_transcription_sessions: "Live transcription sessions" };
-
-function renderGauges(g) {
-  const el = document.getElementById("gauges-grid");
-  const keys = Object.keys(g || {});
-  if (!keys.length) { el.innerHTML = '<div class="card"><div class="empty">No live gauges registered in this process.</div></div>'; return; }
-  el.innerHTML = keys.map(k => {
-    const v = g[k] || {};
-    if (v.error) return `<div class="card"><div class="title">${esc(GAUGE_LABELS[k] || k)}</div><div class="err">${esc(v.error)}</div></div>`;
-    const first = Object.keys(v)[0];
-    const rest = Object.entries(v).slice(1).map(([kk, vv]) => `<div class="row"><span>${esc(kk.replace(/_/g, " "))}</span><b>${esc(String(vv))}</b></div>`).join("");
-    return `<div class="card"><div class="title">${esc(GAUGE_LABELS[k] || k)}</div>
-      <div class="row"><b style="font-size:22px;">${esc(String(v[first]))}</b><span>${esc(first.replace(/_/g, " "))}</span></div>${rest}</div>`;
-  }).join("");
+function renderDelivery(e, fcm) {
+  const el = document.getElementById("delivery-tiles");
+  const t = [];
+  if (!e || e.error) t.push(`<div class="panel tile"><h3>Email</h3><div class="err-text">${esc((e && e.error) || "No data")}</div></div>`);
+  else {
+    const confirmedPct = e.sent ? Math.round((e.sent_verified / e.sent) * 100) : null;
+    t.push(tile("Emails sent", e.sent, [["Last sent", timeEl(e.last_sent_at, ago(e.last_sent_at))]], "ok"));
+    t.push(tile("Confirmed in Sent folder", confirmedPct === null ? "—" : confirmedPct + "%", [["Confirmed", e.sent_verified], ["Not confirmed", e.sent_unverified]], e.sent_unverified > 0 ? "warn" : "ok"));
+    t.push(tile("Failed sends", e.failed_waiting, [["Last error", e.last_error ? `<span title="${esc(e.last_error)}">${esc(e.last_error.slice(0, 40))}${e.last_error.length > 40 ? "…" : ""}</span>` : "none"]], e.failed_waiting > 0 ? "crit" : "ok"));
+    t.push(tile("Drafts", e.drafts_waiting, [["Waiting for user", e.drafts_waiting], ["Cancelled", e.dismissed], ["Mid-send", e.sending]], e.sending > 0 ? "warn" : "ok"));
+  }
+  const f = (fcm || {}).last_24h || {};
+  t.push(tile("Push sent", f.sent || 0, [["Errors", f.error || 0], ["Stale tokens", f.stale || 0], ["No device", f.no_token || 0]], (f.error || 0) > 0 ? "warn" : "ok"));
+  t.push(tile("Registered devices", (fcm || {}).registered_tokens ?? 0, [["Last push", timeEl((fcm || {}).last_send_at, ago((fcm || {}).last_send_at))]], "ok"));
+  el.innerHTML = t.join("");
 }
 
-function renderEi(ei) {
-  const el = document.getElementById("ei-table");
-  const keys = Object.keys(ei || {});
-  if (!keys.length) { el.innerHTML = '<div class="empty">No extraction activity in the last 24h.</div>'; return; }
-  const rows = keys.map(k => {
-    const v = ei[k];
-    const pill = v.error > 0 ? "warn" : "ok";
-    return `<tr><td>${k}</td><td>${v.success}</td><td><span class="pill ${pill}">${v.error}</span></td><td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td></tr>`;
-  }).join("");
-  el.innerHTML = `<div class="card" style="padding:0;">
-    <table><tr><th>run_type</th><th>success</th><th>error</th><th>last run</th></tr>${rows}</table>
-    <div class="log-hint" style="margin:0; border:none; border-top:1px solid var(--wa-border); border-radius:0;"><b>Log:</b> ${EI_LOG_HINT}</div>
-  </div>`;
+function renderPipelines(ei, digest) {
+  const body = document.getElementById("ei-body");
+  const rows = Object.entries(ei || {}).sort((a, b) => b[1].error - a[1].error);
+  body.innerHTML = rows.length ? rows.map(([k, v]) => {
+    const sev = v.error > 0 ? "warn" : "ok";
+    return `<tr><td data-label="Status">${statusBadge(sev)}</td><td class="lead"><span class="job-id" style="font-size:12.5px;color:var(--text);">${esc(k)}</span></td>
+      <td data-label="OK" class="r">${v.success}</td><td data-label="Errors" class="r">${v.error}</td><td data-label="Last run">${timeEl(v.last_at, ago(v.last_at))}</td></tr>`;
+  }).join("") : `<tr><td colspan="5" class="empty">No extraction activity in the last 24 hours.</td></tr>`;
+  const dg = digest || {};
+  document.getElementById("digest-tiles").innerHTML =
+    tile("Weekly digests sent · 7d", dg.sent_last_7d ?? 0, [["Last sent", timeEl(dg.last_sent_at, ago(dg.last_sent_at))]], "ok");
 }
 
-function renderDigest(d) {
-  const el = document.getElementById("digest-grid");
-  el.innerHTML = `
-    <div class="card">
-      <div class="title">Sent (7d)</div>
-      <div class="row"><b style="font-size:22px;">${d.sent_last_7d ?? 0}</b></div>
-      <div class="log-hint"><b>Log:</b> ${DIGEST_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">Last sent</div>
-      <div class="row"><b>${d.last_sent_at ? new Date(d.last_sent_at).toLocaleString() : "never"}</b></div>
-      <div class="log-hint"><b>Log:</b> ${DIGEST_LOG_HINT}</div>
-    </div>`;
+function renderInfra(db, sys) {
+  const t = [];
+  const disk = (sys || {}).disk || {}, mem = (sys || {}).memory || {}, cpu = (sys || {}).cpu || {};
+  if (disk.error) t.push(`<div class="panel tile"><h3>Disk</h3><div class="err-text">${esc(disk.error)}</div></div>`);
+  else if (disk.total_gb) { const s = usageSev(disk.percent_used, 80, 92); t.push(tile("Disk", pct(disk.percent_used), [["Used", `${disk.used_gb} / ${disk.total_gb} GB`], ["Free", `${disk.free_gb} GB`]], s, disk.percent_used)); }
+  if (mem.error) t.push(`<div class="panel tile"><h3>Memory</h3><div class="err-text">${esc(mem.error)}</div></div>`);
+  else if (mem.total_mb) { const s = usageSev(mem.percent_used, 85, 95); t.push(tile("Memory", pct(mem.percent_used), [["Used", `${(mem.used_mb / 1024).toFixed(1)} / ${(mem.total_mb / 1024).toFixed(1)} GB`], ["Available", `${(mem.available_mb / 1024).toFixed(1)} GB`]], s, mem.percent_used)); }
+  if (cpu.error) t.push(`<div class="panel tile"><h3>CPU</h3><div class="err-text">${esc(cpu.error)}</div></div>`);
+  else if (cpu.core_count) { const s = cpu.load_5m > cpu.core_count ? "warn" : "ok"; t.push(tile("CPU load (5 min)", cpu.load_5m, [["1 / 15 min", `${cpu.load_1m} / ${cpu.load_15m}`], ["Cores", cpu.core_count]], s)); }
+  t.push(tile("Database size", bytes((db || {}).total_bytes), [["Tables listed", ((db || {}).largest_tables || []).length]], "ok"));
+  document.getElementById("compute-tiles").innerHTML = t.join("");
+  const tables = (db || {}).largest_tables || [];
+  const max = Math.max(1, ...tables.map(x => x.bytes || 0));
+  document.getElementById("db-body").innerHTML = tables.length ? tables.map(x => `
+    <tr><td class="lead"><span class="job-id" style="font-size:12.5px;color:var(--text);">${esc(x.table)}</span></td>
+    <td data-label="Size" class="r">${esc(bytes(x.bytes))}</td>
+    <td data-label="Share">${meter((x.bytes / max) * 100, "ok")}</td></tr>`).join("") : `<tr><td colspan="3" class="empty">No table data.</td></tr>`;
 }
 
-function renderFcm(fcm) {
-  const el = document.getElementById("fcm-grid");
-  const by = fcm.last_24h || {};
-  const sent = by.sent || 0, stale = by.stale || 0, error = by.error || 0, noToken = by.no_token || 0;
-  const errPill = (error > 0 || stale > 0) ? "warn" : "ok";
-  el.innerHTML = `
-    <div class="card">
-      <div class="title">Sent</div>
-      <div class="row"><b style="font-size:22px;">${sent}</b></div>
-      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">Stale / Error</div>
-      <div class="row"><span class="pill ${errPill}">${stale} stale, ${error} error</span></div>
-      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">No token</div>
-      <div class="row"><b>${noToken}</b></div>
-      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
-    </div>
-    <div class="card">
-      <div class="title">Registered devices</div>
-      <div class="row"><b>${fcm.registered_tokens ?? 0}</b></div>
-      <div class="row" style="font-size:11px;"><span>Last send</span><span>${fcm.last_send_at ? new Date(fcm.last_send_at).toLocaleString() : "never"}</span></div>
-      <div class="log-hint"><b>Log:</b> ${FCM_LOG_HINT}</div>
-    </div>`;
+function renderAll() {
+  const d = state.data;
+  if (!d) return;
+  const items = collectAttention(d);
+  renderOverview(d, items);
+  renderJobs(d.jobs);
+  renderTasks(d.tasks, d.task_buffer);
+  renderDelivery(d.email, d.fcm);
+  renderPipelines(d.ei_realtime, d.weekly_digest);
+  renderInfra(d.db, d.system);
+  document.title = (items.some(i => i.sev === "crit") ? "✕ " : items.length ? "! " : "") + "Throughline Ops";
 }
 
-function fmtBytes(b) {
-  if (b === null || b === undefined) return "-";
-  const gb = b / 1e9;
-  if (gb >= 1) return gb.toFixed(2) + " GB";
-  return (b / 1e6).toFixed(1) + " MB";
-}
-
-function renderDb(db) {
-  const el = document.getElementById("db-grid");
-  const tableRows = (db.largest_tables || []).map(t =>
-    `<tr><td>${t.table}</td><td>${fmtBytes(t.bytes)}</td></tr>`
-  ).join("");
-  el.innerHTML = `
-    <div class="card">
-      <div class="title">Total DB size</div>
-      <div class="row"><b style="font-size:22px;">${fmtBytes(db.total_bytes)}</b></div>
-      <div class="log-hint"><b>Log:</b> ${DB_LOG_HINT}</div>
-    </div>
-    <div class="card" style="grid-column: span 2; padding:0;">
-      <div class="title" style="padding:var(--space-4) var(--space-4) 0;">Largest tables</div>
-      <table style="padding:0 var(--space-4) var(--space-3);"><tr><th>table</th><th>size</th></tr>${tableRows}</table>
-      <div class="log-hint" style="margin:0 var(--space-4) var(--space-3); border-radius:var(--radius-xs);"><b>Log:</b> ${DB_LOG_HINT}</div>
-    </div>`;
-}
-
-function barClass(pct) {
-  if (pct >= 90) return "bad";
-  if (pct >= 70) return "warn";
-  return "";
-}
-
-function renderSystem(sys) {
-  const el = document.getElementById("system-grid");
-  const disk = sys.disk || {};
-  const mem = sys.memory || {};
-  const cpu = sys.cpu || {};
-
-  const diskHtml = disk.error
-    ? `<div class="err">${disk.error}</div>`
-    : `<div class="row"><span>Used</span><b>${disk.used_gb} / ${disk.total_gb} GB</b></div>
-       <div class="bar-track"><div class="bar-fill ${barClass(disk.percent_used)}" style="width:${disk.percent_used}%"></div></div>
-       <div class="row" style="margin-top:6px;"><span>Free</span><b>${disk.free_gb} GB</b></div>`;
-
-  const memHtml = mem.error
-    ? `<div class="err">${mem.error}</div>`
-    : `<div class="row"><span>Used</span><b>${(mem.used_mb/1024).toFixed(1)} / ${(mem.total_mb/1024).toFixed(1)} GB</b></div>
-       <div class="bar-track"><div class="bar-fill ${barClass(mem.percent_used)}" style="width:${mem.percent_used}%"></div></div>`;
-
-  const cpuHtml = cpu.error
-    ? `<div class="err">${cpu.error}</div>`
-    : `<div class="row"><span>Load (1m/5m/15m)</span><b>${cpu.load_1m} / ${cpu.load_5m} / ${cpu.load_15m}</b></div>
-       <div class="row"><span>Cores</span><b>${cpu.core_count}</b></div>`;
-
-  el.innerHTML = `
-    <div class="card"><div class="title">Disk</div>${diskHtml}</div>
-    <div class="card"><div class="title">Memory</div>${memHtml}</div>
-    <div class="card"><div class="title">CPU</div>${cpuHtml}</div>`;
+/* ---------- freshness + refresh ---------- */
+function renderFreshness() {
+  const dot = document.getElementById("live-dot"), txt = document.getElementById("freshness-text");
+  if (!state.lastOkAt) { txt.textContent = state.lastTryFailed ? "Could not load" : "Loading…"; dot.className = "live-dot stale"; return; }
+  const age = (Date.now() - state.lastOkAt) / 1000;
+  const stale = age > (REFRESH_MS / 1000) * 2.5;
+  dot.className = "live-dot" + (state.paused ? " paused" : stale || state.lastTryFailed ? " stale" : "");
+  txt.textContent = (state.paused ? "Paused · " : "") + "Updated " + (age < 5 ? "just now" : ago(new Date(state.lastOkAt).toISOString()));
 }
 
 async function refresh() {
   const btn = document.getElementById("refresh-btn");
-  btn.disabled = true;
-  btn.textContent = "Refreshing...";
+  btn.disabled = true; btn.textContent = "Refreshing…";
   try {
-    const res = await fetch("/admin/api/status", { credentials: "same-origin" });
+    const res = await fetch("/admin/api/status", { credentials: "same-origin", headers: { Accept: "application/json" } });
     if (res.status === 401 || res.redirected) { window.location.href = "/admin/login"; return; }
-    const data = await res.json();
-    renderJobs(data.jobs);
-    renderTasks(data.tasks, data.task_buffer);
-    renderEmail(data.email);
-    renderGauges(data.gauges);
-    renderEi(data.ei_realtime);
-    renderDigest(data.weekly_digest);
-    renderFcm(data.fcm);
-    renderDb(data.db);
-    renderSystem(data.system);
-    document.getElementById("generated-at").textContent =
-      "Updated " + new Date(data.generated_at).toLocaleTimeString() +
-      " · EI " + (data.flags.emotional_intelligence_enabled ? "on" : "off") +
-      " · Nudges " + (data.flags.nudge_feature_enabled ? "on" : "off");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    state.data = await res.json();
+    state.lastOkAt = Date.now(); state.lastTryFailed = false;
+    document.getElementById("fetch-banner").classList.remove("show");
+    renderAll();
   } catch (e) {
-    document.getElementById("generated-at").textContent = "Failed to load: " + e;
+    state.lastTryFailed = true;
+    const b = document.getElementById("fetch-banner");
+    b.textContent = state.lastOkAt
+      ? `Couldn't refresh (${e.message || e}). Showing data from ${new Date(state.lastOkAt).toLocaleTimeString()} — it may be out of date.`
+      : `Couldn't load the dashboard (${e.message || e}). Retrying every 30 seconds.`;
+    b.classList.add("show");
   } finally {
-    btn.disabled = false;
-    btn.textContent = "Refresh";
+    btn.disabled = false; btn.textContent = "Refresh";
+    renderFreshness();
   }
 }
-
-function updateToggleIcon() {
-  document.getElementById('theme-toggle').textContent = document.documentElement.dataset.theme === 'light' ? '☀️' : '🌙';
+function schedule() {
+  clearInterval(state.timer);
+  if (!state.paused) state.timer = setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
 }
-function toggleTheme() {
-  var next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+
+/* ---------- interactions ---------- */
+async function jobAction(job, act, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  try {
+    const res = await fetch(`/admin/api/jobs/${encodeURIComponent(job)}/${act}`, { method: "POST", credentials: "same-origin" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) alert(`Couldn't ${act} ${job}: ${data.error || "HTTP " + res.status}`);
+    else toast(`${job}: ${act} done`);
+  } catch (e) { alert(`Couldn't ${act} ${job}: ${e}`); }
+  refresh();
+}
+async function deleteCustomJob(job) {
+  if (!confirm(`Delete custom job "${job}"? Its schedule and run history are removed; log files on disk are kept.`)) return;
+  try {
+    const res = await fetch(`/admin/api/custom-jobs/${encodeURIComponent(job)}`, { method: "DELETE", credentials: "same-origin" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) alert(`Delete failed: ${data.error || "HTTP " + res.status}`);
+    else { state.expanded.delete(job); toast(`Deleted ${job}`); }
+  } catch (e) { alert(`Delete failed: ${e}`); }
+  refresh();
+}
+function toggleJob(name) {
+  if (state.expanded.has(name)) state.expanded.delete(name); else state.expanded.add(name);
+  renderJobs(state.data && state.data.jobs);
+  const row = document.getElementById("job-" + name);
+  if (row) row.focus({ preventScroll: true });
+}
+
+document.addEventListener("click", (ev) => {
+  const t = ev.target.closest("[data-act],[data-delete],[data-copy],[data-job-row],[data-open-job],[data-filter]");
+  if (!t) return;
+  if (t.dataset.act) { ev.stopPropagation(); jobAction(t.dataset.job, t.dataset.act, t.dataset.confirm); }
+  else if (t.dataset.delete) { ev.stopPropagation(); deleteCustomJob(t.dataset.delete); }
+  else if (t.dataset.copy !== undefined) { ev.stopPropagation(); copy(t.dataset.copy); }
+  else if (t.dataset.openJob) {
+    state.filter = "all"; syncFilterButtons();
+    state.expanded.add(t.dataset.openJob); renderJobs(state.data && state.data.jobs);
+  }
+  else if (t.dataset.filter) { state.filter = t.dataset.filter; syncFilterButtons(); renderJobs(state.data && state.data.jobs); }
+  else if (t.dataset.jobRow) {
+    if (ev.target.closest("button, a, input, code")) return;
+    toggleJob(t.dataset.jobRow);
+  }
+});
+document.addEventListener("keydown", (ev) => {
+  const row = ev.target.closest && ev.target.closest("[data-job-row]");
+  if (row && (ev.key === "Enter" || ev.key === " ") && ev.target === row) { ev.preventDefault(); toggleJob(row.dataset.jobRow); }
+});
+function syncFilterButtons() {
+  document.querySelectorAll("[data-filter]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter)));
+}
+document.getElementById("job-search").addEventListener("input", (e) => { state.search = e.target.value; renderJobs(state.data && state.data.jobs); });
+document.getElementById("refresh-btn").addEventListener("click", refresh);
+document.getElementById("pause-btn").addEventListener("click", (e) => {
+  state.paused = !state.paused;
+  e.currentTarget.textContent = state.paused ? "Resume" : "Pause";
+  e.currentTarget.setAttribute("aria-pressed", String(state.paused));
+  schedule(); renderFreshness();
+  if (!state.paused) refresh();
+});
+document.getElementById("theme-btn").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
   document.documentElement.dataset.theme = next;
-  localStorage.setItem('admin_theme', next);
-  updateToggleIcon();
-}
-updateToggleIcon();
-
-function toggleNavGroup(key) {
-  var children = document.getElementById('children-' + key);
-  var chevron = document.getElementById('chevron-' + key);
-  var collapsing = !children.classList.contains('collapsed');
-  children.classList.toggle('collapsed', collapsing);
-  chevron.classList.toggle('collapsed', collapsing);
-  document.querySelector('.nav-parent[onclick*="' + key + '"]').setAttribute('aria-expanded', String(!collapsing));
-  try { localStorage.setItem('admin_nav_' + key, collapsing ? 'closed' : 'open'); } catch (e) {}
-}
-// Restore each group's collapsed/expanded state from the last visit --
-// defaults to expanded (both are small, two-and-one-item trees) if never
-// toggled before.
-['infra', 'finance'].forEach(function (key) {
-  var saved;
-  try { saved = localStorage.getItem('admin_nav_' + key); } catch (e) { saved = null; }
-  if (saved === 'closed') toggleNavGroup(key);
+  try { localStorage.setItem("admin_theme", next); } catch (e) {}
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !state.paused && state.lastOkAt && Date.now() - state.lastOkAt > REFRESH_MS) refresh();
 });
 
-function toggleScheduleFields() {
-  const kind = document.getElementById("cj-kind").value;
-  document.getElementById("cj-cron-fields").style.display = kind === "cron" ? "" : "none";
-  document.getElementById("cj-interval-fields").style.display = kind === "interval" ? "" : "none";
+// Sidebar: highlight the section in view.
+const navLinks = document.querySelectorAll("[data-nav]");
+if ("IntersectionObserver" in window) {
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(en => {
+      if (en.isIntersecting) navLinks.forEach(a => a.classList.toggle("active", a.dataset.nav === en.target.id));
+    });
+  }, { rootMargin: "-30% 0px -60% 0px" });
+  document.querySelectorAll("section.block").forEach(s => obs.observe(s));
 }
 
-async function createCustomJob() {
-  const msgEl = document.getElementById("cj-msg");
-  const submitBtn = document.getElementById("cj-submit");
-  msgEl.textContent = "";
-  msgEl.className = "form-msg";
-
+/* ---------- custom job form ---------- */
+document.getElementById("cj-kind").addEventListener("change", (e) => {
+  document.getElementById("cj-cron-fields").hidden = e.target.value !== "cron";
+  document.getElementById("cj-interval-fields").hidden = e.target.value !== "interval";
+});
+document.getElementById("cj-submit").addEventListener("click", async () => {
+  const msg = document.getElementById("cj-msg"), btn = document.getElementById("cj-submit");
+  const set = (text, cls) => { msg.textContent = text; msg.className = "form-msg " + (cls || ""); };
   const job_name = document.getElementById("cj-name").value.trim();
   const script_path = document.getElementById("cj-script").value.trim();
   const schedule_kind = document.getElementById("cj-kind").value;
   const log_dir = document.getElementById("cj-logdir").value.trim();
   const body = { job_name, script_path, schedule_kind, log_dir };
-
+  if (!job_name || !script_path) return set("Job name and script path are required.", "error");
   if (schedule_kind === "cron") {
-    const hoursRaw = document.getElementById("cj-hours").value.trim();
-    body.hours_utc = hoursRaw.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n) && n >= 0 && n <= 23);
-    if (!body.hours_utc.length) { msgEl.textContent = "Enter at least one valid hour (0-23)."; msgEl.className = "form-msg error"; return; }
+    body.hours_utc = document.getElementById("cj-hours").value.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n) && n >= 0 && n <= 23);
+    if (!body.hours_utc.length) return set("Enter at least one hour between 0 and 23.", "error");
   } else {
     const n = parseInt(document.getElementById("cj-interval").value, 10);
-    if (!n || n < 1) { msgEl.textContent = "Enter a valid interval in minutes."; msgEl.className = "form-msg error"; return; }
+    if (!n || n < 1) return set("Enter an interval of at least 1 minute.", "error");
     body.interval_minutes = n;
   }
-  if (!job_name || !script_path) {
-    msgEl.textContent = "Job name and script path are required.";
-    msgEl.className = "form-msg error";
-    return;
-  }
-
-  submitBtn.disabled = true;
+  btn.disabled = true; set("Creating…");
   try {
-    const res = await fetch("/admin/api/custom-jobs", {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      msgEl.textContent = `Created "${job_name}" -- it'll fire automatically within ${SCHEDULER_TICK_NOTE}.`;
-      msgEl.className = "form-msg ok";
-      document.getElementById("cj-name").value = "";
-      document.getElementById("cj-script").value = "";
-      document.getElementById("cj-hours").value = "";
-      document.getElementById("cj-interval").value = "";
-      document.getElementById("cj-logdir").value = "";
+    const res = await fetch("/admin/api/custom-jobs", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      set(`Created "${job_name}". It fires within 30 seconds of its scheduled time.`, "ok");
+      ["cj-name", "cj-script", "cj-hours", "cj-interval", "cj-logdir"].forEach(id => document.getElementById(id).value = "");
       refresh();
-    } else {
-      msgEl.textContent = data.error || "Failed to create job.";
-      msgEl.className = "form-msg error";
-    }
-  } catch (e) {
-    msgEl.textContent = "Failed to create job: " + e;
-    msgEl.className = "form-msg error";
-  } finally {
-    submitBtn.disabled = false;
-  }
-}
-const SCHEDULER_TICK_NOTE = "30 seconds of its scheduled time";
+    } else set(data.error || `Couldn't create the job (HTTP ${res.status}).`, "error");
+  } catch (e) { set("Couldn't create the job: " + e, "error"); }
+  finally { btn.disabled = false; }
+});
 
 refresh();
-setInterval(refresh, REFRESH_MS);
+schedule();
+setInterval(renderFreshness, 5000);
 </script>
 </body>
 </html>
