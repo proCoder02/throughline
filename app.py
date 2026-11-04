@@ -51,6 +51,9 @@ import mail_sent_box
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
 from ops.tracking import record_fcm_send, record_heartbeat
+from ops import checks as ops_checks
+from ops import tasks as ops_tasks
+from ops.probe import ops_probe_worker
 
 load_dotenv()
 
@@ -3252,12 +3255,14 @@ def generate_conversation_title(raw_transcript):
     return title[:80] or None
 
 
+@ops_tasks.tracked("conversation_titling")
 def run_conversation_titling(user_id, conversation_id, raw_transcript):
     """Runs in its own thread with its own pooled connection, same pattern
     as run_background_analysis -- generating the title is an LLM call and
     shouldn't hold up the websocket teardown it's triggered from."""
     title = generate_conversation_title(raw_transcript)
     if not title:
+        ops_tasks.fail("no title generated")
         return
     conn = get_raw_connection()
     try:
@@ -3275,6 +3280,7 @@ def run_conversation_titling(user_id, conversation_id, raw_transcript):
             cache_delete(f"user:{user_id}:conversation:{conversation_id}", f"user:{user_id}:conversations")
     except Exception as e:
         print(f"[run_conversation_titling] DB error: {e!r}")
+        ops_tasks.fail(f"DB error: {e!r}")
         conn.rollback()
     finally:
         release_raw_connection(conn)
@@ -3505,6 +3511,7 @@ def _apply_tags_questions_setting(user_id, topics, questions):
     return topics, questions
 
 
+@ops_tasks.tracked("transcript_analysis")
 def run_background_analysis(user_id, conversation_id, delta_text, push):
     """Runs in its own thread with its own pooled connection -- Flask's
     request-scoped `g` connection can't be shared across threads. Extracts
@@ -3512,6 +3519,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     pass (not the whole conversation), then pushes a summary back over the
     websocket so the UI can show it without the user clicking Analyze."""
     if not delta_text.strip():
+        ops_tasks.ignore()
         return
 
     conn = get_raw_connection()
@@ -3527,11 +3535,13 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
             {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
             {"role": "user", "content": delta_text},
         ])
-    except Exception:
+    except Exception as e:
+        ops_tasks.fail(f"LLM call failed: {e!r}")
         return
 
     parsed = extract_json(content)
     if not parsed:
+        ops_tasks.fail("LLM reply was not valid JSON")
         return
 
     tasks = parsed.get("tasks") or []
@@ -3612,6 +3622,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
         cur.close()
     except Exception as e:
         print(f"[run_background_analysis] DB error: {e!r}")
+        ops_tasks.fail(f"DB error: {e!r}")
         conn.rollback()
         created_tasks = []
         notify_mood_friend_ids = []
@@ -3731,6 +3742,7 @@ Reply with ONLY this JSON, no preamble/fences:
 {{"reminders": [{{"description": "", "due_date": null, "reminder_at": null}}]}}"""
 
 
+@ops_tasks.tracked("reminder_extraction")
 def trigger_reminder_extraction(user_id, message_content) -> None:
     """Fire-and-forget, mirrors trigger_chat_feedback_extraction exactly --
     call from a background thread right after /chat or /chat/global has
@@ -3751,9 +3763,8 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
     response is already on its way, so a failure here must never surface to
     the user."""
     message_content = (message_content or "").strip()
-    if not user_id or not message_content:
-        return
-    if not _REMINDER_INTENT_RE.search(message_content):
+    if not user_id or not message_content or not _REMINDER_INTENT_RE.search(message_content):
+        ops_tasks.ignore()  # most chat messages: not a reminder request, no LLM call
         return
 
     try:
@@ -3786,6 +3797,7 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
             conn.commit()
         except Exception as e:
             print(f"[trigger_reminder_extraction] DB error: {e!r}")
+            ops_tasks.fail(f"DB error: {e!r}")
             conn.rollback()
             return
         finally:
@@ -3807,6 +3819,7 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
             )
     except Exception as e:
         print(f"[trigger_reminder_extraction] failed: {e!r}")
+        ops_tasks.fail(repr(e))
 
 
 # ---------------------------------------------------------------------------
@@ -4078,19 +4091,29 @@ def relay_ephemeral(user_id, event):
         pass
 
 
+_notify_listener_state = ops_checks.ListenerState()
+_live_listen_sessions = ops_checks.LiveCounter()  # /ws/listen Deepgram sessions open right now
+
+
 def _notify_pubsub_listener():
     """Cross-process delivery: if some other worker process holds the live
     connection for a user an event was just published for, this delivers it
     there. In today's single-process deployment this never fires for a
     connection this same process already handled synchronously above (the
     `origin` check skips those) -- it only matters once/if this ever runs
-    with more than one worker."""
+    with more than one worker.
+
+    Polls with a timeout instead of blocking in pubsub.listen() forever, so
+    every pass (message or not) ticks _notify_listener_state -- that's what
+    ops/checks.py's probe reads to tell a live listener from a stuck one."""
     while True:
         try:
             pubsub = redis_pubsub_client.pubsub()
             pubsub.subscribe(_NOTIFY_CHANNEL)
-            for message in pubsub.listen():
-                if message.get("type") != "message":
+            while True:
+                message = pubsub.get_message(timeout=30)
+                _notify_listener_state.tick(connected=True)
+                if not message or message.get("type") != "message":
                     continue
                 try:
                     payload = json.loads(message["data"])
@@ -4109,15 +4132,18 @@ def _notify_pubsub_listener():
                         ws.send(json.dumps(event))
                     except Exception:
                         pass
+                _notify_listener_state.delivered_one()
                 try:
                     redis_client.lrem(f"pending_events:{user_id}", 1, json.dumps(event))
                 except redis.RedisError:
                     pass
         except redis.RedisError as e:
             print(f"[redis] notify pubsub listener error: {e!r}; retrying in 5s")
+            _notify_listener_state.failed(e)
             time.sleep(5)
         except Exception as e:
             print(f"[redis] notify pubsub listener crashed: {e!r}; retrying in 5s")
+            _notify_listener_state.failed(e)
             time.sleep(5)
 
 
@@ -4604,6 +4630,7 @@ def ws_listen(ws):
     threading.Thread(target=receive_from_deepgram, daemon=True).start()
     threading.Thread(target=audio_classifier_worker, daemon=True).start()
 
+    _live_listen_sessions.opened()
     try:
         while True:
             chunk = ws.receive()
@@ -4641,6 +4668,7 @@ def ws_listen(ws):
             except Exception:
                 break
     finally:
+        _live_listen_sessions.closed()
         state["stop"] = True
         try:
             dg_ws.close()
@@ -6743,6 +6771,7 @@ def upload_call_recording(call_id):
     return jsonify({"conversation_id": primary_conversation_id})
 
 
+@ops_tasks.tracked("call_titling")
 def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
     """Legacy web mixed-stream call path: every participant's conversation
     holds the exact same raw_transcript already, so generate its title once
@@ -6751,6 +6780,7 @@ def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
     different wording for what's the same conversation."""
     title = generate_conversation_title(raw_transcript)
     if not title:
+        ops_tasks.fail("no title generated")
         return
     conn = get_raw_connection()
     try:
@@ -6760,6 +6790,7 @@ def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
         conn.commit()
     except Exception as e:
         print(f"[_title_all_call_conversations] DB error: {e!r}")
+        ops_tasks.fail(f"DB error: {e!r}")
         conn.rollback()
         return
     finally:
@@ -7530,7 +7561,8 @@ def chat_global():
     resolved = None
     if chat_followup.resolver_enabled() and chat_followup.needs_resolution(prompt, history):
         known_people = [r["name"] for r in speaker_rows] + [r["name"] for r in friend_rows]
-        resolved = chat_followup.resolve_with_llm(history, prompt, known_people, thread_summary=thread_summary)
+        resolved = ops_tasks.run("chat_resolver", chat_followup.resolve_with_llm,
+                                 history, prompt, known_people, thread_summary=thread_summary)
     if resolved:
         resolved_lower = resolved["standalone"].lower()
         hinted = {n.lower() for n in resolved["people"]}
@@ -7941,7 +7973,7 @@ def chat_global():
         if chat_summary.enabled():
             # Background: folds whatever just scrolled out of the history
             # window into the running summary; the reply never waits on it.
-            _spawn_background(chat_summary.update, get_raw_connection, release_raw_connection,
+            _spawn_background(ops_tasks.wrap("chat_summary", chat_summary.update), get_raw_connection, release_raw_connection,
                               user_id, CHAT_HISTORY_MAX_TURNS * 2)
 
     try:
@@ -9153,11 +9185,32 @@ except Exception as e:
 # the reminder-email worker needs its own start path here instead. Only
 # safe with a single worker process; running multiple gunicorn workers
 # would start one thread per worker and send duplicate reminder emails.
+def _start_ops_monitoring():
+    """Hands ops/ the objects this file owns; every check itself lives in
+    ops/checks.py, and ops/probe.py's worker runs them."""
+    def _costlens_stats():
+        try:
+            from costlens_agent import get_stats
+            return get_stats()
+        except Exception:
+            return None
+
+    ops_checks.install(
+        redis_client=redis_client,
+        notify_listener=_notify_listener_state,
+        rq_queues=[call_queue],
+        costlens_stats=_costlens_stats,
+        gauges={"live_transcription_sessions": _live_listen_sessions.snapshot},
+    )
+    threading.Thread(target=ops_probe_worker, daemon=True).start()
+
+
 if __name__ != "__main__" and IS_WEB_ROLE:
     threading.Thread(target=email_reminder_worker, daemon=True).start()
     threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
     threading.Thread(target=ops_alert_worker, daemon=True).start()
     threading.Thread(target=custom_job_scheduler, daemon=True).start()
+    _start_ops_monitoring()
     _start_nudge_worker_safely()
 
 if __name__ == "__main__":
@@ -9179,6 +9232,7 @@ if __name__ == "__main__":
         threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
         threading.Thread(target=ops_alert_worker, daemon=True).start()
         threading.Thread(target=custom_job_scheduler, daemon=True).start()
+        _start_ops_monitoring()
         _start_nudge_worker_safely()
 
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True, ssl_context=ssl_context)

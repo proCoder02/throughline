@@ -16,6 +16,7 @@ from email.utils import formataddr
 
 from . import db as ops_db
 from .jobs import job_status
+from .probe import probe_jobs
 from .schema import ensure_ops_schema
 from .tracking import record_completed_run
 
@@ -97,10 +98,14 @@ def ops_alert_worker():
             cur = ops_db.dict_cursor(conn)
             ensure_ops_schema(cur, conn)
             _ensure_alerts_table(cur, conn)
+            probe_names = set(probe_jobs())
             for job in job_status(cur, conn):
                 job_name = job["job_name"]
                 checked[job_name] = {"stale": job["stale"], "age_hours": job["age_hours"], "status": job["status"]}
-                if not job["stale"]:
+                # A health probe (ops/checks.py) reporting "error" is as
+                # alert-worthy as a stale job -- e.g. no RQ worker running.
+                failing = job_name in probe_names and job["status"] == "error"
+                if not (job["stale"] or failing):
                     _consecutive_stale[job_name] = 0
                     continue
                 _consecutive_stale[job_name] = _consecutive_stale.get(job_name, 0) + 1
@@ -115,11 +120,15 @@ def ops_alert_worker():
                     checked[job_name]["skipped_cooldown"] = True
                     continue
                 age_desc = f"{job['age_hours']:.1f}h ago" if job["age_hours"] is not None else "never run"
+                if job["stale"]:
+                    subject = f"[Throughline] {job_name} is stale"
+                    body = f"{job_name} last ran: {age_desc} (status: {job['status']})."
+                else:
+                    problem = (job.get("detail") or {}).get("problem") or (job.get("detail") or {}).get("error") or "see dashboard"
+                    subject = f"[Throughline] {job_name} is failing"
+                    body = f"{job_name} health check failed {age_desc}: {problem}"
                 email_ok = _send_alert_email(
-                    alert_email,
-                    f"[Throughline] {job_name} is stale",
-                    f"{job_name} last ran: {age_desc} (status: {job['status']}).\n\n"
-                    f"Check https://129-213-21-239.sslip.io/admin for details.",
+                    alert_email, subject, body + "\n\nCheck https://129-213-21-239.sslip.io/admin for details.",
                 )
                 checked[job_name]["email_sent"] = email_ok
                 cur.execute(

@@ -48,6 +48,13 @@ class CostLensTracker:
         self._buffer: List[dict] = []
         self._lock = threading.Lock()
         self._client = httpx.Client(timeout=10)
+        # Health numbers for the ops dashboard (stats() below).
+        self._started_at = time.monotonic()
+        self._last_ok_at = None
+        self._last_error = None
+        self._sent_total = 0
+        self._failed_flushes = 0
+        self._dropped_total = 0
 
         self._flush_thread = threading.Thread(target=self._periodic_flush, daemon=True)
         self._flush_thread.start()
@@ -93,6 +100,33 @@ class CostLensTracker:
         # only so existing call sites passing it don't need to change).
         with self._lock:
             self._buffer.append(asdict(record))
+            self._trim_locked()
+
+    # While CostLens is unreachable every failed flush puts its records
+    # back, so without a cap the buffer grows for as long as the outage
+    # lasts. Past this many, the oldest records are dropped (and counted).
+    MAX_BUFFERED = 20000
+
+    def _trim_locked(self):
+        excess = len(self._buffer) - self.MAX_BUFFERED
+        if excess > 0:
+            del self._buffer[:excess]
+            self._dropped_total += excess
+
+    def stats(self) -> dict:
+        with self._lock:
+            buffered = len(self._buffer)
+        now = time.monotonic()
+        return {
+            "flush_thread_alive": self._flush_thread.is_alive(),
+            "buffered": buffered,
+            "sent_total": self._sent_total,
+            "failed_flushes": self._failed_flushes,
+            "dropped_total": self._dropped_total,
+            "seconds_since_last_ok": round(now - self._last_ok_at, 1) if self._last_ok_at else None,
+            "seconds_since_start": round(now - self._started_at, 1),
+            "last_error": self._last_error,
+        }
 
     def _flush(self):
         # Callers (only _periodic_flush below) must NOT already hold
@@ -123,10 +157,18 @@ class CostLensTracker:
             )
             if response.status_code != 201:
                 logger.warning("CostLens ingest failed: %s", response.status_code)
+                self._failed_flushes += 1
+                self._last_error = f"HTTP {response.status_code}"
+            else:
+                self._sent_total += len(records)
+                self._last_ok_at = time.monotonic()
         except Exception as e:
             logger.warning("CostLens flush error: %s", e)
+            self._failed_flushes += 1
+            self._last_error = repr(e)[:300]
             with self._lock:
                 self._buffer = records + self._buffer
+                self._trim_locked()
 
     def _periodic_flush(self):
         while True:

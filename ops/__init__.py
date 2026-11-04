@@ -12,4 +12,11 @@ internals change. The only things another file needs from here are:
     app.register_blueprint(admin_bp).
   - ops.alerts.ops_alert_worker -- started once as a background thread,
     same pattern as every other worker in app.py.
+  - ops.checks.install(...) -- hands over the objects app.py owns (Redis
+    client, RQ queues, the notify listener's ListenerState, CostLens stats,
+    live gauges); every health check itself lives in ops/checks.py.
+  - ops.probe.ops_probe_worker -- started once, runs those checks and
+    writes out ops.tasks' buffered counts.
+  - ops.tasks.run / wrap / fail / ignore -- success/error/latency counts
+    for one-off background work (see ops/tasks.py).
 """

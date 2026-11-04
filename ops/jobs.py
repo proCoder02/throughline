@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from . import job_control
+from . import probe
 from .tracking import HEARTBEAT_SECONDS
 
 # job_name -> expected max gap between runs before it's flagged stale, in
@@ -20,6 +21,7 @@ JOB_STALE_HOURS = {
     "ei_pipeline": 15, "nudge_cycle": 3,
     "email_reminder_worker": 0.2, "call_ring_timeout_worker": 0.2,
     "ops_alert_check": 1,  # diagnostic heartbeat -- see alerts.py's record_completed_run call
+    "custom_job_scheduler": 0.2,
 }
 
 # Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
@@ -50,6 +52,10 @@ JOB_SCHEDULE = {
         "kind": "interval", "interval_seconds": 1800,
         "cadence_label": "Every 30 min (diagnostic -- see ops/alerts.py)",
     },
+    "custom_job_scheduler": {
+        "kind": "interval", "interval_seconds": HEARTBEAT_SECONDS,
+        "cadence_label": "Continuous (30s loop; heartbeat every 5 min)",
+    },
 }
 
 # job_name -> how this job can be controlled from the dashboard:
@@ -68,7 +74,10 @@ JOB_CONTROL_KIND = {
     "email_reminder_worker": "in_process",
     "call_ring_timeout_worker": "in_process",
     "ops_alert_check": "none",
+    "custom_job_scheduler": "none",  # pausing it would silently stop every custom job
 }
+# Probe-backed jobs (ops/probe.py, registered via ops/checks.py) are merged
+# in by job_status() -- they're health checks, so always control_kind "none".
 
 JOB_HISTORY_LIMIT = 5
 
@@ -136,6 +145,11 @@ def job_status(cur, conn) -> list:
     all_schedules = dict(JOB_SCHEDULE)
     all_stale_hours = dict(JOB_STALE_HOURS)
     control_kind = dict(JOB_CONTROL_KIND)
+    for name, meta in probe.probe_jobs().items():
+        all_schedules[name] = {"kind": "interval", "interval_seconds": HEARTBEAT_SECONDS,
+                               "cadence_label": meta["cadence_label"]}
+        all_stale_hours[name] = meta["stale_hours"]
+        control_kind[name] = "none"
     for name, custom in custom_jobs.items():
         sched = _custom_job_schedule(custom)
         all_schedules[name] = sched

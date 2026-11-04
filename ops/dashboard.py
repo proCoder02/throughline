@@ -20,9 +20,12 @@ from flask import Blueprint, jsonify, redirect, render_template, request, sessio
 from . import actions as ops_actions
 from . import db as ops_db
 from . import job_control as ops_job_control
+from . import probe as ops_probe
+from . import tasks as ops_tasks
 from .jobs import job_status
 from .schema import ensure_ops_schema
-from .stats import db_stats, ei_realtime_stats, fcm_stats, system_stats, weekly_digest_stats
+from .stats import db_stats, ei_realtime_stats, email_stats, fcm_stats, system_stats, weekly_digest_stats
+from .tasks import task_stats
 
 admin_bp = Blueprint("admin", __name__, template_folder="templates")
 
@@ -93,6 +96,10 @@ def admin_api_status():
             "weekly_digest": weekly_digest_stats(cur),
             "fcm": fcm_stats(cur),
             "db": db_stats(cur),
+            "tasks": task_stats(cur, conn),
+            "task_buffer": ops_tasks.buffer_state(),
+            "email": email_stats(cur, conn),
+            "gauges": ops_probe.gauges(),
             "system": system_stats(),
             "flags": {
                 "emotional_intelligence_enabled": os.getenv("EMOTIONAL_INTELLIGENCE_ENABLED", "false").strip().lower() == "true",

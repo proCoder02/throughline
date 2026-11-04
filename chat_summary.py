@@ -19,6 +19,8 @@ import time
 
 import requests
 
+from ops import tasks as ops_tasks  # reports outcomes when run via ops_tasks.wrap (no-op otherwise)
+
 DDL = """
 CREATE TABLE IF NOT EXISTS chat_thread_summaries (
     user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
@@ -159,10 +161,12 @@ def update(get_conn, release_conn, user_id, recent_window, post=requests.post):
         rows = pending_messages(cur, user_id, recent_window, covered)
         conn.commit()
         if len(rows) < MIN_NEW_MESSAGES:
+            ops_tasks.ignore()  # nothing has scrolled out yet: no model call
             return
         started = time.time()
         new_summary = summarize(summary, rows, post=post)
         if new_summary is None:
+            ops_tasks.fail("summary model call failed or returned nothing")
             return
         last_id = rows[-1][0]
         # Only if nobody else moved it on meanwhile (two quick turns) --
@@ -176,6 +180,7 @@ def update(get_conn, release_conn, user_id, recent_window, post=requests.post):
         print(f"[chat-summary] user {user_id}: folded {len(rows)} messages in {time.time() - started:.1f}s")
     except Exception as e:
         print(f"[chat-summary] update failed: {e!r}")
+        ops_tasks.fail(repr(e))
         if conn is not None:
             try:
                 conn.rollback()

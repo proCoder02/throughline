@@ -351,6 +351,21 @@
   </section>
 
   <section>
+    <h2>Background Tasks (last 24h)</h2>
+    <div id="tasks-table"><div class="empty">Loading...</div></div>
+  </section>
+
+  <section>
+    <h2>Email Sends (last 7 days)</h2>
+    <div class="grid" id="email-grid"></div>
+  </section>
+
+  <section>
+    <h2>Live</h2>
+    <div class="grid" id="gauges-grid"></div>
+  </section>
+
+  <section>
     <h2>EI Extraction (last 24h)</h2>
     <div id="ei-table"><div class="empty">Loading...</div></div>
   </section>
@@ -444,7 +459,32 @@ const JOB_LOG_HINTS = {
   nudge_cycle: 'journalctl -u throughline -g "nudge_engine"',
   email_reminder_worker: 'journalctl -u throughline -g "email_reminder_worker"',
   call_ring_timeout_worker: 'journalctl -u throughline -g "call_ring_timeout_worker"',
+  custom_job_scheduler: 'journalctl -u throughline -g "ops.scheduler"',
+  notify_pubsub_listener: 'journalctl -u throughline -g "notify pubsub listener"',
+  redis: 'journalctl -u redis-server',
+  costlens_flush: 'journalctl -u throughline -g "CostLens"',
+  rq_worker_calls: 'journalctl -u throughline -g "ops.probe"',
 };
+
+// Probe-backed cards (ops/checks.py) carry their findings in detail --
+// show the problem line plus the scalar numbers, so the card answers
+// "why red?" without opening the logs.
+function renderDetail(j) {
+  const d = j.detail;
+  if (!d || typeof d !== "object" || j.control_kind !== "none" || j.job_name === "ops_alert_check") return "";
+  const problem = d.problem || (j.status === "error" && d.error) || "";
+  const rows = Object.entries(d)
+    .filter(([k, v]) => k !== "problem" && k !== "error" && v !== null && typeof v !== "object")
+    .slice(0, 7)
+    .map(([k, v]) => `<div class="job-field"><span class="job-field-label">${esc(k.replace(/_/g, " "))}</span><span class="job-field-value">${esc(String(v))}</span></div>`)
+    .join("");
+  const problemHtml = problem ? `<div class="err" style="margin-top:var(--space-2);">${esc(problem)}</div>` : "";
+  return problemHtml + (rows ? `<div class="job-fields" style="margin-top:var(--space-2);">${rows}</div>` : "");
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
 
 function logHintForJob(j) {
   // Any subprocess-kind job (ei_pipeline, every custom job) gets a real
@@ -549,6 +589,7 @@ function renderJobs(jobs) {
           <div class="job-field"><span class="job-field-label">Run time</span><span class="job-field-value">${fmtDuration(j.duration_seconds)}</span></div>
           <div class="job-field"><span class="job-field-label">Next run</span><span class="job-field-value">${j.on_ice ? "— (on ice)" : fmtNextRun(j.next_run_at)}</span></div>
         </div>
+        ${renderDetail(j)}
         <div class="job-history">
           <span class="job-history-label">Last ${(j.history||[]).length || 0} runs</span>
           <span class="job-history-dots">${renderHistoryDots(j.history)}</span>
@@ -568,6 +609,95 @@ const DIGEST_LOG_HINT = 'journalctl -u throughline -g "nudge_engine"';
 const FCM_LOG_HINT = 'journalctl -u throughline -g "fcm"';
 const DB_LOG_HINT = 'journalctl -u throughline';
 const SYSTEM_LOG_HINT = 'journalctl -u throughline';
+
+const TASK_LABELS = {
+  chat_resolver: "Chat follow-up resolver (Groq, on the request path)",
+  chat_summary: "Chat thread summary",
+  transcript_analysis: "Live transcript analysis",
+  conversation_titling: "Conversation titling",
+  call_titling: "Call titling",
+  reminder_extraction: "Reminder extraction from chat",
+};
+const TASK_LOG_HINT = 'journalctl -u throughline -g "chat-resolver|chat-summary|run_background_analysis|titling|trigger_reminder_extraction"';
+
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return "-";
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
+}
+
+function renderTasks(tasks, buf) {
+  const el = document.getElementById("tasks-table");
+  const keys = Object.keys(tasks || {}).sort();
+  const bufNote = buf ? `<div class="meta" style="padding:var(--space-2) var(--space-3);">${buf.buffered} waiting to be written · ${buf.dropped_total} dropped since start (written every 30s)</div>` : "";
+  if (!keys.length) { el.innerHTML = `<div class="card"><div class="empty">No background task runs recorded in the last 24h.</div>${bufNote}</div>`; return; }
+  const rows = keys.map(k => {
+    const v = tasks[k];
+    const total = v.success + v.error;
+    const errRate = total ? v.error / total : 0;
+    const pill = errRate >= 0.2 ? "bad" : v.error > 0 ? "warn" : "ok";
+    const lastErr = v.last_error
+      ? `<span title="${esc(v.last_error)}">${esc(v.last_error.slice(0, 60))}${v.last_error.length > 60 ? "…" : ""}</span><br><span class="meta">${new Date(v.last_error_at).toLocaleString()}</span>`
+      : '<span class="meta">-</span>';
+    return `<tr><td>${esc(TASK_LABELS[k] || k)}<br><span class="meta">${esc(k)}</span></td><td>${v.success}</td>
+      <td><span class="pill ${pill}">${v.error}</span></td><td>${fmtMs(v.p50_ms)} / ${fmtMs(v.p95_ms)}</td>
+      <td>${v.last_at ? new Date(v.last_at).toLocaleString() : "-"}</td><td style="font-size:12px;">${lastErr}</td></tr>`;
+  }).join("");
+  el.innerHTML = `<div class="card" style="padding:0; overflow-x:auto;">
+    <table><tr><th>task</th><th>ok</th><th>error</th><th>median / p95</th><th>last run</th><th>last error</th></tr>${rows}</table>
+    ${bufNote}
+    <div class="log-hint" style="margin:0; border:none; border-top:1px solid var(--wa-border); border-radius:0;"><b>Log:</b> ${TASK_LOG_HINT}</div>
+  </div>`;
+}
+
+const EMAIL_LOG_HINT = 'journalctl -u throughline -g "email|sent-box"';
+
+function renderEmail(e) {
+  const el = document.getElementById("email-grid");
+  if (!e || e.error) { el.innerHTML = `<div class="card"><div class="err">${esc((e && e.error) || "no data")}</div></div>`; return; }
+  const unverifiedPill = e.sent_unverified > 0 ? "warn" : "ok";
+  const failedPill = e.failed_waiting > 0 ? "bad" : "ok";
+  el.innerHTML = `
+    <div class="card">
+      <div class="title">Sent</div>
+      <div class="row"><b style="font-size:22px;">${e.sent}</b></div>
+      <div class="row" style="font-size:11px;"><span>Last sent</span><span>${e.last_sent_at ? new Date(e.last_sent_at).toLocaleString() : "never"}</span></div>
+      <div class="log-hint"><b>Log:</b> ${EMAIL_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">Found in Sent folder</div>
+      <div class="row"><span>Confirmed</span><b>${e.sent_verified}</b></div>
+      <div class="row"><span>Not confirmed</span><span class="pill ${unverifiedPill}">${e.sent_unverified}</span></div>
+      <div class="log-hint"><b>Log:</b> ${EMAIL_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">Failed sends (still pending)</div>
+      <div class="row"><span class="pill ${failedPill}">${e.failed_waiting}</span></div>
+      ${e.last_error ? `<div class="row" style="font-size:11px;" title="${esc(e.last_error)}"><span>Last error</span><span>${esc(e.last_error.slice(0, 50))}</span></div>` : ""}
+      <div class="log-hint"><b>Log:</b> ${EMAIL_LOG_HINT}</div>
+    </div>
+    <div class="card">
+      <div class="title">Drafts</div>
+      <div class="row"><span>Waiting for the user</span><b>${e.drafts_waiting}</b></div>
+      <div class="row"><span>Cancelled</span><b>${e.dismissed}</b></div>
+      <div class="row"><span>Mid-send</span><b>${e.sending}</b></div>
+    </div>`;
+}
+
+const GAUGE_LABELS = { live_transcription_sessions: "Live transcription sessions" };
+
+function renderGauges(g) {
+  const el = document.getElementById("gauges-grid");
+  const keys = Object.keys(g || {});
+  if (!keys.length) { el.innerHTML = '<div class="card"><div class="empty">No live gauges registered in this process.</div></div>'; return; }
+  el.innerHTML = keys.map(k => {
+    const v = g[k] || {};
+    if (v.error) return `<div class="card"><div class="title">${esc(GAUGE_LABELS[k] || k)}</div><div class="err">${esc(v.error)}</div></div>`;
+    const first = Object.keys(v)[0];
+    const rest = Object.entries(v).slice(1).map(([kk, vv]) => `<div class="row"><span>${esc(kk.replace(/_/g, " "))}</span><b>${esc(String(vv))}</b></div>`).join("");
+    return `<div class="card"><div class="title">${esc(GAUGE_LABELS[k] || k)}</div>
+      <div class="row"><b style="font-size:22px;">${esc(String(v[first]))}</b><span>${esc(first.replace(/_/g, " "))}</span></div>${rest}</div>`;
+  }).join("");
+}
 
 function renderEi(ei) {
   const el = document.getElementById("ei-table");
@@ -696,6 +826,9 @@ async function refresh() {
     if (res.status === 401 || res.redirected) { window.location.href = "/admin/login"; return; }
     const data = await res.json();
     renderJobs(data.jobs);
+    renderTasks(data.tasks, data.task_buffer);
+    renderEmail(data.email);
+    renderGauges(data.gauges);
     renderEi(data.ei_realtime);
     renderDigest(data.weekly_digest);
     renderFcm(data.fcm);

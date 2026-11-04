@@ -29,6 +29,8 @@ import time
 
 import requests
 
+from ops import tasks as ops_tasks  # reports why a resolver call failed (no-op outside ops_tasks.run)
+
 STATE_TTL_SECONDS = 6 * 3600
 
 # Gendered pronouns only: "they/them" refer to places and things ("are they
@@ -212,6 +214,7 @@ def resolve_with_llm(history, prompt, known_people=(), post=requests.post, threa
     """Ask the small model; None on any failure so the caller just carries on."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
+        ops_tasks.fail("GROQ_API_KEY not set")
         return None
     payload = {
         "model": os.getenv("CHAT_RESOLVER_MODEL", "openai/gpt-oss-20b"),
@@ -234,7 +237,10 @@ def resolve_with_llm(history, prompt, known_people=(), post=requests.post, threa
         content = response.json()["choices"][0]["message"].get("content") or ""
     except Exception as e:
         print(f"[chat-resolver] failed after {time.time() - started:.2f}s: {e!r}")
+        ops_tasks.fail("timeout" if isinstance(e, requests.Timeout) else repr(e))
         return None
     result = parse_resolution(content)
+    if result is None:
+        ops_tasks.fail("reply was not a usable resolution")
     print(f"[chat-resolver] {time.time() - started:.2f}s {prompt!r} -> {result!r}")
     return result

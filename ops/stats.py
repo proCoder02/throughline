@@ -68,6 +68,40 @@ def fcm_stats(cur) -> dict:
     }
 
 
+def email_stats(cur, conn) -> dict:
+    """Derived from email_drafts (app.py's send_email_record writes the
+    outcome of every send there): last 7 days of drafts and direct emails,
+    and of the ones sent, how many were found again in the Sent folder.
+    A pending row with a send_error is a send that was tried and failed."""
+    try:
+        cur.execute(
+            """
+            SELECT
+              count(*) FILTER (WHERE status = 'sent') AS sent,
+              count(*) FILTER (WHERE status = 'sent' AND sent_box_verified IS TRUE) AS sent_verified,
+              count(*) FILTER (WHERE status = 'sent' AND sent_box_verified IS FALSE) AS sent_unverified,
+              count(*) FILTER (WHERE status = 'pending' AND send_error IS NOT NULL) AS failed_waiting,
+              count(*) FILTER (WHERE status = 'pending' AND send_error IS NULL) AS drafts_waiting,
+              count(*) FILTER (WHERE status = 'sending') AS sending,
+              count(*) FILTER (WHERE status = 'dismissed') AS dismissed,
+              max(sent_at) AS last_sent_at
+            FROM email_drafts
+            WHERE created_at > now() - interval '7 days'
+            """
+        )
+        r = cur.fetchone()
+        cur.execute("SELECT send_error FROM email_drafts WHERE send_error IS NOT NULL ORDER BY id DESC LIMIT 1")
+        last_err = cur.fetchone()
+        out = {k: r[k] for k in ("sent", "sent_verified", "sent_unverified", "failed_waiting",
+                                 "drafts_waiting", "sending", "dismissed")}
+        out["last_sent_at"] = r["last_sent_at"].isoformat() if r["last_sent_at"] else None
+        out["last_error"] = last_err["send_error"] if last_err else None
+        return out
+    except Exception as e:
+        conn.rollback()
+        return {"error": f"email_drafts not readable: {e!r}"[:300]}
+
+
 def db_stats(cur) -> dict:
     cur.execute("SELECT pg_database_size(current_database()) AS bytes")
     db_bytes = cur.fetchone()["bytes"]

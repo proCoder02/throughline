@@ -12,6 +12,7 @@ from . import db as ops_db
 from . import job_control
 from .jobs import _compute_next_run
 from .runner import launch_subprocess_job
+from .tracking import record_heartbeat
 
 SCHEDULER_TICK_SECONDS = 30
 
@@ -47,6 +48,11 @@ def custom_job_scheduler():
                 jobs = job_control.list_custom_jobs(cur, conn)
                 running = job_control.all_running(cur, conn)
                 iced = job_control.all_on_ice(cur, conn)
+                # Its own card on the dashboard: if this loop dies, every
+                # custom job just goes stale with no visible cause otherwise.
+                record_heartbeat(cur, conn, "custom_job_scheduler", {
+                    "custom_jobs": len(jobs), "running": len(running), "on_ice": sum(1 for v in iced.values() if v),
+                })
             finally:
                 ops_db.release_conn(conn)
 
