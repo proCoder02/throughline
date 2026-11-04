@@ -111,7 +111,7 @@ function SettingsRoute() {
 }
 
 function HomeRoute() {
-  const { auth, openConversationInChats, openGlobalChatInChats } = useOutletContext();
+  const { auth, openConversationInChats, openGlobalChatInChats, personaPending, openPersona } = useOutletContext();
   const navigate = useNavigate();
   return (
     <HomeSection
@@ -119,6 +119,8 @@ function HomeRoute() {
       onOpenConversation={openConversationInChats}
       onOpenGlobalChat={openGlobalChatInChats}
       onNavigate={(path) => navigate(path)}
+      personaPending={personaPending}
+      onOpenPersona={openPersona}
     />
   );
 }
@@ -164,7 +166,10 @@ export const router = createBrowserRouter([
       { path: 'profiles', element: <ProfilesRoute /> },
       { path: 'friends', element: <FriendsRoute /> },
       { path: 'settings', element: <SettingsRoute /> },
-      { path: 'os', element: <OsRoute /> },
+      // os/* -- one route for every screen inside it (/app/os/tasks, ...),
+      // so the browser's Back button moves between them and they can be
+      // linked to. A single route object keeps OsApp mounted across them.
+      { path: 'os/*', element: <OsRoute /> },
       { path: 'meet', element: <Suspense fallback={LAZY_FALLBACK}><MeetPage /></Suspense> },
       // Anything unrecognized under /app (including a stale bookmark to a
       // future IA path not built yet) falls back to the default section

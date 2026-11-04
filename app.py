@@ -9169,6 +9169,23 @@ def _meet_suggest_personality(user_id):
     return json.loads(match.group(0)) if match else {}
 
 
+def _public_base_url():
+    """Where links in emails should point. PUBLIC_BASE_URL when set;
+    otherwise this request's host, over https unless it's local."""
+    base = os.getenv("PUBLIC_BASE_URL", "").strip() or request.host_url
+    if base.startswith("http://") and not re.match(r"http://(localhost|127\.0\.0\.1|192\.168\.)", base):
+        base = "https://" + base[len("http://"):]
+    return base
+
+
+from password_reset import create_password_reset_blueprint
+app.register_blueprint(create_password_reset_blueprint(
+    secret_key=app.secret_key, get_db=get_db, dict_cursor=dict_cursor,
+    generate_password_hash=generate_password_hash, send_plain_email=send_plain_email,
+    public_base_url=_public_base_url,
+))
+
+
 try:
     from meet import create_meet_blueprint, is_enabled as _meet_enabled
     if _meet_enabled():

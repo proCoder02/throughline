@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { apiJson, post, del } from '../api.js';
 import { showToast, confirmDialog } from '../lib/notify.js';
 import { uploadFile, getUploadsStatus } from '../lib/uploads.js';
@@ -10,7 +10,10 @@ import PhotoViewer from '../components/PhotoViewer.jsx';
 import MailSettingsCard from '../components/MailSettingsCard.jsx';
 import AssistantChat from '../components/assistant/AssistantChat.jsx';
 import EmailSourceLink from '../components/EmailSourceLink.jsx';
-import { CameraIcon, SunIcon, MoonIcon, TrashIcon } from '../icons.jsx';
+import {
+  CameraIcon, SunIcon, MoonIcon, TrashIcon, HomeIcon, ChatIcon, FriendIcon, MeetIcon, TaskIcon, PhoneIcon,
+  ChartIcon, SparkleIcon, ShareIcon, FoodOrderIcon, BellIcon, SettingsIcon, SearchIcon, MicIcon,
+} from '../icons.jsx';
 import './os.css';
 
 // The "Personal Intelligence OS" screen -- same IA/visual design as the
@@ -30,9 +33,9 @@ import './os.css';
 // reusing code that already works in production.
 
 const SHARING_LEVELS = [
-  { value: 'off', label: 'Off', description: 'Your private cognitive information stays private.' },
-  { value: 'limited', label: 'Limited', description: 'AI may use selected context to find mutually useful outcomes.' },
-  { value: 'collaborative', label: 'Collaborative', description: 'AI can use approved context to actively help both of you coordinate.' },
+  { value: 'off', label: 'Off', description: 'Nothing Throughline knows about you is used for this friend.' },
+  { value: 'limited', label: 'Limited', description: 'Throughline may use some of what it knows to suggest things that suit you both.' },
+  { value: 'collaborative', label: 'Collaborative', description: 'Throughline can use what you approve to help you both plan together.' },
 ];
 
 const MOOD_HEIGHT = { happy: 85, excited: 92, positive: 80, calm: 62, neutral: 50, tired: 35, sad: 25, angry: 30, anxious: 40, stressed: 32 };
@@ -82,27 +85,36 @@ function DecorativeToggle({ defaultOn = false }) {
   return <Toggle on={on} onChange={setOn} />;
 }
 
-function NavItem({ icon, label, screenKey, navActive, go }) {
+function NavItem({ icon: Icon, label, screenKey, navActive, go, badge }) {
   return (
     <button
       className={'nav-item' + (navActive === screenKey ? ' active' : '')}
-      onClick={() => go(screenKey, screenKey)}
+      aria-current={navActive === screenKey ? 'page' : undefined}
+      title={label}
+      onClick={() => go(screenKey)}
     >
-      <span className="nav-icon">{icon}</span>
+      <span className="nav-icon" aria-hidden="true"><Icon /></span>
       <span>{label}</span>
+      {badge > 0 && <span className="nav-badge" aria-label={`${badge} new`}>{badge > 9 ? '9+' : badge}</span>}
     </button>
   );
 }
 
-export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
+// Every screen this page has; the URL picks one (/app/os/<screen>).
+const SCREENS = ['home', 'conversations', 'listen', 'tasks', 'people', 'calls', 'insights', 'ask', 'sharing', 'commerce', 'notifications', 'settings'];
+// Screens without their own sidebar entry highlight their parent.
+const NAV_PARENT = { listen: 'conversations' };
+
+export default function OsApp({ auth, notify, call, theme, toggleTheme, personaPending, openPersona }) {
   const navigate = useNavigate();
   const user = auth?.user;
 
-  const [screen, setScreen] = useState('home');
-  const [navActive, setNavActive] = useState('home');
-  function go(screenKey, navKey = null) {
-    setScreen(screenKey);
-    setNavActive(navKey);
+  const sub = (useParams()['*'] || '').split('/')[0];
+  const screen = SCREENS.includes(sub) ? sub : 'home';
+  const navActive = NAV_PARENT[screen] || screen;
+  function go(screenKey) {
+    if (screenKey === screen) return;
+    navigate(screenKey === 'home' ? '/app/os' : `/app/os/${screenKey}`);
   }
   const screenClass = (key) => 'screen' + (screen === key ? ' active' : '');
 
@@ -117,9 +129,21 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
   const [settings, setSettings] = useState(null);
   const [nudgeSettings, setNudgeSettings] = useState(null);
 
+  // A failed load used to look exactly like "nothing yet"; now it says so
+  // and offers a retry.
+  const [loadFailed, setLoadFailed] = useState({ conversations: false, tasks: false });
+  const loadConversations = () => {
+    setLoadFailed((f) => ({ ...f, conversations: false }));
+    return apiJson('/conversations').then(setConversations).catch(() => { setConversations([]); setLoadFailed((f) => ({ ...f, conversations: true })); });
+  };
+  const loadTasks = () => {
+    setLoadFailed((f) => ({ ...f, tasks: false }));
+    return apiJson('/tasks?status=all').then(setTasks).catch(() => { setTasks([]); setLoadFailed((f) => ({ ...f, tasks: true })); });
+  };
+
   useEffect(() => {
-    apiJson('/conversations').then(setConversations).catch(() => setConversations([]));
-    apiJson('/tasks?status=all').then(setTasks).catch(() => setTasks([]));
+    loadConversations();
+    loadTasks();
     apiJson('/profiles').then(setProfiles).catch(() => setProfiles({}));
     apiJson('/friends').then(setFriends).catch(() => setFriends([]));
     apiJson('/mood/history?days=56').then((d) => { setMoodDays(d.days || []); setMoodStreak(d.streak || 0); }).catch(() => {});
@@ -131,6 +155,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
     apiJson('/insights/digest').then((d) => setDigest((d.digest && d.digest.cards) || null)).catch(() => setDigest(null));
     apiJson('/settings').then(setSettings).catch(() => {});
     apiJson('/settings/nudges').then(setNudgeSettings).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -391,6 +416,70 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
     return items;
   }, [tasks, notify.dmUnreadCounts, friends, digest]);
 
+  // ---- Home "Needs you": things waiting on the user, each with its action,
+  // ahead of the summary numbers. Overdue first, then due today, then unread
+  // messages from friends. ----
+  const needsYou = useMemo(() => {
+    const items = [];
+    const now = new Date();
+    const todayKey = now.toDateString();
+    (tasks || []).forEach((t) => {
+      if (t.status !== 'open' || !t.due_date) return;
+      const due = new Date(t.due_date);
+      const overdue = due < now && due.toDateString() !== todayKey;
+      if (overdue || due.toDateString() === todayKey) {
+        items.push({ key: 'task-' + t.id, kind: 'task', overdue, task: t, title: t.description, meta: overdue ? `Overdue · was due ${due.toLocaleDateString()}` : 'Due today' });
+      }
+    });
+    items.sort((a, b) => (b.overdue - a.overdue));
+    Object.entries(notify.dmUnreadCounts || {}).forEach(([fid, count]) => {
+      if (!count) return;
+      const f = friends.find((x) => String(x.id) === String(fid));
+      if (!f) return;
+      items.push({ key: 'dm-' + fid, kind: 'dm', friend: f, title: `${f.nickname || f.username} messaged you`, meta: `${count} unread` });
+    });
+    return items;
+  }, [tasks, notify.dmUnreadCounts, friends]);
+
+  // ---- Search: conversations, people and tasks already loaded on this
+  // page, plus "Ask Throughline" for anything else. ----
+  const [globalQuery, setGlobalQuery] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [convQuery, setConvQuery] = useState('');
+  const searchResults = useMemo(() => {
+    const q = globalQuery.trim().toLowerCase();
+    if (!q) return [];
+    const has = (s) => (s || '').toLowerCase().includes(q);
+    const out = [];
+    (conversations || []).filter((c) => has(c.title)).slice(0, 5)
+      .forEach((c) => out.push({ key: 'c' + c.id, group: 'Conversation', label: c.title || 'Untitled conversation', run: () => { openConversation(c.id); go('conversations'); } }));
+    peopleList.filter((p) => has(p.name)).slice(0, 5)
+      .forEach((p) => out.push({ key: p.key, group: p.kind === 'friend' ? 'Friend' : 'Person', label: p.name, run: () => { if (p.kind === 'friend') messageFriend(p.friend); go('people'); } }));
+    (tasks || []).filter((t) => has(t.description)).slice(0, 5)
+      .forEach((t) => out.push({ key: 't' + t.id, group: 'Task', label: t.description, run: () => go('tasks') }));
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [globalQuery, conversations, peopleList, tasks]);
+  const [askDraft, setAskDraft] = useState('');
+  // The search text only pre-fills the visit it came with: cleared once the
+  // user actually leaves Ask (not before the navigation there lands).
+  const prevScreen = useRef(screen);
+  useEffect(() => {
+    if (prevScreen.current === 'ask' && screen !== 'ask') setAskDraft('');
+    prevScreen.current = screen;
+  }, [screen]);
+  function runSearch(item) {
+    setSearchOpen(false);
+    if (item) item.run();
+    else { setAskDraft(globalQuery.trim()); go('ask'); }
+    setGlobalQuery('');
+  }
+  const visibleConversations = useMemo(() => {
+    const q = convQuery.trim().toLowerCase();
+    if (!q) return conversations || [];
+    return (conversations || []).filter((c) => (c.title || '').toLowerCase().includes(q) || (c.category || '').toLowerCase().includes(q));
+  }, [conversations, convQuery]);
+
   // ---- Mood chart + heatmap: real per-day mood, reconstructed as a full
   // calendar grid so days with no log show up honestly as blank, not skipped. ----
   const moodByDate = useMemo(() => {
@@ -419,6 +508,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
     return cells;
   }, [moodByDate]);
 
+  const dmUnreadTotal = Object.values(notify.dmUnreadCounts || {}).reduce((a, n) => a + (n || 0), 0);
   const recentConversations = (conversations || []).slice(0, 3);
   const digestHeadline = digest && digest.length ? digest[0].headline : null;
 
@@ -437,32 +527,34 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
             <div className="logo-text">Throughline</div>
           </div>
 
-          <div className="nav-section">
-            <div className="nav-title">Workspace</div>
-            <NavItem icon="✦" label="Home" screenKey="home" navActive={navActive} go={go} />
-            <NavItem icon="◉" label="Conversations" screenKey="conversations" navActive={navActive} go={go} />
-            <NavItem icon="◎" label="People" screenKey="people" navActive={navActive} go={go} />
-            <button className="nav-item" onClick={() => navigate('/app/meet')}>
-              <span className="nav-icon">⇄</span>
-              <span>Meet</span>
-            </button>
-            <NavItem icon="□" label="Tasks" screenKey="tasks" navActive={navActive} go={go} />
-            <NavItem icon="☎" label="Calls" screenKey="calls" navActive={navActive} go={go} />
-          </div>
+          <nav aria-label="Main">
+            <div className="nav-section">
+              <div className="nav-title">Everyday</div>
+              <NavItem icon={HomeIcon} label="Home" screenKey="home" navActive={navActive} go={go} />
+              <NavItem icon={ChatIcon} label="Conversations" screenKey="conversations" navActive={navActive} go={go} />
+              <NavItem icon={TaskIcon} label="Tasks" screenKey="tasks" navActive={navActive} go={go} />
+              <NavItem icon={FriendIcon} label="People" screenKey="people" navActive={navActive} go={go} badge={dmUnreadTotal} />
+              <NavItem icon={PhoneIcon} label="Calls" screenKey="calls" navActive={navActive} go={go} />
+              <button className="nav-item" title="Meet" onClick={() => navigate('/app/meet')}>
+                <span className="nav-icon" aria-hidden="true"><MeetIcon /></span>
+                <span>Meet</span>
+              </button>
+            </div>
 
-          <div className="nav-section">
-            <div className="nav-title">Intelligence</div>
-            <NavItem icon="✧" label="Insights" screenKey="insights" navActive={navActive} go={go} />
-            <NavItem icon="⌕" label="Ask Throughline" screenKey="ask" navActive={navActive} go={go} />
-            <NavItem icon="◇" label="Cognitive Sharing" screenKey="sharing" navActive={navActive} go={go} />
-            <NavItem icon="⌁" label="Commerce" screenKey="commerce" navActive={navActive} go={go} />
-          </div>
+            <div className="nav-section">
+              <div className="nav-title">Assistant</div>
+              <NavItem icon={SparkleIcon} label="Ask Throughline" screenKey="ask" navActive={navActive} go={go} />
+              <NavItem icon={ChartIcon} label="Insights" screenKey="insights" navActive={navActive} go={go} />
+              <NavItem icon={ShareIcon} label="Sharing with friends" screenKey="sharing" navActive={navActive} go={go} />
+              <NavItem icon={FoodOrderIcon} label="Food ordering" screenKey="commerce" navActive={navActive} go={go} />
+            </div>
 
-          <div className="nav-section">
-            <div className="nav-title">System</div>
-            <NavItem icon="♢" label="Notifications" screenKey="notifications" navActive={navActive} go={go} />
-            <NavItem icon="⚙" label="Settings" screenKey="settings" navActive={navActive} go={go} />
-          </div>
+            <div className="nav-section">
+              <div className="nav-title">You</div>
+              <NavItem icon={BellIcon} label="Notifications" screenKey="notifications" navActive={navActive} go={go} badge={derivedNotifications.length} />
+              <NavItem icon={SettingsIcon} label="Settings" screenKey="settings" navActive={navActive} go={go} />
+            </div>
+          </nav>
 
           <div className="sidebar-bottom">
             <div className="profile-mini">
@@ -478,25 +570,66 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
         {/* ========================= MAIN ========================= */}
         <main className="main">
           <header className="topbar">
-            <div className="global-search">
-              ⌕
-              <input placeholder="Search conversations, people, memories..." onClick={() => go('ask')} readOnly />
+            <div className="global-search" role="search">
+              <SearchIcon aria-hidden="true" />
+              <input
+                type="search"
+                aria-label="Search conversations, people and tasks"
+                placeholder="Search conversations, people, tasks…"
+                value={globalQuery}
+                role="combobox"
+                aria-expanded={searchOpen && !!globalQuery.trim()}
+                aria-controls="global-search-results"
+                aria-autocomplete="list"
+                onChange={(e) => { setGlobalQuery(e.target.value); setSearchOpen(true); }}
+                onFocus={() => setSearchOpen(true)}
+                onBlur={() => setTimeout(() => setSearchOpen(false), 150)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && globalQuery.trim()) runSearch(searchResults[0] || null);
+                  if (e.key === 'Escape') { setGlobalQuery(''); setSearchOpen(false); e.currentTarget.blur(); }
+                }}
+              />
+              {searchOpen && globalQuery.trim() && (
+                <div className="search-results" id="global-search-results" role="listbox">
+                  {searchResults.map((r) => (
+                    <button key={r.key} type="button" role="option" aria-selected="false" className="search-result" onMouseDown={(e) => e.preventDefault()} onClick={() => runSearch(r)}>
+                      <span className="search-result-group">{r.group}</span>
+                      <span className="search-result-label">{r.label}</span>
+                    </button>
+                  ))}
+                  {!searchResults.length && <div className="search-empty">No conversations, people or tasks match.</div>}
+                  <button type="button" role="option" aria-selected="false" className="search-result search-ask" onMouseDown={(e) => e.preventDefault()} onClick={() => runSearch(null)}>
+                    <SparkleIcon aria-hidden="true" />
+                    <span className="search-result-label">Ask Throughline: “{globalQuery.trim()}”</span>
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="top-actions">
-              <button className="icon-button" onClick={() => go('notifications')}>
-                ♢{derivedNotifications.length > 0 && ' ' + derivedNotifications.length}
-              </button>
-              <select
-                className="context-select"
-                value={settings?.personalization || 'personal'}
-                onChange={(e) => updatePersonalization(e.target.value)}
+              <button
+                className="icon-button" onClick={() => go('notifications')}
+                aria-label={derivedNotifications.length ? `Notifications (${derivedNotifications.length})` : 'Notifications'}
+                title="Notifications"
               >
-                <option value="personal">Personal</option>
-                <option value="office">Office</option>
-                <option value="study">Study</option>
-              </select>
-              <Avatar url={user?.profile_picture_url} name={user?.username} />
+                <BellIcon aria-hidden="true" />
+                {derivedNotifications.length > 0 && <span className="icon-badge" aria-hidden="true">{derivedNotifications.length > 9 ? '9+' : derivedNotifications.length}</span>}
+              </button>
+              <label className="context-label" title="New conversations are filed under this mode, and it steers what Throughline looks for and how it replies">
+                <span>Mode</span>
+                <select
+                  className="context-select"
+                  value={settings?.personalization || 'personal'}
+                  onChange={(e) => updatePersonalization(e.target.value)}
+                >
+                  <option value="personal">Personal</option>
+                  <option value="office">Office</option>
+                  <option value="study">Study</option>
+                </select>
+              </label>
+              <button className="avatar-button" onClick={() => go('settings')} aria-label="Your settings" title="Settings">
+                <Avatar url={user?.profile_picture_url} name={user?.username} />
+              </button>
             </div>
           </header>
 
@@ -506,11 +639,65 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="hero">
                 <div className="ai-pill">
                   <span className="pulse" />
-                  Cognitive system active
+                  {notify.connected ? 'Connected' : 'Reconnecting…'}
                 </div>
                 <h1 style={{ marginTop: 15 }}>Good {timeGreeting()}, {user?.username}.</h1>
-                <p>Here's what Throughline thinks matters right now.</p>
-                <button className="primary-button" onClick={() => go('ask')}>Ask Throughline</button>
+                <p>
+                  {conversations && conversations.length === 0
+                    ? 'Start by recording a conversation -- Throughline pulls out tasks, people and notes for you.'
+                    : needsYou.length ? `${needsYou.length} thing${needsYou.length === 1 ? '' : 's'} need${needsYou.length === 1 ? 's' : ''} you today.` : "You're all caught up."}
+                </p>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  {conversations && conversations.length === 0 ? (
+                    <button className="primary-button" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }} onClick={() => go('listen')}>
+                      <MicIcon style={{ width: 16, height: 16, flexShrink: 0 }} aria-hidden="true" /> Record your first conversation
+                    </button>
+                  ) : (
+                    <button className="primary-button" onClick={() => go('ask')}>Ask Throughline</button>
+                  )}
+                  {conversations && conversations.length > 0 && (
+                    <button className="secondary-button" onClick={() => go('listen')}>Record a conversation</button>
+                  )}
+                </div>
+              </div>
+
+              {personaPending && (
+                <div className="card personalize-card" style={{ marginBottom: 20 }}>
+                  <div className="personalize-text">
+                    <div className="personalize-title">Personalize Throughline</div>
+                    <div className="personalize-sub">A few quick answers so replies, reminders and insights fit you.</div>
+                  </div>
+                  <button className="secondary-button" onClick={openPersona}>Answer a few questions</button>
+                </div>
+              )}
+
+              <div className="card" style={{ marginBottom: 20 }}>
+                <div className="page-heading" style={{ marginBottom: 5 }}>
+                  <div><h2 style={{ fontSize: 18 }}>Needs you</h2></div>
+                  <button className="secondary-button" onClick={() => go('tasks')}>All tasks</button>
+                </div>
+                <div className="list">
+                  {tasks === null ? (
+                    <div className="list-item"><div className="item-main"><div className="item-meta">Loading…</div></div></div>
+                  ) : loadFailed.tasks ? (
+                    <div className="list-item"><div className="item-main"><div className="item-meta">Couldn't load your tasks.</div></div><button className="secondary-button" onClick={loadTasks}>Retry</button></div>
+                  ) : needsYou.length ? needsYou.slice(0, 6).map((n) => (
+                    <div key={n.key} className="list-item">
+                      <span className={'badge' + (n.kind === 'dm' ? ' blue' : n.overdue ? ' orange' : '')}>{n.kind === 'dm' ? 'Message' : n.overdue ? 'Overdue' : 'Today'}</span>
+                      <div className="item-main">
+                        <div className="item-title">{n.title}</div>
+                        <div className="item-meta">{n.meta}</div>
+                      </div>
+                      {n.kind === 'task' ? (
+                        <button className="secondary-button" onClick={() => toggleTask(n.task)}>Mark done</button>
+                      ) : (
+                        <button className="secondary-button" onClick={() => { messageFriend(n.friend); go('people'); }}>Reply</button>
+                      )}
+                    </div>
+                  )) : (
+                    <div className="list-item"><div className="item-main"><div className="item-meta">Nothing due today and no unread messages.</div></div></div>
+                  )}
+                </div>
               </div>
 
               <div className="grid-4">
@@ -539,10 +726,10 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="grid-2" style={{ marginTop: 20 }}>
                 <div className="card insight-card">
                   <div className="insight-icon">✦</div>
-                  <div className="card-title">Throughline noticed</div>
+                  <div className="card-title">This week's insight</div>
                   <h2>{digestHeadline || 'Keep talking -- your first weekly insight appears once there\'s enough to look at.'}</h2>
                   <button className="secondary-button" style={{ marginTop: 18 }} onClick={() => go('insights')}>
-                    Explore connection →
+                    See insights →
                   </button>
                 </div>
 
@@ -571,8 +758,14 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                 <div className="list">
                   {conversations === null ? (
                     <div className="list-item"><div className="item-main"><div className="item-meta">Loading…</div></div></div>
+                  ) : loadFailed.conversations ? (
+                    <div className="list-item"><div className="item-main"><div className="item-meta">Couldn't load your conversations.</div></div><button className="secondary-button" onClick={loadConversations}>Retry</button></div>
                   ) : recentConversations.length ? recentConversations.map((c) => (
-                    <div key={c.id} className="list-item" style={{ cursor: 'pointer' }} onClick={() => { openConversation(c.id); go('conversations'); }}>
+                    <div
+                      key={c.id} className="list-item" style={{ cursor: 'pointer' }} role="button" tabIndex={0}
+                      onClick={() => { openConversation(c.id); go('conversations'); }}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openConversation(c.id); go('conversations'); } }}
+                    >
                       <div className="avatar">{initials(c.title)}</div>
                       <div className="item-main">
                         <div className="item-title">{c.title || 'Untitled conversation'}</div>
@@ -597,14 +790,23 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
 
               <div className="chat-layout">
                 <div className="chat-list">
-                  <input className="chat-search" placeholder="Search conversations..." disabled />
+                  <input
+                    className="chat-search" type="search" placeholder="Filter by title or category…"
+                    aria-label="Filter conversations" value={convQuery} onChange={(e) => setConvQuery(e.target.value)}
+                  />
                   {conversations === null ? (
                     <div className="item-meta" style={{ padding: 12 }}>Loading…</div>
-                  ) : conversations.length ? conversations.map((c) => (
+                  ) : loadFailed.conversations ? (
+                    <div className="item-meta" style={{ padding: 12 }}>
+                      Couldn't load your conversations. <button className="secondary-button" style={{ marginTop: 8 }} onClick={loadConversations}>Retry</button>
+                    </div>
+                  ) : visibleConversations.length ? visibleConversations.map((c) => (
                     <div
                       key={c.id}
                       className={'conversation' + (selectedConvId === c.id ? ' selected' : '')}
+                      role="button" tabIndex={0} aria-current={selectedConvId === c.id ? 'true' : undefined}
                       onClick={() => openConversation(c.id)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openConversation(c.id); } }}
                     >
                       <div className="avatar">{initials(c.title)}</div>
                       <div className="item-main">
@@ -612,7 +814,13 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                         <div className="item-meta">{relativeDay(c.created_at)}</div>
                       </div>
                     </div>
-                  )) : <div className="item-meta" style={{ padding: 12 }}>No conversations yet.</div>}
+                  )) : convQuery.trim() ? (
+                    <div className="item-meta" style={{ padding: 12 }}>No conversations match “{convQuery.trim()}”.</div>
+                  ) : (
+                    <div className="item-meta" style={{ padding: 12 }}>
+                      No conversations yet. <button className="secondary-button" style={{ marginTop: 8 }} onClick={() => go('listen')}>Record one</button>
+                    </div>
+                  )}
                 </div>
 
                 <div className="chat-window">
@@ -660,7 +868,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="page-heading">
                 <div>
                   <h1>Listen</h1>
-                  <p>Turn conversations into searchable intelligence.</p>
+                  <p>Record a conversation -- Throughline transcribes it and pulls out tasks, people and notes.</p>
                 </div>
               </div>
               <div className="fill-panel">
@@ -681,16 +889,18 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                 <div className="card"><div className="card-title">Open</div><div className="card-value">{openTasksCount}</div></div>
                 <div className="card"><div className="card-title">Due today</div><div className="card-value">{dueTodayCount}</div></div>
                 <div className="card"><div className="card-title">Completed</div><div className="card-value">{doneTasksCount}</div></div>
-                <div className="card"><div className="card-title">AI extracted</div><div className="card-value">{(tasks || []).length}</div></div>
+                <div className="card"><div className="card-title">All tasks</div><div className="card-value">{(tasks || []).length}</div></div>
               </div>
 
               <div className="card" style={{ marginTop: 20 }}>
                 <div className="list">
                   {tasks === null ? (
                     <div className="item-meta" style={{ padding: 12 }}>Loading…</div>
+                  ) : loadFailed.tasks ? (
+                    <div className="list-item"><div className="item-main"><div className="item-meta">Couldn't load your tasks.</div></div><button className="secondary-button" onClick={loadTasks}>Retry</button></div>
                   ) : tasks.length ? tasks.map((t) => (
                     <div key={t.id} className="list-item">
-                      <input type="checkbox" checked={t.status === 'done'} onChange={() => toggleTask(t)} />
+                      <input type="checkbox" checked={t.status === 'done'} onChange={() => toggleTask(t)} aria-label={`${t.status === 'done' ? 'Reopen' : 'Mark done'}: ${t.description}`} />
                       <div className="item-main">
                         <div className="item-title" style={t.status === 'done' ? { textDecoration: 'line-through', color: '#9ca3af' } : undefined}>
                           {t.description}
@@ -784,10 +994,10 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="page-heading">
                 <div>
                   <h1>Calls</h1>
-                  <p>Voice conversations connected to your cognitive history.</p>
+                  <p>Voice calls with your friends.</p>
                 </div>
                 <button className="primary-button" onClick={() => { setPickingCall((v) => !v); setCallSelection([]); }}>
-                  ☎ {pickingCall ? 'Cancel' : 'Start call'}
+                  {pickingCall ? 'Cancel' : 'Start a call'}
                 </button>
               </div>
 
@@ -838,7 +1048,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="page-heading">
                 <div>
                   <h1>Insights</h1>
-                  <p>Your weekly cognitive digest.</p>
+                  <p>Your mood over time and this week's highlights.</p>
                 </div>
               </div>
 
@@ -893,9 +1103,11 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
             <section className={screenClass('ask')}>
               {screen === 'ask' && (
                 <AssistantChat
+                  key={askDraft}
                   title="Ask Throughline"
                   subtitle="Across your conversations, people, tasks and email"
                   userName={user?.username}
+                  initialInput={askDraft}
                 />
               )}
             </section>
@@ -904,8 +1116,8 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
             <section className={screenClass('sharing')}>
               <div className="page-heading">
                 <div>
-                  <h1>Cognitive Sharing</h1>
-                  <p>Choose what intelligence you share with your friends.</p>
+                  <h1>Sharing with friends</h1>
+                  <p>Choose, per friend, whether Throughline can use what it knows about you to help you both.</p>
                 </div>
               </div>
 
@@ -918,11 +1130,13 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
                       <div>
                         <div className="settings-label">{f.nickname || f.username}</div>
                         <div className="settings-description">
-                          {s ? (s.both_enabled ? 'Mutual suggestions enabled' : 'Waiting on the other side to opt in') : 'Loading…'}
+                          {s ? (s.both_enabled ? 'On for both of you' : 'Only works once your friend turns it on too') : 'Loading…'}
+                          {s && <> · {(SHARING_LEVELS.find((l) => l.value === (s.my_level || 'off')) || SHARING_LEVELS[0]).description}</>}
                         </div>
                       </div>
                       <select
                         className="context-select"
+                        aria-label={`Sharing with ${f.nickname || f.username}`}
                         value={s?.my_level || 'off'}
                         disabled={!s || sharingSavingId === f.id}
                         onChange={(e) => setFriendSharing(f.id, e.target.value)}
@@ -939,18 +1153,18 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
             <section className={screenClass('commerce')}>
               <div className="page-heading">
                 <div>
-                  <h1>Cognitive Commerce</h1>
-                  <p>Ask Throughline for something and review before ordering.</p>
+                  <h1>Food ordering</h1>
+                  <p>Ask Throughline for food; you review and confirm before anything is ordered.</p>
                 </div>
               </div>
 
               {swiggy === null ? (
                 <div className="card"><p className="card-sub">Loading…</p></div>
               ) : !swiggy.enabled ? (
-                <div className="card"><p className="card-sub">Cognitive Commerce isn't enabled on this account yet.</p></div>
+                <div className="card"><p className="card-sub">Food ordering isn't available on this account yet.</p></div>
               ) : (
                 <div className="card">
-                  <div className="ai-pill">{swiggy.accounts?.food?.connected ? '✦ Connected' : '✦ Not connected'}</div>
+                  <div className="ai-pill">{swiggy.accounts?.food?.connected ? 'Swiggy connected' : 'Swiggy not connected'}</div>
                   <h2>Order food from inside a chat</h2>
                   <p className="card-sub">
                     Real ordering happens through <b>Ask Throughline</b> or any conversation -- ask for
@@ -976,7 +1190,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="page-heading">
                 <div>
                   <h1>Notifications</h1>
-                  <p>Everything Throughline thinks you should know.</p>
+                  <p>Tasks due soon, unread messages and new insights.</p>
                 </div>
               </div>
 
@@ -1001,7 +1215,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme }) {
               <div className="page-heading">
                 <div>
                   <h1>Settings</h1>
-                  <p>Control how Throughline understands and assists you.</p>
+                  <p>Your profile, mode, smart features, connected accounts and appearance.</p>
                 </div>
               </div>
 

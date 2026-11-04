@@ -1,17 +1,17 @@
 import Avatar from './Avatar.jsx';
-import { ChatIcon, TaskIcon, ProfileIcon, FriendIcon, SettingsIcon } from '../icons.jsx';
+import { HomeIcon, ChatIcon, TaskIcon, ProfileIcon, FriendIcon, MeetIcon, SettingsIcon } from '../icons.jsx';
+import { NAV_ITEMS } from '../lib/nav.js';
 
-const SECTIONS = [
-  { key: 'chats', label: 'Chats', Icon: ChatIcon },
-  { key: 'tasks', label: 'Tasks', Icon: TaskIcon },
-  { key: 'profiles', label: 'Profiles', Icon: ProfileIcon },
-  { key: 'friends', label: 'Friends', Icon: FriendIcon },
-];
+const ICONS = { home: HomeIcon, chats: ChatIcon, tasks: TaskIcon, friends: FriendIcon, profiles: ProfileIcon, meet: MeetIcon };
+// Desktop's Home is the full "os" screen (see lib/nav.js homePath).
+const ROUTE = { home: 'os' };
 
 export default function IconRail({ active, onSelect, username, profilePictureUrl, badges = {}, online }) {
+  const sections = NAV_ITEMS.filter((i) => i.key !== 'settings');
   return (
     <nav className="icon-rail" aria-label="Main">
-      {SECTIONS.map(({ key, label, Icon }) => {
+      {sections.map(({ key, label }) => {
+        const Icon = ICONS[key];
         const count = badges[key] || 0;
         return (
           <button
@@ -20,7 +20,7 @@ export default function IconRail({ active, onSelect, username, profilePictureUrl
             title={label}
             aria-label={count > 0 ? `${label} (${count} unread)` : label}
             aria-current={active === key ? 'page' : undefined}
-            onClick={() => onSelect(key)}
+            onClick={() => onSelect(ROUTE[key] || key)}
           >
             <Icon />
             <span className="rail-label" aria-hidden="true">{label}</span>

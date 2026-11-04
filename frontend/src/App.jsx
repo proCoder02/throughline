@@ -16,11 +16,31 @@ import AppDrawer from './components/AppDrawer.jsx';
 import { startRingtone, stopRingtone, unlockAudio } from './ringtone.js';
 import IconRail from './components/IconRail.jsx';
 import { MenuIcon } from './icons.jsx';
+import { SECTION_TITLES } from './lib/nav.js';
 
-const SECTION_TITLES = {
-  home: 'Home', chats: 'Chats', tasks: 'Tasks', profiles: 'Profiles',
-  friends: 'Friends', settings: 'Settings', os: 'Throughline', meet: 'Meet',
-};
+// "Skip for now" on the onboarding questions is remembered per account on
+// this device, so it isn't shown again on every visit -- the Home screens
+// keep a small "Personalize" card until it's done.
+const personaSkipKey = (userId) => `tl_persona_skipped_${userId}`;
+function personaSkipped(userId) {
+  try { return localStorage.getItem(personaSkipKey(userId)) === '1'; } catch { return false; }
+}
+
+// Shown while the very first sign-in check runs (no cached user yet) --
+// the shape of the app instead of a blank page.
+function LoadingShell() {
+  return (
+    <div className="app-loading" role="status" aria-live="polite">
+      <div className="app-loading-rail" />
+      <div className="app-loading-main">
+        <div className="app-loading-bar" style={{ width: '38%' }} />
+        <div className="app-loading-bar" style={{ width: '62%' }} />
+        <div className="app-loading-block" />
+        <span className="sr-only">Loading Throughline…</span>
+      </div>
+    </div>
+  );
+}
 
 /// Root layout route (see router.jsx) -- rendered once and never unmounted
 /// by navigation between sections, which is exactly what auth/notify/call
@@ -51,17 +71,27 @@ export default function App() {
   // same open-once-then-clear shape as pendingConversationId above, mirrors
   // the Flutter Home screen's _openChat() opening the chat in place.
   const [pendingOpenGlobalChat, setPendingOpenGlobalChat] = useState(false);
-  // null = not checked yet, true/false once checked. Gates the app shell
-  // behind a one-time persona form for any account that hasn't submitted
-  // one -- covers brand-new signups and pre-existing accounts alike.
+  // null = not checked yet, true/false once checked. The persona questions
+  // no longer block the app: they open once for an account that hasn't
+  // answered them, with "Skip for now", and Home keeps a reminder card.
   const [personaCompleted, setPersonaCompleted] = useState(null);
+  const [personaOpen, setPersonaOpen] = useState(false);
+  const userId = auth.user?.id;
 
   useEffect(() => {
-    if (!auth.user) return;
+    if (!userId) return;
     apiJson('/persona')
-      .then((d) => setPersonaCompleted(d.completed))
-      .catch(() => setPersonaCompleted(true)); // fail-open -- don't block the app on a network hiccup
-  }, [auth.user]);
+      .then((d) => {
+        setPersonaCompleted(d.completed);
+        if (!d.completed && !personaSkipped(userId)) setPersonaOpen(true);
+      })
+      .catch(() => setPersonaCompleted(true)); // fail-open -- don't nag on a network hiccup
+  }, [userId]);
+
+  const skipPersona = () => {
+    try { localStorage.setItem(personaSkipKey(userId), '1'); } catch { /* ignore */ }
+    setPersonaOpen(false);
+  };
 
   // Rings while a call is coming in and hasn't been picked up/joined yet --
   // stops the moment it's accepted, declined, or cleared for any reason.
@@ -124,10 +154,8 @@ export default function App() {
     navigate(window.location.pathname + (rest ? '?' + rest : ''), { replace: true });
   }, [auth.user, location.search]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (auth.loading) return null;
+  if (auth.loading && !auth.user) return <LoadingShell />;
   if (!auth.user) return <AuthScreen auth={auth} />;
-  if (personaCompleted === null) return null;
-  if (!personaCompleted) return <PersonaOnboarding onComplete={() => setPersonaCompleted(true)} />;
 
   const openConversationInChats = (conversationId) => {
     if (!conversationId) return;
@@ -202,6 +230,10 @@ export default function App() {
           pendingOpenGlobalChat,
           openGlobalChatInChats,
           consumePendingOpenGlobalChat: () => setPendingOpenGlobalChat(false),
+          // false only once we know the questions are unanswered -- Home
+          // shows a "Personalize" card then.
+          personaPending: personaCompleted === false,
+          openPersona: () => setPersonaOpen(true),
         }}
       />
       <CallOverlay
@@ -214,6 +246,14 @@ export default function App() {
         onEnableAudio={call.enableAudio}
       />
       <NotificationHost />
+      {personaOpen && (
+        <div className="persona-overlay">
+          <PersonaOnboarding
+            onComplete={() => { setPersonaCompleted(true); setPersonaOpen(false); }}
+            onSkip={skipPersona}
+          />
+        </div>
+      )}
     </div>
   );
 }

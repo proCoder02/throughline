@@ -941,6 +941,52 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
 }
 .persona-chip input { margin: 0; }
 .persona-chip.active { border-color: var(--wa-accent); background: color-mix(in srgb, var(--wa-accent) 25%, transparent); color: var(--wa-text); }
+/* Both cards were fixed-width (360/480px) -- wider than a phone screen. */
+.auth-card, .persona-card { max-width: calc(100vw - 32px); }
+.auth-screen { min-height: 100vh; height: auto; padding: var(--space-4) 0; }
+
+/* Persona questions as an overlay over the running app (it no longer
+   blocks the app, and opening it from Home mustn't reset the screen). */
+.persona-overlay { position: fixed; inset: 0; z-index: 250; background: var(--wa-bg-app); overflow-y: auto; }
+.persona-overlay .auth-screen { min-height: 100%; }
+.persona-actions { display: flex; gap: var(--space-2); margin-top: var(--space-4); }
+.persona-actions .btn { flex: 1; }
+.persona-why { font-size: var(--text-sm); color: var(--wa-text-soft); margin: 0 0 var(--space-4); }
+
+/* Sign-in form */
+.auth-card form { display: block; }
+.auth-label { display: block; font-size: var(--text-sm); font-weight: 600; color: var(--wa-text); margin-top: var(--space-3); }
+.auth-pw { position: relative; }
+.auth-pw .field { padding-right: 44px; }
+.auth-pw-toggle {
+  position: absolute; right: 6px; top: calc(50% + 3px); transform: translateY(-50%);
+  width: 34px; height: 34px; display: grid; place-items: center; border-radius: var(--radius-sm); color: var(--wa-text-soft);
+}
+.auth-pw-toggle:hover { background: var(--wa-hover); color: var(--wa-text); }
+.auth-pw-toggle svg { width: 18px; height: 18px; }
+.auth-field-hint { font-size: var(--text-xs); color: var(--wa-text-soft); margin-top: 4px; }
+.link-button { background: none; border: 0; padding: 4px 0; color: var(--wa-accent-dark); font-size: var(--text-sm); font-weight: 600; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.link-button:hover { color: var(--wa-accent); }
+.auth-row { display: flex; justify-content: flex-end; margin-top: 6px; }
+.auth-switch { display: flex; justify-content: center; gap: 4px; align-items: baseline; color: var(--wa-text-soft); }
+.auth-success { color: var(--wa-accent-dark); font-size: var(--text-sm); margin-top: 10px; }
+
+/* Loading skeleton (first sign-in check, before any cached user exists) */
+.app-loading { display: flex; height: 100vh; background: var(--wa-bg-app); }
+.app-loading-rail { width: 72px; background: var(--wa-panel); flex-shrink: 0; }
+.app-loading-main { flex: 1; padding: 40px; display: flex; flex-direction: column; gap: 14px; }
+.app-loading-bar, .app-loading-block { border-radius: var(--radius-sm); background: var(--wa-hover); animation: loadingPulse 1.4s ease-in-out infinite; }
+.app-loading-bar { height: 18px; }
+.app-loading-block { height: 220px; margin-top: 10px; }
+@keyframes loadingPulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .app-loading-bar, .app-loading-block { animation: none; } }
+@media (max-width: 859px) { .app-loading-rail { display: none; } .app-loading-main { padding: 72px 16px 16px; } }
+
+/* "Personalize Throughline" reminder card on Home */
+.personalize-card { display: flex; align-items: center; gap: var(--space-3); }
+.personalize-card .personalize-text { flex: 1; min-width: 0; }
+.personalize-card .personalize-title { font-weight: 700; font-size: var(--text-sm); }
+.personalize-card .personalize-sub { font-size: var(--text-xs); color: var(--wa-text-soft); margin-top: 2px; }
 
 /* ---------- Toasts + confirm dialog (themed window.alert()/confirm() replacements, see lib/notify.js) ---------- */
 .toast-stack {

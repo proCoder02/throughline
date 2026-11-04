@@ -133,12 +133,13 @@ const fromRow = (r) => withId({ role: r.role, content: r.content, replyMeta: r.r
 // An older backend ignores ?limit and returns the whole list -- treat that as one complete page.
 const asPage = (data) => (Array.isArray(data) ? { messages: data, start: 0 } : data);
 
-export default function AssistantChat({ title = 'Ask Throughline', subtitle, userName, onBack }) {
+export default function AssistantChat({ title = 'Ask Throughline', subtitle, userName, onBack, initialInput = '' }) {
   const mailStatus = useMailStatus();
   const [messages, setMessages] = useState(null); // null = loading history
   const [sending, setSending] = useState(false);
   const [pendingText, setPendingText] = useState('');
-  const [input, setInput] = useState('');
+  // Pre-filled (never auto-sent) when arriving from the top search bar.
+  const [input, setInput] = useState(initialInput);
   const [image, setImage] = useState(null); // { file, previewUrl }
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [confirmQueue, setConfirmQueue] = useState([]);

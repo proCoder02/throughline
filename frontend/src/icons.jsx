@@ -70,4 +70,10 @@ export const SparkleIcon = (props) => <svg {...base} {...props}><path d="M12 3l1
 export const PlusIcon = (props) => <svg {...base} {...props}><path d="M12 5v14M5 12h14"/></svg>;
 export const ArrowUpIcon = (props) => <svg {...base} {...props}><path d="M12 19V5M5 12l7-7 7 7"/></svg>;
 export const ArrowDownIcon = (props) => <svg {...base} {...props}><path d="M12 5v14M19 12l-7 7-7-7"/></svg>;
-export const RetryIcon = (props) => <svg {...base} {...props}><path d="M3 12a9 9 0 0115.5-6.2L21 8M21 3v5h-5M21 12a9 9 0 01-15.5 6.2L3 16M3 21v-5h5"/></svg>;
+export const HomeIcon = (props) => <svg {...base} {...props}><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>;
+export const MeetIcon = (props) => <svg {...base} {...props}><rect x="3" y="4" width="7" height="16" rx="2"/><rect x="14" y="4" width="7" height="16" rx="2"/><path d="M10 12h4"/></svg>;
+export const EyeIcon = (props) => <svg {...base} {...props}><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>;
+export const EyeOffIcon = (props) => <svg {...base} {...props}><path d="M3 3l18 18M10.6 5.1A10.7 10.7 0 0112 5c6.4 0 10 7 10 7a17.6 17.6 0 01-3.2 4.2M6.6 6.6A17.4 17.4 0 002 12s3.6 7 10 7a10 10 0 005.4-1.6M9.9 9.9a3 3 0 004.2 4.2"/></svg>;
+export const ShareIcon = (props) => <svg {...base} {...props}><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="M8.2 10.8l7.6-4.4M8.2 13.2l7.6 4.4"/></svg>;
+export const ChartIcon = (props) => <svg {...base} {...props}><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>;
+export const RetryIcon =(props) => <svg {...base} {...props}><path d="M3 12a9 9 0 0115.5-6.2L21 8M21 3v5h-5M21 12a9 9 0 01-15.5 6.2L3 16M3 21v-5h5"/></svg>;

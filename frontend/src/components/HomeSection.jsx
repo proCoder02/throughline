@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiJson, post } from '../api.js';
 import {
-  SunIcon, CloudIcon, BoltIcon, ChevronRightIcon, BellIcon, SparkleIcon, PlusIcon,
+  SunIcon, BoltIcon, ChevronRightIcon, BellIcon, SparkleIcon, PlusIcon,
   ChatIcon, MicIcon, TaskIcon, FriendIcon, AttachIcon, ProfileIcon, SendIcon,
 } from '../icons.jsx';
 
@@ -55,7 +55,7 @@ function SectionHeader({ title, icon, onSeeAll }) {
 // Entrance/micro-animations (staggered fade-slide-in, the rainbow sweep, the
 // pulsing "new" halo, per-tile tap-bounce, the drawn checkmark) aren't
 // reproduced -- everything that's actually DATA and layout is.
-export default function HomeSection({ username, onOpenConversation, onOpenGlobalChat, onNavigate }) {
+export default function HomeSection({ username, onOpenConversation, onOpenGlobalChat, onNavigate, personaPending, onOpenPersona }) {
   const [digest, setDigest] = useState(null); // null = loading, else array of {category,label,headline,body}
   const [openTasks, setOpenTasks] = useState(null);
   const [conversations, setConversations] = useState(null);
@@ -90,6 +90,17 @@ export default function HomeSection({ username, onOpenConversation, onOpenGlobal
   return (
     <div className="home-section">
       <GreetingHeader username={username} now={now} />
+
+      {personaPending && onOpenPersona && (
+        <div className="home-card personalize-card">
+          <SparkleIcon style={{ width: 18, height: 18, color: 'var(--wa-accent)', flexShrink: 0 }} aria-hidden="true" />
+          <div className="personalize-text">
+            <div className="personalize-title">Personalize Throughline</div>
+            <div className="personalize-sub">A few quick answers so replies, reminders and insights fit you.</div>
+          </div>
+          <button type="button" className="btn secondary small" onClick={onOpenPersona}>Start</button>
+        </div>
+      )}
 
       <InsightCard
         headline={firstCard?.headline || "Keep talking -- your first insight appears once there's enough to look at."}
@@ -132,9 +143,6 @@ function GreetingHeader({ username, now }) {
       </div>
       <div style={{ textAlign: 'right', flexShrink: 0 }}>
         <div style={{ fontSize: 11.5, color: 'var(--wa-text-soft)' }}>{dateString(now)}</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 3, justifyContent: 'flex-end', marginTop: 4, fontSize: 11.5, color: 'var(--wa-text-soft)' }}>
-          <CloudIcon style={{ width: 14, height: 14 }} /> --&deg; &middot; --
-        </div>
       </div>
     </div>
   );
@@ -297,7 +305,10 @@ function WeeklyInsightCard({ insights }) {
 
 function AskBar({ onTap }) {
   return (
-    <div className="home-ask-bar" onClick={onTap} role="button" tabIndex={0}>
+    <div
+      className="home-ask-bar" onClick={onTap} role="button" tabIndex={0} aria-label="Ask Throughline"
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onTap(); } }}
+    >
       <span className="home-ask-bar-icon"><PlusIcon /></span>
       <span className="home-ask-bar-text">Ask about your people, plans, or anything...</span>
       <span className="home-ask-bar-send"><SendIcon /></span>

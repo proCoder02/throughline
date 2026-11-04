@@ -1,19 +1,12 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiJson } from '../api.js';
-import { ChatIcon, TaskIcon, ProfileIcon, FriendIcon, SettingsIcon, ClockIcon, CloseIcon } from '../icons.jsx';
+import {
+  HomeIcon, MeetIcon, ChatIcon, TaskIcon, ProfileIcon, FriendIcon, SettingsIcon, ClockIcon, CloseIcon,
+} from '../icons.jsx';
+import { NAV_ITEMS } from '../lib/nav.js';
 
-const HomeIcon = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-    <path d="M3 11l9-8 9 8" /><path d="M5 10v10h14V10" />
-  </svg>
-);
-
-const MeetIcon = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-    <rect x="3" y="4" width="7" height="16" rx="2" /><rect x="14" y="4" width="7" height="16" rx="2" /><path d="M10 12h4" />
-  </svg>
-);
+const ICONS = { home: HomeIcon, chats: ChatIcon, tasks: TaskIcon, friends: FriendIcon, profiles: ProfileIcon, meet: MeetIcon, settings: SettingsIcon };
 
 // Web counterpart of the Flutter client's _AppDrawer (home_shell.dart) --
 // same destinations (Home/Chats/Tasks/Profiles/Friends/Settings, same badge
@@ -29,15 +22,8 @@ export default function AppDrawer({ open, onClose, active, notify, onOpenConvers
     apiJson('/conversations').then((d) => setRecent((d || []).slice(0, 12))).catch(() => setRecent([]));
   }, [open, recent]);
 
-  const items = [
-    { key: 'home', label: 'Home', Icon: HomeIcon, badge: 0 },
-    { key: 'chats', label: 'Chats', Icon: ChatIcon, badge: notify?.unreadChatIds?.size || 0 },
-    { key: 'tasks', label: 'Tasks', Icon: TaskIcon, badge: notify?.taskCount || 0 },
-    { key: 'profiles', label: 'Profiles', Icon: ProfileIcon, badge: 0 },
-    { key: 'friends', label: 'Friends', Icon: FriendIcon, badge: 0 },
-    { key: 'meet', label: 'Meet', Icon: MeetIcon, badge: 0 },
-    { key: 'settings', label: 'Settings', Icon: SettingsIcon, badge: 0 },
-  ];
+  const badges = { chats: notify?.unreadChatIds?.size || 0, tasks: notify?.taskCount || 0 };
+  const items = NAV_ITEMS.map(({ key, label }) => ({ key, label, Icon: ICONS[key], badge: badges[key] || 0 }));
 
   const select = (key) => {
     onClose();
