@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react';
-import { post, del } from '../api.js';
+import { useEffect, useRef, useState } from 'react';
+import { apiJson, post, del } from '../api.js';
 import { uploadFile, confirmUpload } from '../lib/uploads.js';
 import { DraftIcon, AttachIcon, CloseIcon } from '../icons.jsx';
 
@@ -8,11 +8,17 @@ import { DraftIcon, AttachIcon, CloseIcon } from '../icons.jsx';
 // action_cards when send_email's recipient isn't a known friend, or
 // file_vehicle_insurance_claim drafted a claim email (see app.py's
 // _tool_send_email/_tool_file_vehicle_insurance_claim). The email is already
-// composed and held as a pending row server-side; Send/Cancel here is the
-// only thing that decides whether it actually goes out.
+// composed and held as a pending row server-side.
+//
+// Every state this card shows comes from the server: it loads the email's
+// real status when it appears (it may have been sent from the chat, another
+// device, or before a reload), and Send / Cancel / Attach only change the
+// card when the server says the action happened. A failure keeps the draft
+// pending with the server's reason, so it can be retried.
 export default function EmailDraftCard({ card, onResolved }) {
-  // 'pending' | 'busy' | 'sent' | 'dismissed' | 'error'
-  const [state, setState] = useState(card._resolvedStatus || 'pending');
+  // 'pending' | 'busy' | 'sent' | 'sending' | 'dismissed'
+  const [state, setState] = useState(card._resolvedStatus || card.status || 'pending');
+  const [record, setRecord] = useState(card._record || null);
   const [attachments, setAttachments] = useState(card._attachments || []);
   const [attaching, setAttaching] = useState(false);
   const [errorText, setErrorText] = useState(null);
@@ -20,35 +26,67 @@ export default function EmailDraftCard({ card, onResolved }) {
 
   const draftId = card.draft_id;
 
+  const apply = (data) => {
+    if (!data || !data.status) return;
+    card._resolvedStatus = data.status;
+    card._record = data;
+    setRecord(data);
+    setState(data.status);
+    if (Array.isArray(data.attachments)) {
+      card._attachments = data.attachments;
+      setAttachments(data.attachments);
+    }
+  };
+
+  useEffect(() => {
+    let alive = true;
+    apiJson(`/email-drafts/${draftId}`)
+      .then((data) => { if (alive) apply(data); })
+      .catch(() => { /* keep what the chat reply said; the next action re-checks anyway */ });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftId]);
+
+  const failed = (e, fallback) => {
+    if (e?.status === 409 && e.data?.status) {
+      apply(e.data); // already sent / cancelled elsewhere: show that, not an error
+      setErrorText(null);
+      return;
+    }
+    setState('pending');
+    setErrorText(e?.data?.error || e?.message || fallback);
+  };
+
   const send = async () => {
     setState('busy');
+    setErrorText(null);
     try {
-      await post(`/email-drafts/${draftId}/confirm`, {});
-      card._resolvedStatus = 'sent';
-      setState('sent');
+      const data = await post(`/email-drafts/${draftId}/confirm`, {});
+      if (!data.ok || data.status !== 'sent') throw Object.assign(new Error(data.error || 'Not sent'), { data });
+      apply(data);
       onResolved?.();
     } catch (e) {
-      setErrorText('Could not send this email.');
-      setState('error');
+      failed(e, 'The email was not sent. Please try again.');
     }
   };
 
   const cancel = async () => {
     setState('busy');
+    setErrorText(null);
     try {
-      await post(`/email-drafts/${draftId}/dismiss`, {});
+      const data = await post(`/email-drafts/${draftId}/dismiss`, {});
+      if (!data.ok || data.status !== 'dismissed') throw Object.assign(new Error(data.error || 'Not cancelled'), { data });
+      apply(data);
+      onResolved?.();
     } catch (e) {
-      // Dismiss failing silently is fine -- worst case the card stays
-      // pending server-side; it can never accidentally send either way.
+      failed(e, 'Could not cancel the draft. Please try again.');
     }
-    card._resolvedStatus = 'dismissed';
-    setState('dismissed');
-    onResolved?.();
   };
 
   const attach = async (file) => {
     if (!file) return;
     setAttaching(true);
+    setErrorText(null);
     try {
       const contentType = file.type || 'application/octet-stream';
       const objectKey = await uploadFile(file, 'chat_file');
@@ -59,7 +97,8 @@ export default function EmailDraftCard({ card, onResolved }) {
       card._attachments = data.attachments;
       setAttachments(data.attachments);
     } catch (e) {
-      setErrorText(null); // don't knock the whole card into an error state over an attach failure
+      if (e?.status === 409 && e.data?.status) apply(e.data);
+      setErrorText(e?.data?.error || `Could not attach ${file.name}. Please try again.`);
     } finally {
       setAttaching(false);
     }
@@ -67,30 +106,40 @@ export default function EmailDraftCard({ card, onResolved }) {
 
   const removeAttachment = async (attachmentId) => {
     setAttaching(true);
+    setErrorText(null);
     try {
       const data = await del(`/email-drafts/${draftId}/attachments/${attachmentId}`);
       card._attachments = data.attachments;
       setAttachments(data.attachments);
     } catch (e) {
-      // Leaving the chip in place on failure is fine -- the user can just
-      // try removing it again, same as every other best-effort action here.
+      setErrorText(e?.data?.error || 'Could not remove that file. Please try again.');
     } finally {
       setAttaching(false);
     }
   };
 
   if (state === 'sent') {
+    const verified = record ? record.sent_box_verified : card.sent_box_verified;
+    const copyTo = record?.copy_to || card.copy_to;
     return (
       <div className="action-card">
         <div className="action-card-done"><DraftIcon /> Email sent to {card.to_email}.</div>
+        <div className="action-card-need" style={{ marginTop: 4 }}>
+          {verified
+            ? 'Confirmed in Throughline’s Sent folder.'
+            : verified === false
+              ? 'The mail server accepted it, but it could not be confirmed in Throughline’s Sent folder.'
+              : 'Sent before Sent-folder tracking, so it cannot be checked there.'}
+          {copyTo ? ` A copy went to your inbox (${copyTo}).` : ''}
+        </div>
       </div>
     );
   }
-  if (state === 'dismissed') {
-    return <div className="action-card"><div className="action-card-done">Draft cancelled.</div></div>;
+  if (state === 'sending') {
+    return <div className="action-card"><div className="action-card-done"><DraftIcon /> Sending to {card.to_email}…</div></div>;
   }
-  if (state === 'error') {
-    return <div className="action-card"><div className="action-card-done">{errorText || 'Something went wrong.'}</div></div>;
+  if (state === 'dismissed') {
+    return <div className="action-card"><div className="action-card-done">Draft cancelled. Nothing was sent.</div></div>;
   }
 
   const busy = state === 'busy' || attaching;
@@ -131,6 +180,9 @@ export default function EmailDraftCard({ card, onResolved }) {
             </span>
           ))}
         </div>
+      )}
+      {errorText && (
+        <div role="alert" style={{ marginTop: 8, fontSize: 12.5, color: 'var(--danger, #c0392b)' }}>{errorText}</div>
       )}
       <input
         ref={fileInputRef} type="file" style={{ display: 'none' }}

@@ -18,7 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from email.utils import formataddr
+from email.utils import formataddr, formatdate, make_msgid
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -47,6 +47,7 @@ from ops.actions import register_nudge_runner
 from ops.alerts import ops_alert_worker
 import chat_followup
 import chat_summary
+import mail_sent_box
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
 from ops.tracking import record_fcm_send, record_heartbeat
@@ -905,19 +906,44 @@ def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, r
     attachments: optional list of {"filename", "content_type", "data"}
     dicts (e.g. a vehicle insurance claim's supporting photos/FIR -- see
     confirm_email_draft) -- attached the same way the .ics branch below
-    already does, just generalized from one hardcoded file to a list."""
+    already does, just generalized from one hardcoded file to a list.
+
+    Returns True/False for the reminder callers; _smtp_send_detailed below
+    is the full version (Message-ID, refused recipients, Sent-folder check)."""
+    return _smtp_send_detailed(
+        to_email, subject, text_body, ics_content=ics_content, from_name=from_name,
+        reply_to=reply_to, attachments=attachments,
+    )["sent"]
+
+
+def _smtp_send_detailed(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None,
+                        attachments=None, bcc=None, save_to_sent=False):
+    """Sends one email and reports exactly what happened:
+    {"sent", "message_id", "error", "sent_box"}.
+
+    sent is True only when the SMTP server accepted the message FOR to_email
+    (sendmail's refused-recipients dict is checked, not just "no exception").
+    bcc: extra envelope recipients, never shown in any header -- used to give
+    the sending user their own copy. save_to_sent: file the message in the
+    shared mailbox's Sent folder and confirm it there by Message-ID (see
+    mail_sent_box) -- SMTP on its own never keeps a copy anywhere."""
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_username = os.getenv("SMTP_USERNAME")
     smtp_password = os.getenv("SMTP_PASSWORD")
+    result = {"sent": False, "message_id": None, "error": None, "sent_box": None}
     if not all([smtp_host, smtp_username, smtp_password]):
         print("[email] SMTP not configured (SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD) -- skipping")
-        return False
+        result["error"] = "Email sending is not configured on the server"
+        return result
 
     msg = MIMEMultipart()
     msg["From"] = formataddr((f"{from_name} via Throughline", smtp_username)) if from_name else smtp_username
     msg["To"] = to_email
     msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=False)
+    msg["Message-ID"] = make_msgid(domain=smtp_username.partition("@")[2] or None)
+    result["message_id"] = msg["Message-ID"]
     if reply_to:
         msg["Reply-To"] = reply_to
     msg.attach(MIMEText(text_body, "plain"))
@@ -937,17 +963,26 @@ def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, r
         part.add_header("Content-Disposition", "attachment", filename=attachment["filename"])
         msg.attach(part)
 
+    envelope = [to_email] + [b for b in (bcc or []) if b and b.lower() != to_email.lower()]
+    raw = msg.as_string()
     try:
         smtp_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
         with smtp_class(smtp_host, smtp_port, timeout=15) as server:
             if smtp_port != 465:
                 server.starttls()
             server.login(smtp_username, smtp_password)
-            server.sendmail(smtp_username, [to_email], msg.as_string())
-        return True
+            refused = server.sendmail(smtp_username, envelope, raw) or {}
     except Exception as e:
         print(f"[email] SMTP send to {to_email} failed: {e!r}")
-        return False
+        result["error"] = f"The mail server did not accept the email: {e}"[:300]
+        return result
+    if to_email in refused:
+        result["error"] = f"The mail server refused the recipient {to_email}: {refused[to_email]}"[:300]
+        return result
+    result["sent"] = True
+    if save_to_sent:
+        result["sent_box"] = mail_sent_box.save_and_verify(raw.encode("utf-8"), result["message_id"])
+    return result
 
 
 def send_reminder_email(to_email, description, owner, due_date, reminder_at):
@@ -1948,7 +1983,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. If the user wants it emailed to themself (e.g. 'email me a reminder') and names no one else, omit both friend_name and to_email -- it goes to their own registered address. A friend_name email or a self-email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent.",
+            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. If the user wants it emailed to themself (e.g. 'email me a reminder') and names no one else, omit both friend_name and to_email -- it goes to their own registered address. A friend_name email or a self-email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent. When it does send, the result's 'verdict' says whether it reached the Sent folder -- repeat that, never a stronger claim. Never call this again to 'resend' an existing draft; use send_email_draft for that.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2055,6 +2090,45 @@ AGENT_TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email_draft",
+            "description": (
+                "Send an email draft that is already waiting for approval (from send_email or "
+                "file_vehicle_insurance_claim). Call this ONLY when the user's current message clearly "
+                "tells you to send it ('send it', 'yes send', 'go ahead and send the email'). Omit "
+                "draft_id to send the most recent pending draft. The result is the ground truth: "
+                "ok=false means NOTHING was sent -- say so and give the error. ok=true comes with a "
+                "'verdict' saying whether the email was confirmed in the Sent folder; repeat that verdict, "
+                "never claim more than it says."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"draft_id": {"type": "integer", "description": "A specific draft to send. Omit for the latest pending draft."}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_email_status",
+            "description": (
+                "Check whether an email the assistant drafted or sent actually went out, by looking at the "
+                "record AND the mailbox's Sent folder (and the inbox for bounce reports). Call this "
+                "whenever the user asks if an email was sent or delivered, and before you ever say an "
+                "earlier email 'was sent' or 'already sent'. You do NOT know this from memory -- answer "
+                "only from this tool's 'verdict'. Omit both arguments for the most recent email."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "draft_id": {"type": "integer", "description": "The email's id, if known."},
+                    "to_email": {"type": "string", "description": "Part of the recipient's address, e.g. 'oracle.com'."},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -2081,6 +2155,240 @@ def send_plain_email(to_email, subject, body, from_name=None, reply_to=None, att
     attachment, arbitrary recipient instead of always the authenticated
     user's own address. attachments: see _smtp_send's own doc comment."""
     return _smtp_send(to_email, subject, body, from_name=from_name, reply_to=reply_to, attachments=attachments)
+
+
+# ---- Email records: one email_drafts row per email the assistant sends ----
+# A draft (status pending) waits for the user; a friend/self email is a row
+# that goes straight to sending. Either way, send_email_record() below is the
+# ONLY place an assistant email goes out, so the card's Send button, the
+# chat's "send it", and a direct send all get the same guarantees:
+#   * sent at most once (the row is claimed atomically: pending -> sending);
+#   * "sent" only when the mail server accepted it for the recipient;
+#   * a copy filed in the Sent folder and found again there by Message-ID;
+#   * the sender gets a copy (hidden BCC to their registered address).
+_email_columns_ready = False
+_email_columns_lock = threading.Lock()
+
+
+def _ensure_email_draft_columns(cur, db):
+    """Lazy, idempotent: the sent-record columns on email_drafts (same
+    pattern as _ensure_dm_client_id_column). Also in schema.sql."""
+    global _email_columns_ready
+    if _email_columns_ready:
+        return
+    with _email_columns_lock:
+        if _email_columns_ready:
+            return
+        for ddl in (
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'draft'",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS message_id TEXT",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_verified BOOLEAN",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_folder TEXT",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS send_error TEXT",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS copy_to TEXT",
+        ):
+            cur.execute(ddl)
+        db.commit()
+        _email_columns_ready = True
+
+
+def _bcc_sender_enabled():
+    return os.getenv("EMAIL_BCC_SENDER", "true").strip().lower() != "false"
+
+
+_EMAIL_STATUS_TEXT = {
+    "pending": "Not sent. It is still a draft waiting for the user to approve it.",
+    "sending": "Being sent right now.",
+    "dismissed": "Not sent. The user cancelled this draft.",
+}
+
+
+def _email_record_payload(row, sent_box_error=None):
+    """What the clients and the model are told about one email row. The
+    'verdict' is the single source of truth the chat must repeat."""
+    status = row["status"]
+    payload = {
+        "draft_id": row["id"], "status": status, "to_email": row["to_email"], "subject": row["subject"],
+        "sent_at": row["sent_at"].isoformat() if row.get("sent_at") else None,
+        "sent_box_verified": row.get("sent_box_verified"), "sent_box_folder": row.get("sent_box_folder"),
+        "copy_to": row.get("copy_to"), "send_error": row.get("send_error"),
+    }
+    copy_note = (f" A copy was sent to the user's own inbox ({row['copy_to']}); it will not appear in the "
+                 "user's own Sent folder, because it is sent from Throughline's mailbox."
+                 if row.get("copy_to") else "")
+    if status == "sent":
+        if row.get("sent_box_verified"):
+            payload["verdict"] = (f"Sent to {row['to_email']}. The mail server accepted it, and it is confirmed in "
+                                  f"the Sent folder of Throughline's sending mailbox." + copy_note)
+        elif row.get("message_id"):
+            payload["verdict"] = (f"Sent to {row['to_email']} (the mail server accepted it), but it could not be "
+                                  f"confirmed in the Sent folder of Throughline's sending mailbox"
+                                  + (f": {sent_box_error}." if sent_box_error else ".") + copy_note)
+        else:
+            payload["verdict"] = (f"Marked sent to {row['to_email']} before Sent-folder tracking existed, so it "
+                                  "cannot be checked in the Sent folder.")
+    else:
+        payload["verdict"] = _EMAIL_STATUS_TEXT.get(status, f"Status: {status}.")
+    return payload
+
+
+_EMAIL_ROW_COLUMNS = ("id, user_id, to_email, subject, body, from_name, reply_to, status, kind, message_id, "
+                      "sent_at, sent_box_verified, sent_box_folder, send_error, copy_to")
+
+
+def send_email_record(cur, db, user_id, draft_id):
+    """Send one pending email_drafts row. Returns (http_status, payload);
+    payload["ok"] is True only when the email really went out."""
+    _ensure_email_draft_columns(cur, db)
+    # Claim first and commit, so a double tap, a retry, or the chat and the
+    # card racing each other can never send the same email twice.
+    cur.execute(
+        f"UPDATE email_drafts SET status = 'sending', send_error = NULL "
+        f"WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING {_EMAIL_ROW_COLUMNS}",
+        (draft_id, user_id),
+    )
+    row = cur.fetchone()
+    db.commit()
+    if not row:
+        cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s AND user_id = %s",
+                    (draft_id, user_id))
+        current = cur.fetchone()
+        if not current:
+            return 404, {"ok": False, "error": "No email with that id"}
+        payload = _email_record_payload(current)
+        payload.update(ok=False, error=f"This email is not waiting to be sent. {payload['verdict']}")
+        return 409, payload
+
+    def back_to_pending(error):
+        cur.execute("UPDATE email_drafts SET status = 'pending', send_error = %s WHERE id = %s", (error, draft_id))
+        db.commit()
+        cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s", (draft_id,))
+        payload = _email_record_payload(cur.fetchone())
+        payload.update(ok=False, error=error)
+        return payload
+
+    import storage
+    cur.execute("SELECT object_key, filename, content_type FROM email_draft_attachments WHERE draft_id = %s",
+                (draft_id,))
+    attachments = []
+    for att in cur.fetchall():
+        data = storage.download_object(att["object_key"])
+        if data is None:
+            # Sending without a file the user attached would be a silent lie
+            # about what went out -- stop, keep the draft, and say which one.
+            return 502, back_to_pending(f"The attachment '{att['filename']}' could not be loaded, so nothing was "
+                                        "sent. Remove it and attach it again, then send.")
+        attachments.append({"filename": att["filename"], "content_type": att["content_type"], "data": data})
+
+    copy_to = row["reply_to"] if _bcc_sender_enabled() and row["reply_to"] else None
+    try:
+        res = _smtp_send_detailed(
+            row["to_email"], row["subject"], row["body"], from_name=row["from_name"], reply_to=row["reply_to"],
+            attachments=attachments, bcc=[copy_to] if copy_to else None, save_to_sent=True,
+        )
+    except Exception as e:  # never leave a row stuck in 'sending'
+        res = {"sent": False, "error": f"Sending failed: {e!r}"[:300], "message_id": None, "sent_box": None}
+    if not res["sent"]:
+        return 502, back_to_pending(res["error"] or "The email could not be sent.")
+
+    box = res["sent_box"] or {}
+    cur.execute(
+        f"UPDATE email_drafts SET status = 'sent', resolved_at = now(), sent_at = now(), message_id = %s, "
+        f"sent_box_verified = %s, sent_box_folder = %s, send_error = NULL, copy_to = %s "
+        f"WHERE id = %s RETURNING {_EMAIL_ROW_COLUMNS}",
+        (res["message_id"], bool(box.get("verified")), box.get("folder"), copy_to, draft_id),
+    )
+    sent_row = cur.fetchone()
+    # No-op unless this draft came from file_vehicle_insurance_claim.
+    cur.execute("UPDATE vehicle_insurance_claims SET status = 'filed', resolved_at = now() WHERE email_draft_id = %s",
+                (draft_id,))
+    db.commit()
+    payload = _email_record_payload(sent_row, sent_box_error=box.get("error"))
+    payload["ok"] = True
+    return 200, payload
+
+
+def check_email_record(cur, db, user_id, row):
+    """Live re-check of one email row against the mailbox: Sent folder by
+    Message-ID, plus any delivery-failure report in the inbox."""
+    if row["status"] != "sent" or not row.get("message_id"):
+        return _email_record_payload(row)
+    live = mail_sent_box.verify(row["message_id"])
+    if live["folder"]:  # the Sent folder was actually searched: found or not, that's the answer
+        # (unreachable mailbox = no folder: keep the last known result instead)
+        cur.execute("UPDATE email_drafts SET sent_box_verified = %s, sent_box_folder = COALESCE(%s, sent_box_folder) "
+                    "WHERE id = %s", (live["verified"], live["folder"], row["id"]))
+        db.commit()
+        row = {**row, "sent_box_verified": live["verified"], "sent_box_folder": live["folder"] or row.get("sent_box_folder")}
+    payload = _email_record_payload(row, sent_box_error=live["error"])
+    bounced = mail_sent_box.find_bounce(row["message_id"])
+    payload["bounced"] = bounced
+    if bounced:
+        payload["verdict"] = (f"The mail server accepted it, but a delivery-failure report came back for "
+                              f"{row['to_email']}, so it most likely did NOT reach them.")
+    return payload
+
+
+def _tool_send_email_draft(cur, db, user_id, args):
+    """The chat's "send it": sends a pending draft through the same path as
+    the card's Send button. Defaults to the most recent pending draft."""
+    _ensure_email_draft_columns(cur, db)
+    draft_id = args.get("draft_id")
+    if not draft_id:
+        cur.execute("SELECT id FROM email_drafts WHERE user_id = %s AND status = 'pending' "
+                    "ORDER BY created_at DESC LIMIT 1", (user_id,))
+        found = cur.fetchone()
+        if not found:
+            return {"ok": False, "error": "There is no email draft waiting to be sent."}
+        draft_id = found["id"]
+    try:
+        draft_id = int(draft_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "draft_id must be a number"}
+    _, payload = send_email_record(cur, db, user_id, draft_id)
+    if payload.get("ok"):
+        payload["_action_card"] = _email_status_card(cur, payload)
+    return payload
+
+
+def _email_status_card(cur, payload):
+    """Re-shows the email as a resolved card, so the chat displays the real
+    outcome next to the reply instead of only the model's words for it."""
+    cur.execute("SELECT body FROM email_drafts WHERE id = %s", (payload["draft_id"],))
+    body_row = cur.fetchone()
+    return {
+        "type": "email_draft", "draft_id": payload["draft_id"], "to_email": payload["to_email"],
+        "subject": payload["subject"], "body": body_row["body"] if body_row else "",
+        "status": payload["status"], "sent_box_verified": payload.get("sent_box_verified"),
+        "copy_to": payload.get("copy_to"),
+    }
+
+
+def _tool_check_email_status(cur, db, user_id, args):
+    """Ground truth for "was it sent?" -- the record plus a live look at the
+    mailbox. The model must answer from this, never from memory."""
+    _ensure_email_draft_columns(cur, db)
+    clauses, params = ["user_id = %s"], [user_id]
+    if args.get("draft_id"):
+        try:
+            clauses.append("id = %s")
+            params.append(int(args["draft_id"]))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "draft_id must be a number"}
+    elif (args.get("to_email") or "").strip():
+        clauses.append("to_email ILIKE %s")
+        params.append(f"%{args['to_email'].strip()}%")
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE {' AND '.join(clauses)} "
+                f"ORDER BY created_at DESC LIMIT 3", params)
+    rows = cur.fetchall()
+    if not rows:
+        return {"ok": True, "found": False, "verdict": "No email matching that was drafted or sent by the assistant."}
+    latest = check_email_record(cur, db, user_id, rows[0])
+    result = {"ok": True, "found": True, **latest}
+    if len(rows) > 1:
+        result["earlier"] = [_email_record_payload(r) for r in rows[1:]]
+    return result
 
 
 def _tool_create_task(cur, db, user_id, args):
@@ -2373,8 +2681,25 @@ def _tool_send_email(cur, db, user_id, args):
     body = args.get("body") or ""
 
     if sends_immediately:
-        sent = send_plain_email(to_email, subject, body, from_name=from_name, reply_to=reply_to)
-        return {"ok": sent, "to_email": to_email} if sent else {"error": f"Failed to send email to {to_email}"}
+        # Recorded like a draft and sent through the same path, so it has a
+        # Message-ID, a Sent-folder copy, and can be checked later.
+        _ensure_email_draft_columns(cur, db)
+        cur.execute(
+            "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to, kind) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'direct') RETURNING id",
+            (user_id, to_email, subject, body, from_name, reply_to),
+        )
+        record_id = cur.fetchone()["id"]
+        db.commit()
+        _, payload = send_email_record(cur, db, user_id, record_id)
+        if payload.get("ok"):
+            payload["_action_card"] = _email_status_card(cur, payload)
+        else:
+            # Nothing went out; don't leave a draft card-less row waiting.
+            cur.execute("UPDATE email_drafts SET status = 'dismissed', resolved_at = now() WHERE id = %s AND status = 'pending'",
+                        (record_id,))
+            db.commit()
+        return payload
 
     cur.execute(
         "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to) "
@@ -2591,6 +2916,8 @@ AGENT_TOOL_DISPATCH = {
     "send_email": lambda cur, db, user_id, args: _tool_send_email(cur, db, user_id, args),
     "file_vehicle_insurance_claim": lambda cur, db, user_id, args: _tool_file_vehicle_insurance_claim(cur, db, user_id, args),
     "get_latest_draft": lambda cur, db, user_id, args: _tool_get_latest_draft(cur, db, user_id, args),
+    "send_email_draft": lambda cur, db, user_id, args: _tool_send_email_draft(cur, db, user_id, args),
+    "check_email_status": lambda cur, db, user_id, args: _tool_check_email_status(cur, db, user_id, args),
 }
 
 # 6: a spending question answered from email needs query_spending -> mail
@@ -2674,6 +3001,10 @@ def run_agent_tool_loop(cur, db, user_id, messages):
 
             if name == "create_task" and result.get("ok"):
                 created_task = True
+            if name in ("send_email", "send_email_draft", "check_email_status"):
+                # Read by _email_claim_backstop after the reply is written.
+                outcomes = g.setdefault("email_outcomes", [])
+                outcomes.append({"tool": name, "ok": bool(result.get("ok")), "status": result.get("status")})
             card = result.pop("_action_card", None)
             if card:
                 action_cards.append(card)
@@ -3335,6 +3666,52 @@ _FABRICATED_PLACEHOLDER_RE = re.compile(r"\[(insert|your)\b", re.IGNORECASE)
 # Model-internal citation markers -- lenticular brackets (never used in
 # normal prose), optionally preceded by spaces.
 _TOOL_CITATION_RE = re.compile(r"[ \t]*【[^】\n]{0,400}】")
+
+# The assistant saying an email went out ("already sent", "I've sent it",
+# "has been sent", "email sent"). Deliberately narrow: "Oracle sent you a
+# reminder" or "was sent on 3 Oct" (reading someone's mail) must not match.
+_EMAIL_SENT_CLAIM_RE = re.compile(
+    r"\b(?:already\s+(?:been\s+)?sent"
+    r"|I(?:'ve|\s+have)?\s+(?:already\s+|just\s+|now\s+|successfully\s+)?sent"
+    r"|(?:has|have)\s+(?:already\s+|now\s+|just\s+|successfully\s+)?been\s+(?:successfully\s+)?(?:sent|delivered)"
+    r"|e-?mail\s+(?:was\s+|is\s+)?(?:successfully\s+)?sent)\b",
+    re.IGNORECASE,
+)
+_EMAIL_WORD_RE = re.compile(r"\be-?mail|\bmail\b", re.IGNORECASE)
+_NEGATION_RE = re.compile(r"\b(?:not|never|yet\s+to)\b|n't\b", re.IGNORECASE)
+
+
+def _claims_email_sent(reply):
+    if not reply or not _EMAIL_WORD_RE.search(reply):
+        return False
+    for m in _EMAIL_SENT_CLAIM_RE.finditer(reply):
+        if not _NEGATION_RE.search(reply[max(0, m.start() - 30):m.end()]):
+            return True
+    return False
+
+
+def _email_claim_backstop(cur, db, user_id, reply, outcomes):
+    """Deterministic check, not just a prompt rule -- confirmed live: asked
+    to "send it", the model answered "already sent" while the Oracle draft
+    sat unsent, because nothing in chat could send a draft. If the reply
+    says an email went out but no tool sent (or confirmed) one this turn,
+    replace it with what the record and mailbox actually say."""
+    if not _claims_email_sent(reply):
+        return reply
+    if any(o["ok"] and o.get("status") == "sent" for o in outcomes):
+        return reply
+    _ensure_email_draft_columns(cur, db)
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE user_id = %s "
+                f"ORDER BY created_at DESC LIMIT 1", (user_id,))
+    latest = cur.fetchone()
+    if latest and latest["status"] == "pending":
+        return (f"Correction: the email to {latest['to_email']} (“{latest['subject']}”) has NOT been sent "
+                "yet. It is still a draft. Tap Send on the card, or tell me “send it” and I’ll send it "
+                "and check that it reached the Sent folder.")
+    if latest and latest["status"] == "sent":
+        return "I checked the mailbox: " + check_email_record(cur, db, user_id, latest)["verdict"]
+    return ("I can’t confirm that any email was sent: there is no sent email on record. "
+            "Tell me what to send and I’ll draft it for you to approve.")
 
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
 
@@ -4781,77 +5158,64 @@ def confirm_email_draft(draft_id):
     one point where a drafted email actually goes out. Ownership + pending
     check in the same query via the WHERE clause, same shape as
     delete_task below, rather than a separate SELECT-then-check."""
+    db = get_db()
+    status, payload = send_email_record(dict_cursor(db), db, current_user_id(), draft_id)
+    return jsonify(payload), status
+
+
+@app.route("/email-drafts/<int:draft_id>", methods=["GET"])
+@login_required
+def get_email_draft(draft_id):
+    """Current state of one email, so a card shows the truth after a
+    reload, a scroll, or a send from the chat or another device.
+    ?verify=1 also re-checks the mailbox's Sent folder and inbox bounces."""
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
-    cur.execute(
-        "SELECT to_email, subject, body, from_name, reply_to FROM email_drafts "
-        "WHERE id = %s AND user_id = %s AND status = 'pending'",
-        (draft_id, user_id),
-    )
-    draft = cur.fetchone()
-    if not draft:
-        return jsonify({"error": "No pending draft with that id"}), 404
-
-    import storage
-    cur.execute(
-        "SELECT object_key, filename, content_type FROM email_draft_attachments WHERE draft_id = %s",
-        (draft_id,),
-    )
-    attachments = []
-    for row in cur.fetchall():
-        data = storage.download_object(row["object_key"])
-        if data is None:
-            # Best-effort, same as every other storage.download_object
-            # caller -- one bad/expired object shouldn't block the whole
-            # claim from going out with whatever attachments did come through.
-            continue
-        attachments.append({"filename": row["filename"], "content_type": row["content_type"], "data": data})
-
-    sent = send_plain_email(
-        draft["to_email"], draft["subject"], draft["body"],
-        from_name=draft["from_name"], reply_to=draft["reply_to"], attachments=attachments,
-    )
-    if not sent:
-        return jsonify({"error": f"Failed to send email to {draft['to_email']}"}), 502
-
-    cur.execute(
-        "UPDATE email_drafts SET status = 'sent', resolved_at = now() WHERE id = %s",
-        (draft_id,),
-    )
-    # No-op unless this draft came from file_vehicle_insurance_claim --
-    # keeps the claim's own status in lockstep with its email draft instead
-    # of tracking it independently.
-    cur.execute(
-        "UPDATE vehicle_insurance_claims SET status = 'filed', resolved_at = now() WHERE email_draft_id = %s",
-        (draft_id,),
-    )
-    db.commit()
-    return jsonify({"ok": True, "status": "sent"})
+    _ensure_email_draft_columns(cur, db)
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s AND user_id = %s", (draft_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "No email with that id"}), 404
+    payload = check_email_record(cur, db, user_id, row) if request.args.get("verify") == "1" else _email_record_payload(row)
+    payload["ok"] = True
+    payload["attachments"] = _email_draft_attachments_list(cur, draft_id)
+    return jsonify(payload)
 
 
 @app.route("/email-drafts/<int:draft_id>/dismiss", methods=["POST"])
 @login_required
 def dismiss_email_draft(draft_id):
-    """User tapped Cancel -- nothing is ever sent for a dismissed draft."""
+    """User tapped Cancel -- nothing is ever sent for a dismissed draft.
+    Only a still-pending draft can be cancelled; anything else answers 409
+    with its real status, so the card never shows "cancelled" for an email
+    that already went out."""
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
+    _ensure_email_draft_columns(cur, db)
     cur.execute(
-        "UPDATE email_drafts SET status = 'dismissed', resolved_at = now() "
-        "WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING id",
+        f"UPDATE email_drafts SET status = 'dismissed', resolved_at = now() "
+        f"WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING {_EMAIL_ROW_COLUMNS}",
         (draft_id, user_id),
     )
     updated = cur.fetchone()
-    # No-op unless this draft came from file_vehicle_insurance_claim.
-    cur.execute(
-        "UPDATE vehicle_insurance_claims SET status = 'dismissed', resolved_at = now() WHERE email_draft_id = %s",
-        (draft_id,),
-    )
+    if updated:
+        # No-op unless this draft came from file_vehicle_insurance_claim.
+        cur.execute(
+            "UPDATE vehicle_insurance_claims SET status = 'dismissed', resolved_at = now() WHERE email_draft_id = %s",
+            (draft_id,),
+        )
     db.commit()
-    if not updated:
-        return jsonify({"error": "No pending draft with that id"}), 404
-    return jsonify({"ok": True, "status": "dismissed"})
+    if updated:
+        return jsonify({**_email_record_payload(updated), "ok": True})
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s AND user_id = %s", (draft_id, user_id))
+    current = cur.fetchone()
+    if not current:
+        return jsonify({"ok": False, "error": "No email with that id"}), 404
+    payload = _email_record_payload(current)
+    payload.update(ok=False, error=f"This draft can no longer be cancelled. {payload['verdict']}")
+    return jsonify(payload), 409
 
 
 def _email_draft_attachments_list(cur, draft_id):
@@ -4890,9 +5254,27 @@ def attach_email_draft_file(draft_id):
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
-    cur.execute("SELECT id FROM email_drafts WHERE id = %s AND user_id = %s AND status = 'pending'", (draft_id, user_id))
-    if not cur.fetchone():
-        return jsonify({"error": "No pending draft with that id"}), 404
+    # FOR UPDATE: a send that starts at the same moment waits for this
+    # insert, so a file is never "attached" to an email that already left.
+    cur.execute("SELECT status FROM email_drafts WHERE id = %s AND user_id = %s FOR UPDATE", (draft_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        db.rollback()
+        return jsonify({"ok": False, "error": "No email with that id"}), 404
+    if row["status"] != "pending":
+        db.rollback()
+        return jsonify({"ok": False, "status": row["status"],
+                        "error": "This email is no longer a draft, so files can't be added to it."}), 409
+
+    size = storage.object_size(object_key)
+    if size is None:
+        db.rollback()
+        return jsonify({"ok": False, "error": "The file didn't finish uploading. Please attach it again."}), 400
+    if size > storage.DOWNLOAD_MAX_BYTES:
+        db.rollback()
+        storage.delete_object(object_key)
+        limit_mb = storage.DOWNLOAD_MAX_BYTES // (1024 * 1024)
+        return jsonify({"ok": False, "error": f"That file is too large to email (the limit is {limit_mb} MB)."}), 400
 
     cur.execute(
         "INSERT INTO email_draft_attachments (draft_id, object_key, filename, content_type) "
@@ -6621,7 +7003,11 @@ def _agent_continuation_guardrail() -> str:
         "If asked to show, repeat, or confirm the exact content of something already drafted, call "
         "the get_latest_draft tool and quote its real result -- never reconstruct or guess the "
         "content yourself, and never use placeholder/bracket text like \"[insert policy number]\" in "
-        "anything you say, ever."
+        "anything you say, ever. You also cannot know from memory whether an email was sent. When "
+        "the user tells you to send a drafted email, call send_email_draft; when they ask whether "
+        "an email was sent, call check_email_status. Only ever say an email was sent if one of those "
+        "tools (or send_email) returned it in THIS turn, and repeat its 'verdict' -- otherwise say "
+        "it is still a draft waiting for them."
     )
 
 
@@ -7533,6 +7919,12 @@ def chat_global():
     # nothing to the user; the source chips already show where data came from.
     if reply:
         reply = _TOOL_CITATION_RE.sub("", reply).strip()
+    if reply:
+        try:
+            reply = _email_claim_backstop(cur, db, user_id, reply, g.get("email_outcomes", []))
+        except Exception as e:
+            db.rollback()
+            print(f"[email] sent-claim backstop failed: {e!r}")
 
     if reply:
         # Store the clean question/reply, not the retrieval blob -- that

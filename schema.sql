@@ -170,10 +170,26 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     body TEXT NOT NULL,
     from_name TEXT,
     reply_to TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | dismissed
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | sending | sent | dismissed
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at TIMESTAMPTZ
+    resolved_at TIMESTAMPTZ,
+    -- Sent record (see app.py's send_email_record): every assistant email,
+    -- including friend/self emails that skip the draft step (kind 'direct').
+    kind TEXT NOT NULL DEFAULT 'draft',      -- draft | direct
+    message_id TEXT,                         -- the Message-ID header it went out with
+    sent_at TIMESTAMPTZ,
+    sent_box_verified BOOLEAN,               -- found in the mailbox's Sent folder by Message-ID
+    sent_box_folder TEXT,
+    send_error TEXT,                         -- last failed attempt, shown on the card
+    copy_to TEXT                             -- the sender's own address, BCC'd a copy
 );
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'draft';
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS message_id TEXT;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_verified BOOLEAN;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_folder TEXT;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS send_error TEXT;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS copy_to TEXT;
 CREATE INDEX IF NOT EXISTS idx_email_drafts_user_status
     ON email_drafts (user_id, status);
 

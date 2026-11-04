@@ -131,6 +131,17 @@ def download_object(object_key: str) -> bytes | None:
         return None
 
 
+def object_size(object_key: str) -> int | None:
+    """Size in bytes of an uploaded object, or None if it isn't there (or
+    storage can't be reached) -- lets a caller reject a file up front
+    instead of finding out at send time."""
+    try:
+        head = _client().head_object(Bucket=os.environ["R2_BUCKET_NAME"], Key=object_key)
+        return head["ContentLength"]
+    except Exception:
+        return None
+
+
 def delete_object(object_key: str):
     try:
         _client().delete_object(Bucket=os.environ["R2_BUCKET_NAME"], Key=object_key)
