@@ -71,6 +71,25 @@ _last_beat: dict = {}  # name -> (monotonic time, status) of the last row writte
 _last_prune = {"at": 0.0}
 
 
+def note_written(name: str, status: str) -> None:
+    """A row for this probe was just written elsewhere (the dashboard's
+    "check again") -- counts as its heartbeat."""
+    prev = _last_beat.get(name)
+    _last_beat[name] = (time.monotonic(), status)
+    if prev and prev[1] != status:
+        _status_event(name, prev[1], status, None)
+
+
+_STATUS_WORD = {"success": "healthy", "partial": "warning", "error": "failing"}
+
+
+def _status_event(name, old, new, detail, cur=None, conn=None):
+    from . import events
+    problem = (detail or {}).get("problem") if isinstance(detail, dict) else None
+    events.record("status", name, f"{_STATUS_WORD.get(old, old)} → {_STATUS_WORD.get(new, new)}"
+                  + (f": {problem}" if problem else ""), detail={"from": old, "to": new}, cur=cur, conn=conn)
+
+
 def run_once() -> None:
     """One pass: write out buffered task counts, prune old ones hourly,
     run every probe and record the ones due a row."""
@@ -81,7 +100,10 @@ def run_once() -> None:
         ensure_ops_schema(cur, conn)
         ops_tasks.flush(cur, conn)
         if time.monotonic() - _last_prune["at"] >= PRUNE_INTERVAL_SECONDS:
+            from . import acks, events
             ops_tasks.prune(cur, conn)
+            events.prune(cur, conn)
+            acks.prune(cur, conn)
             _last_prune["at"] = time.monotonic()
         for name in list(_probes):
             started_at = datetime.now(timezone.utc)
@@ -90,8 +112,15 @@ def run_once() -> None:
             if prev is None or prev[1] != status or time.monotonic() - prev[0] >= HEARTBEAT_SECONDS:
                 record_completed_run(cur, conn, name, started_at, status, detail)
                 _last_beat[name] = (time.monotonic(), status)
+                if prev is not None and prev[1] != status:
+                    _status_event(name, prev[1], status, detail, cur, conn)
                 if status != "success":
                     print(f"[ops.probe] {name}: {status} {detail}", flush=True)
+        try:
+            from . import remediations
+            remediations.observe_sending()
+        except Exception as e:
+            print(f"[ops.probe] sending-email watch failed: {e!r}", flush=True)
     except Exception as e:
         print(f"[ops.probe] error: {e!r}", flush=True)
         if conn:
@@ -105,6 +134,8 @@ def run_once() -> None:
 
 
 def ops_probe_worker():
+    from . import events
+    events.record_startup()
     while True:
         time.sleep(PROBE_INTERVAL_SECONDS)
         run_once()

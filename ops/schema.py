@@ -66,4 +66,43 @@ def _ensure_ops_schema_locked(cur, conn) -> None:
         )
         """
     )
+    for ddl in ACTIONABLE_DDL:
+        cur.execute(ddl)
     conn.commit()
+
+
+# Tables behind the actionable parts of the dashboard: the event log
+# (ops/events.py), acknowledge/snooze (ops/acks.py) and open incidents
+# (ops/alerts.py). Also run by the deploy script before the code goes live.
+ACTIONABLE_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS ops.events (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        kind TEXT NOT NULL,
+        subject TEXT,
+        message TEXT,
+        actor TEXT,
+        detail JSONB
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ops_events_created ON ops.events (created_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS ops.acks (
+        item_key TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        until_at TIMESTAMPTZ NOT NULL,
+        note TEXT,
+        actor TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ops.incidents (
+        job_name TEXT PRIMARY KEY,
+        opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        problem TEXT,
+        last_notified_at TIMESTAMPTZ
+    )
+    """,
+)

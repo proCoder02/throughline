@@ -4,6 +4,7 @@ stale-job checker), and scheduler.py can all import this without any of
 them depending on each other."""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 
 from . import job_control
@@ -20,7 +21,7 @@ from .tracking import HEARTBEAT_SECONDS
 JOB_STALE_HOURS = {
     "ei_pipeline": 15, "nudge_cycle": 3,
     "email_reminder_worker": 0.2, "call_ring_timeout_worker": 0.2,
-    "ops_alert_check": 1,  # diagnostic heartbeat -- see alerts.py's record_completed_run call
+    "ops_alert_check": 0.5,  # diagnostic heartbeat -- see alerts.py's record_completed_run call
     "custom_job_scheduler": 0.2,
 }
 
@@ -49,8 +50,8 @@ JOB_SCHEDULE = {
         "cadence_label": "Continuous (10s loop; heartbeat every 5 min)",
     },
     "ops_alert_check": {
-        "kind": "interval", "interval_seconds": 1800,
-        "cadence_label": "Every 30 min (diagnostic -- see ops/alerts.py)",
+        "kind": "interval", "interval_seconds": 300,
+        "cadence_label": "Every 5 min (see ops/alerts.py)",
     },
     "custom_job_scheduler": {
         "kind": "interval", "interval_seconds": HEARTBEAT_SECONDS,
@@ -80,6 +81,18 @@ JOB_CONTROL_KIND = {
 # in by job_status() -- they're health checks, so always control_kind "none".
 
 JOB_HISTORY_LIMIT = 5
+
+# Jobs that only run when their feature flag is on -- with the flag off
+# they're "off", not stale, and never alerted on.
+JOB_FEATURE_FLAG = {
+    "nudge_cycle": "NUDGE_FEATURE_ENABLED",
+    "ei_pipeline": "EMOTIONAL_INTELLIGENCE_ENABLED",
+}
+
+
+def job_disabled(job_name: str) -> bool:
+    flag = JOB_FEATURE_FLAG.get(job_name)
+    return bool(flag) and os.getenv(flag, "false").strip().lower() != "true"
 
 
 def _compute_next_run(sched: dict, last_started_at, now):
@@ -184,6 +197,7 @@ def job_status(cur, conn) -> list:
             duration_seconds = (latest["finished_at"] - latest["started_at"]).total_seconds()
         sched = all_schedules.get(job_name, {})
         is_iced = bool(on_ice.get(job_name))
+        disabled = job_disabled(job_name)
         nxt = None if is_iced else _compute_next_run(sched, latest["started_at"] if latest else None, now) if sched else None
         return {
             "job_name": job_name,
@@ -192,7 +206,8 @@ def job_status(cur, conn) -> list:
             "status": latest["status"] if latest else "never_run",
             "detail": latest["detail"] if latest else None,
             "age_hours": round(age_hours, 2) if age_hours is not None else None,
-            "stale": (not is_iced) and (age_hours is None or age_hours > stale_after),
+            "stale": (not is_iced) and (not disabled) and (age_hours is None or age_hours > stale_after),
+            "disabled": disabled,
             "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
             "cadence_label": sched.get("cadence_label", "—"),
             "next_run_at": nxt.isoformat() if nxt else None,

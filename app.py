@@ -53,6 +53,8 @@ from ops.scheduler import custom_job_scheduler
 from ops.tracking import record_fcm_send, record_heartbeat
 from ops import checks as ops_checks
 from ops import tasks as ops_tasks
+from ops import notify as ops_notify
+from ops import remediations as ops_remediations
 from ops.probe import ops_probe_worker
 
 load_dotenv()
@@ -9202,6 +9204,9 @@ def _start_ops_monitoring():
         costlens_stats=_costlens_stats,
         gauges={"live_transcription_sessions": _live_listen_sessions.snapshot},
     )
+    ops_remediations.install(rq_queues=[call_queue],
+                             email=(send_email_record, get_raw_connection, release_raw_connection, dict_cursor))
+    ops_notify.register_push(send_fcm_to_user)
     threading.Thread(target=ops_probe_worker, daemon=True).start()
 
 

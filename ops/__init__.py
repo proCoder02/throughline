@@ -19,4 +19,13 @@ internals change. The only things another file needs from here are:
     writes out ops.tasks' buffered counts.
   - ops.tasks.run / wrap / fail / ignore -- success/error/latency counts
     for one-off background work (see ops/tasks.py).
+  - ops.remediations.install(...) / ops.notify.register_push(...) -- hand
+    over what the one-click fixes and phone alerts need (RQ queues, the
+    email sender, the FCM sender).
+
+Making the dashboard actionable lives in: runbooks.py (what to do per
+problem), remediations.py (one-click fixes), acks.py (acknowledge /
+snooze), trends.py (24h per-hour history + deploy markers), events.py
+(the activity log), notify.py + alerts.py (alert / reminder / recovered
+messages by email and push).
 """

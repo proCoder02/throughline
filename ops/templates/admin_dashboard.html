@@ -256,6 +256,46 @@
   .form-msg { font-size: 13px; }
   .form-msg.error { color: var(--crit); } .form-msg.ok { color: var(--ok); }
 
+  /* ---------- runbooks, fixes, acknowledge ---------- */
+  .rb { margin-top: 10px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--panel-2); border: 1px solid var(--border-soft); font-size: 12.5px; }
+  .rb-h { font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 4px; }
+  .rb p { margin: 0 0 6px; color: var(--text-soft); }
+  .rb ol { margin: 0 0 8px; padding-left: 18px; color: var(--text); }
+  .rb ol li { margin: 2px 0; }
+  .rb .logbox { margin-bottom: 6px; }
+  .rb .actions { margin-top: 8px; }
+  details.att-rb { margin-top: 6px; }
+  details.att-rb > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--accent); list-style: none; display: inline-flex; align-items: center; gap: 4px; }
+  details.att-rb > summary::-webkit-details-marker { display: none; }
+  details.att-rb[open] > summary .chev { transform: rotate(90deg); }
+  .att-tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+  .att-item.silenced { opacity: .62; }
+  .att-item.silenced:hover, .att-item.silenced:focus-within { opacity: 1; }
+  .ackline { font-size: 12px; color: var(--paused); font-weight: 600; }
+  .incline { font-size: 12px; color: var(--text-soft); margin-bottom: 6px; }
+
+  /* ---------- 24h trend strips ---------- */
+  .spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 18px; vertical-align: middle; }
+  .spark i { width: 4px; height: 14px; border-radius: 1px; background: var(--hover); display: inline-block; position: relative; }
+  .spark i.ok { background: var(--ok); } .spark i.warn { background: var(--warn); } .spark i.crit { background: var(--crit); }
+  .spark i.dep::before { content: ""; position: absolute; left: -1px; right: -1px; top: -4px; height: 2px; background: var(--info); border-radius: 1px; }
+  .spark-legend { font-size: 11.5px; color: var(--text-faint); }
+  .spark-legend .dep-key { display: inline-block; width: 8px; height: 2px; background: var(--info); vertical-align: middle; margin-right: 4px; }
+
+  /* ---------- activity log ---------- */
+  .ev { display: grid; grid-template-columns: 92px 22px minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 9px 14px; border-top: 1px solid var(--border-soft); font-size: 13px; }
+  .ev:first-child { border-top: none; }
+  .ev time { color: var(--text-faint); font-size: 12px; }
+  .ev-ico { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 800; }
+  .ev-ico.crit { background: var(--crit-bg); color: var(--crit); } .ev-ico.ok { background: var(--ok-bg); color: var(--ok); }
+  .ev-ico.warn { background: var(--warn-bg); color: var(--warn); } .ev-ico.info { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info); }
+  .ev-ico.none { background: var(--hover); color: var(--text-soft); }
+  .ev-subj { font-weight: 600; }
+  .ev-msg { color: var(--text-soft); overflow-wrap: anywhere; }
+  .ev-actor { font-size: 12px; color: var(--text-faint); white-space: nowrap; }
+  .channels { font-size: 12px; color: var(--text-soft); }
+  .channels b.on { color: var(--ok); } .channels b.off { color: var(--text-faint); }
+
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 14px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 20; }
   .toast.show { opacity: 1; }
 
@@ -295,6 +335,13 @@
     .tbl.stack .detail-row td { display: block; }
     .search { width: 100%; }
     .block-head .tools { margin-left: 0; width: 100%; }
+    .att-item { grid-template-columns: auto minmax(0, 1fr); }
+    .att-item .att-go { grid-column: 2; }
+    .ev { grid-template-columns: 22px minmax(0, 1fr); row-gap: 2px; }
+    .ev .ev-ico { grid-column: 1; grid-row: 1 / span 3; }
+    .ev .ev-body { grid-column: 2; grid-row: 1; }
+    .ev time { grid-column: 2; grid-row: 2; }
+    .ev-actor { grid-column: 2; grid-row: 3; white-space: normal; }
   }
 </style>
 </head>
@@ -310,6 +357,7 @@
       <a href="#delivery" data-nav="delivery">Email &amp; push <span class="count" id="nav-count-delivery"></span></a>
       <a href="#pipelines" data-nav="pipelines">EI &amp; digest <span class="count" id="nav-count-pipelines"></span></a>
       <a href="#infra" data-nav="infra">Database &amp; compute <span class="count" id="nav-count-infra"></span></a>
+      <a href="#activity" data-nav="activity">Activity</a>
       <div class="nav-label">External</div>
       {% if grafana_url %}
       <a href="{{ grafana_url }}" target="_blank" rel="noopener noreferrer">Grafana<span class="ext">↗</span></a>
@@ -356,6 +404,7 @@
         <div class="block-head">
           <h2 id="h-jobs">Jobs &amp; workers</h2>
           <span class="sub" id="jobs-sub"></span>
+          <span class="spark-legend">24 h: one bar per hour, worst status · <span class="dep-key"></span>deploy/restart</span>
           <div class="tools">
             <div class="filters" role="group" aria-label="Filter jobs">
               <button type="button" data-filter="all" aria-pressed="true">All</button>
@@ -369,7 +418,7 @@
           <table class="tbl stack" id="jobs-table">
             <thead><tr>
               <th scope="col">Status</th><th scope="col">Job</th><th scope="col">Schedule</th>
-              <th scope="col">Last run</th><th scope="col" class="r">Took</th><th scope="col">Next run</th><th scope="col">Last 5</th>
+              <th scope="col">Last run</th><th scope="col" class="r">Took</th><th scope="col">Next run</th><th scope="col">Last 24 h</th>
             </tr></thead>
             <tbody id="jobs-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
           </table>
@@ -398,10 +447,10 @@
           <table class="tbl stack">
             <thead><tr>
               <th scope="col">Status</th><th scope="col">Task</th><th scope="col" class="r">Runs</th>
-              <th scope="col">Failure rate</th><th scope="col" class="r">Median</th><th scope="col" class="r">p95</th>
+              <th scope="col">Failure rate</th><th scope="col">Last 24 h</th><th scope="col" class="r">Median</th><th scope="col" class="r">p95</th>
               <th scope="col">Last run</th><th scope="col">Last error</th>
             </tr></thead>
-            <tbody id="tasks-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+            <tbody id="tasks-body"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
           </table>
           <div class="note" id="tasks-foot" style="padding:8px 14px; border-top:1px solid var(--border-soft);"></div>
         </div>
@@ -434,6 +483,24 @@
             <tbody id="db-body"></tbody>
           </table>
         </div>
+      </section>
+
+      <section class="block" id="activity" aria-labelledby="h-activity">
+        <div class="block-head">
+          <h2 id="h-activity">Activity</h2>
+          <span class="sub" id="activity-sub">Status changes, alerts, actions and deploys</span>
+          <div class="tools">
+            <span class="channels" id="channels"></span>
+            <div class="filters" role="group" aria-label="Filter activity">
+              <button type="button" data-evfilter="all" aria-pressed="true">All</button>
+              <button type="button" data-evfilter="problems" aria-pressed="false">Problems</button>
+              <button type="button" data-evfilter="actions" aria-pressed="false">Actions</button>
+              <button type="button" data-evfilter="deploys" aria-pressed="false">Deploys</button>
+            </div>
+          </div>
+        </div>
+        <div class="panel" id="events"><div class="empty">Loading…</div></div>
+        <div style="margin-top:8px;"><button class="btn small" type="button" id="events-more">Show last 7 days</button></div>
       </section>
     </div>
   </div>
@@ -486,7 +553,23 @@ const TASK_LOG = 'journalctl -u throughline -g "chat-resolver|chat-summary|run_b
 const state = {
   data: null, lastOkAt: null, lastTryFailed: false, paused: false, timer: null,
   expanded: new Set(), filter: "all", search: "",
+  openRb: new Set(), evFilter: "all", moreEvents: null,
 };
+
+/* ---------- API calls that change something ---------- */
+// The X-Ops-Request header is required by every admin POST/DELETE
+// (blocks cross-site form posts).
+async function apiSend(path, method, body) {
+  const res = await fetch(path, {
+    method, credentials: "same-origin",
+    headers: Object.assign({ "X-Ops-Request": "1" }, body ? { "Content-Type": "application/json" } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401 || res.redirected) { window.location.href = "/admin/login"; throw new Error("signed out"); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+  return data;
+}
 
 /* ---------- helpers ---------- */
 function esc(s) {
@@ -506,7 +589,8 @@ function until(iso) {
   const s = (new Date(iso).getTime() - Date.now()) / 1000;
   if (s <= 0) return "due now";
   if (s < 3600) return "in " + Math.max(1, Math.round(s / 60)) + "m";
-  return "in " + (s / 3600).toFixed(1) + "h";
+  if (s < 172800) return "in " + (s / 3600).toFixed(1) + "h";
+  return "in " + Math.round(s / 86400) + "d";
 }
 function abs(iso) { return iso ? new Date(iso).toLocaleString() : ""; }
 function timeEl(iso, text) { return iso ? `<time datetime="${esc(iso)}" title="${esc(abs(iso))}">${esc(text)}</time>` : `<span class="muted">${esc(text)}</span>`; }
@@ -536,8 +620,94 @@ function humanKey(k) { return k.replace(/_/g, " ").replace(/^./, c => c.toUpperC
 // Jobs whose feature flag is off aren't expected to run -- "Off", not "Failing".
 const JOB_FLAG = { nudge_cycle: "nudge_feature_enabled", ei_pipeline: "emotional_intelligence_enabled" };
 function jobDisabled(j) {
+  if (j.disabled !== undefined) return !!j.disabled;
   const flag = JOB_FLAG[j.job_name], flags = (state.data && state.data.flags) || {};
   return flag && flags[flag] === false;
+}
+
+/* ---------- runbooks, fixes, acknowledge ---------- */
+function runbookFor(key, job) {
+  const rb = (state.data && state.data.runbooks) || {};
+  if (rb[key]) return rb[key];
+  const area = key.split(":")[0];
+  if (area === "job") return rb[job && job.control_kind === "subprocess" ? "job:*subprocess" : "job:*"] || null;
+  return rb[area + ":*"] || null;
+}
+function fixIds(key, job) {
+  const rb = runbookFor(key, job) || {};
+  const ids = (rb.fixes || []).slice();
+  if (job && job.control_kind === "none" && !ids.includes("probe_now:" + job.job_name)) ids.push("probe_now:" + job.job_name);
+  const avail = (state.data && state.data.fixes) || {};
+  return ids.filter(id => avail[id]);
+}
+function fixButtons(ids) {
+  const avail = (state.data && state.data.fixes) || {};
+  return ids.map(id => {
+    const f = avail[id];
+    return `<button class="btn small ${f.danger ? "danger" : id.startsWith("probe_now:") ? "" : "primary"}" type="button" data-fix="${esc(id)}" data-confirm="${esc(f.confirm || "")}">${esc(f.label)}</button>`;
+  }).join("");
+}
+function runbookHtml(key, job, withTitle) {
+  const rb = runbookFor(key, job);
+  const ids = fixIds(key, job);
+  if (!rb && !ids.length) return "";
+  const parts = [];
+  if (withTitle) parts.push(`<div class="rb-h">How to fix</div>`);
+  if (rb && rb.cause) parts.push(`<p>${esc(rb.cause)}</p>`);
+  if (rb && rb.steps && rb.steps.length) parts.push(`<ol>${rb.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol>`);
+  if (rb && rb.command) parts.push(`<div class="logbox"><code>${esc(rb.command)}</code><button class="btn small" type="button" data-copy="${esc(rb.command)}" aria-label="Copy command">Copy</button></div>`);
+  if (rb && rb.fixed_when) parts.push(`<div class="note">Fixed when: ${esc(rb.fixed_when)}</div>`);
+  if (ids.length) parts.push(`<div class="actions">${fixButtons(ids)}</div>`);
+  return `<div class="rb">${parts.join("")}</div>`;
+}
+function ackOf(key) { return ((state.data && state.data.acks) || {})[key] || null; }
+function ackLine(a) {
+  if (!a) return "";
+  const left = until(a.until).replace("in ", "");
+  const who = a.actor ? ` by ${a.actor}` : "";
+  return a.kind === "snooze" ? `Snoozed${who} · back ${until(a.until)}` : `Acknowledged${who}${a.note ? " — " + a.note : ""} · lapses in ${left} or on recovery`;
+}
+function ackTools(key) {
+  const a = ackOf(key);
+  if (a) return `<span class="ackline">${esc(ackLine(a))}</span><button class="btn small" type="button" data-unack="${esc(key)}">Unmute</button>`;
+  return `<button class="btn small" type="button" data-ack="${esc(key)}" title="I'm on it: stops reminders, greys it out until it recovers">Acknowledge</button>`
+    + `<button class="btn small" type="button" data-snooze="${esc(key)}" data-hours="2">Snooze 2h</button>`
+    + `<button class="btn small" type="button" data-snooze="${esc(key)}" data-hours="24">Snooze 24h</button>`;
+}
+
+/* ---------- 24h trend strips ---------- */
+function depSlots() {
+  const t = (state.data && state.data.trends) || {};
+  return new Set((t.deploys || []).map(x => x.slot).filter(x => x !== null && x !== undefined));
+}
+function slotTime(i) {
+  const t = (state.data && state.data.trends) || {};
+  if (!t.start) return "";
+  const s = new Date(new Date(t.start).getTime() + i * 3600e3);
+  return s.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+const LEVEL_CLASS = ["ok", "warn", "crit"], LEVEL_WORD = ["healthy", "warning", "failing"];
+function jobSpark(name) {
+  const t = (state.data && state.data.trends) || {};
+  const row = (t.jobs || {})[name];
+  if (!row) return `<span class="muted">—</span>`;
+  const deps = depSlots();
+  const bad = row.filter(v => v === 2).length;
+  return `<span class="spark" role="img" aria-label="Last 24 hours: ${bad} hour(s) failing">${row.map((v, i) =>
+    `<i class="${v === null ? "" : LEVEL_CLASS[v]}${deps.has(i) ? " dep" : ""}" title="${esc(slotTime(i) + " · " + (v === null ? "no report" : LEVEL_WORD[v]) + (deps.has(i) ? " · deploy/restart" : ""))}"></i>`).join("")}</span>`;
+}
+function taskSpark(name) {
+  const t = (state.data && state.data.trends) || {};
+  const row = (t.tasks || {})[name];
+  if (!row) return `<span class="muted">—</span>`;
+  const deps = depSlots();
+  const max = Math.max(1, ...row.map(([ok, err]) => ok + err));
+  return `<span class="spark" role="img" aria-label="Runs per hour, last 24 hours">${row.map(([ok, err], i) => {
+    const n = ok + err, r = n ? err / n : 0;
+    const cls = !n ? "" : r >= 0.5 ? "crit" : r >= 0.2 ? "warn" : "ok";
+    const h = n ? Math.max(4, Math.round((n / max) * 16)) : 14;
+    return `<i class="${cls}${deps.has(i) ? " dep" : ""}" style="height:${h}px" title="${esc(slotTime(i) + ` · ${ok} ok, ${err} failed` + (deps.has(i) ? " · deploy/restart" : ""))}"></i>`;
+  }).join("")}</span>`;
 }
 function jobSev(j) {
   if (j.on_ice) return "paused";
@@ -582,44 +752,49 @@ function collectAttention(d) {
   for (const j of d.jobs || []) {
     const sev = jobSev(j);
     if (sev === "crit" || sev === "warn") {
-      items.push({ sev, area: "Job", name: (JOBS[j.job_name] || {}).name || j.job_name, msg: jobProblem(j), href: "#job-" + j.job_name, key: "jobs", job: j.job_name });
+      items.push({ sev, area: "Job", name: (JOBS[j.job_name] || {}).name || j.job_name, msg: jobProblem(j), href: "#job-" + j.job_name, key: "jobs", job: j.job_name, jobObj: j, ik: "job:" + j.job_name });
     }
   }
   for (const [k, t] of Object.entries(d.tasks || {})) {
     const sev = taskSev(t);
     if (sev === "crit" || sev === "warn") {
       const total = t.success + t.error;
-      items.push({ sev, area: "Task", name: (TASKS[k] || {}).name || k, msg: `${t.error} of ${total} runs failed in 24h${t.last_error ? " — last: " + t.last_error : ""}`, href: "#tasks", key: "tasks" });
+      items.push({ sev, area: "Task", name: (TASKS[k] || {}).name || k, msg: `${t.error} of ${total} runs failed in 24h${t.last_error ? " — last: " + t.last_error : ""}`, href: "#tasks", key: "tasks", ik: "task:" + k });
     }
   }
   const e = d.email || {};
-  if (e.error) items.push({ sev: "warn", area: "Email", name: "Email stats", msg: e.error, href: "#delivery", key: "delivery" });
-  if (e.failed_waiting > 0) items.push({ sev: "crit", area: "Email", name: "Failed email sends", msg: `${e.failed_waiting} email(s) failed to send and are still waiting${e.last_error ? " — " + e.last_error : ""}`, href: "#delivery", key: "delivery" });
-  if (e.sent_unverified > 0) items.push({ sev: "warn", area: "Email", name: "Unconfirmed emails", msg: `${e.sent_unverified} sent email(s) could not be found in the Sent folder`, href: "#delivery", key: "delivery" });
-  if (e.sending > 0) items.push({ sev: "warn", area: "Email", name: "Emails mid-send", msg: `${e.sending} email(s) stuck in 'sending'`, href: "#delivery", key: "delivery" });
+  if (e.error) items.push({ sev: "warn", area: "Email", name: "Email stats", msg: e.error, href: "#delivery", key: "delivery", ik: "email:stats" });
+  if (e.failed_waiting > 0) items.push({ sev: "crit", area: "Email", name: "Failed email sends", msg: `${e.failed_waiting} email(s) failed to send and are still waiting${e.last_error ? " — " + e.last_error : ""}`, href: "#delivery", key: "delivery", ik: "email:failed" });
+  if (e.sent_unverified > 0) items.push({ sev: "warn", area: "Email", name: "Unconfirmed emails", msg: `${e.sent_unverified} sent email(s) could not be found in the Sent folder`, href: "#delivery", key: "delivery", ik: "email:unverified" });
+  if (e.sending > 0) items.push({ sev: "warn", area: "Email", name: "Emails mid-send", msg: `${e.sending} email(s) stuck in 'sending'`, href: "#delivery", key: "delivery", ik: "email:sending" });
   const f = (d.fcm || {}).last_24h || {};
-  if ((f.error || 0) > 0) items.push({ sev: "warn", area: "Push", name: "Push errors", msg: `${f.error} push(es) rejected by Firebase in 24h`, href: "#delivery", key: "delivery" });
+  if ((f.error || 0) > 0) items.push({ sev: "warn", area: "Push", name: "Push errors", msg: `${f.error} push(es) rejected by Firebase in 24h`, href: "#delivery", key: "delivery", ik: "push:errors" });
   for (const [k, v] of Object.entries(d.ei_realtime || {})) {
-    if (v.error > 0) items.push({ sev: "warn", area: "EI", name: k, msg: `${v.error} error(s) in 24h`, href: "#pipelines", key: "pipelines" });
+    if (v.error > 0) items.push({ sev: "warn", area: "EI", name: k, msg: `${v.error} error(s) in 24h`, href: "#pipelines", key: "pipelines", ik: "ei:" + k });
   }
   const sys = d.system || {};
   if (sys.disk && !sys.disk.error) {
     const s = usageSev(sys.disk.percent_used, 80, 92);
-    if (s !== "ok") items.push({ sev: s, area: "Compute", name: "Disk", msg: `${pct(sys.disk.percent_used)} used — ${sys.disk.free_gb} GB free`, href: "#infra", key: "infra" });
+    if (s !== "ok") items.push({ sev: s, area: "Compute", name: "Disk", msg: `${pct(sys.disk.percent_used)} used — ${sys.disk.free_gb} GB free`, href: "#infra", key: "infra", ik: "compute:disk" });
   }
   if (sys.memory && !sys.memory.error) {
     const s = usageSev(sys.memory.percent_used, 85, 95);
-    if (s !== "ok") items.push({ sev: s, area: "Compute", name: "Memory", msg: `${pct(sys.memory.percent_used)} used`, href: "#infra", key: "infra" });
+    if (s !== "ok") items.push({ sev: s, area: "Compute", name: "Memory", msg: `${pct(sys.memory.percent_used)} used`, href: "#infra", key: "infra", ik: "compute:memory" });
   }
   if (sys.cpu && !sys.cpu.error && sys.cpu.load_5m > sys.cpu.core_count) {
-    items.push({ sev: "warn", area: "Compute", name: "CPU load", msg: `5-min load ${sys.cpu.load_5m} on ${sys.cpu.core_count} cores`, href: "#infra", key: "infra" });
+    items.push({ sev: "warn", area: "Compute", name: "CPU load", msg: `5-min load ${sys.cpu.load_5m} on ${sys.cpu.core_count} cores`, href: "#infra", key: "infra", ik: "compute:cpu" });
   }
-  items.sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev]);
+  // Acknowledged/snoozed items keep their place in the list but drop below
+  // the live ones and out of the counts.
+  for (const i of items) i.silenced = !!ackOf(i.ik);
+  items.sort((a, b) => (a.silenced - b.silenced) || SEV_ORDER[a.sev] - SEV_ORDER[b.sev]);
   return items;
 }
 
 /* ---------- renderers ---------- */
-function renderOverview(d, items) {
+function renderOverview(d, allItems) {
+  const items = allItems.filter(i => !i.silenced);
+  const silencedCount = allItems.length - items.length;
   const crit = items.filter(i => i.sev === "crit").length;
   const warn = items.filter(i => i.sev === "warn").length;
   const jobs = d.jobs || [];
@@ -630,6 +805,7 @@ function renderOverview(d, items) {
     : warn ? `${warn} warning${warn > 1 ? "s" : ""} to review` : "All systems operational";
   const offCount = jobs.filter(j => jobSev(j) === "none").length;
   const sub = `${healthyJobs} of ${jobs.length - paused - offCount} jobs and workers healthy` + (paused ? ` · ${paused} paused` : "") + (offCount ? ` · ${offCount} off` : "") +
+    (silencedCount ? ` · ${silencedCount} acknowledged` : "") +
     ` · EI ${d.flags && d.flags.emotional_intelligence_enabled ? "on" : "off"} · Nudges ${d.flags && d.flags.nudge_feature_enabled ? "on" : "off"}`;
   document.getElementById("verdict").className = "verdict " + sev;
   document.getElementById("verdict").innerHTML = `
@@ -640,12 +816,22 @@ function renderOverview(d, items) {
       <div class="vc warn"><b>${warn}</b><span>warnings</span></div>
       <div class="vc ok"><b>${healthyJobs}</b><span>healthy jobs</span></div>
     </div>`;
-  document.getElementById("attention").innerHTML = items.map(i => `
-    <div class="att-item">
+  document.getElementById("attention").innerHTML = allItems.map(i => {
+    const rb = runbookHtml(i.ik, i.jobObj, false);
+    const inc = i.job && (d.incidents || {})[i.job];
+    return `
+    <div class="att-item ${i.silenced ? "silenced" : ""}">
       ${statusBadge(i.sev, "")}
-      <div><div class="att-name">${esc(i.name)}<span class="att-area">${esc(i.area)}</span></div><div class="att-msg">${esc(i.msg)}</div></div>
+      <div>
+        <div class="att-name">${esc(i.name)}<span class="att-area">${esc(i.area)}</span></div>
+        <div class="att-msg">${esc(i.msg)}</div>
+        ${inc ? `<div class="note">Alert open since ${timeEl(inc.opened_at, ago(inc.opened_at))}${inc.last_notified_at ? " · last notified " + timeEl(inc.last_notified_at, ago(inc.last_notified_at)) : " · not notified"}</div>` : ""}
+        ${rb ? `<details class="att-rb" data-rb="${esc(i.ik)}" ${state.openRb.has(i.ik) ? "open" : ""}><summary><span class="chev" aria-hidden="true">›</span>How to fix</summary>${rb}</details>` : ""}
+        <div class="att-tools">${ackTools(i.ik)}</div>
+      </div>
       <a class="att-go" href="${esc(i.href)}" ${i.job ? `data-open-job="${esc(i.job)}"` : ""}>View →</a>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 
   // Headline numbers
   const tasks = Object.values(d.tasks || {});
@@ -685,7 +871,7 @@ function renderOverview(d, items) {
 }
 
 function jobActions(j) {
-  if (j.control_kind === "none") return `<div class="note">Health check — read-only. Fix the cause, the card turns green on the next check (≤ 30 s).</div>`;
+  if (j.control_kind === "none") return `<div class="note">Health check — nothing to pause or restart here. Once the cause is fixed it turns green on the next check (≤ 30 s), or press Check again now.</div>`;
   const out = [];
   out.push(j.on_ice
     ? `<button class="btn small" data-act="unice" data-job="${esc(j.job_name)}">Resume</button>`
@@ -715,17 +901,30 @@ function jobDetail(j, sev) {
   const kv = pairs.length ? `<dl class="kv">${pairs.map(([k, v]) => `<dt>${esc(humanKey(k))}</dt><dd>${esc(String(v))}</dd>`).join("")}</dl>` : `<div class="note">No details reported by the last run.</div>`;
   const info = JOBS[j.job_name];
   const log = jobLog(j);
+  const key = "job:" + j.job_name;
+  const bad = sev === "crit" || sev === "warn";
+  const inc = ((state.data && state.data.incidents) || {})[j.job_name];
+  const hist = (j.history || []).slice().reverse();
+  const histHtml = hist.length
+    ? `<span class="hist" role="img" aria-label="Last ${hist.length} runs: ${esc(hist.map(h => h.status).join(", "))}">${hist.map(h => `<i class="${h.status === "success" ? "ok" : h.status === "partial" ? "warn" : "crit"}" title="${esc(h.status + " · " + abs(h.started_at))}"></i>`).join("")}</span>`
+    : `<span class="muted">none</span>`;
+  // A healthy probe still gets "check again"; the full runbook only when something's wrong.
+  const fixes = bad ? runbookHtml(key, j, true) : (fixIds(key, j).length ? `<div class="actions">${fixButtons(fixIds(key, j))}</div>` : "");
   return `<div class="detail">
       <div>
         ${problem ? `<div class="problem ${sev === "warn" ? "warn" : ""}">${esc(problem)}</div>` : ""}
+        ${inc ? `<div class="incline">Alert open since ${timeEl(inc.opened_at, ago(inc.opened_at))}${inc.last_notified_at ? " · last notified " + timeEl(inc.last_notified_at, ago(inc.last_notified_at)) : " · not notified"}</div>` : ""}
         ${info ? `<div class="note" style="margin-bottom:8px;">${esc(info.about)}</div>` : ""}
-        <div class="note" style="margin-bottom:6px;">Last run ${j.started_at ? esc(abs(j.started_at)) : "never"}${j.status ? " · reported " + esc(j.status) : ""}</div>
+        <div class="note" style="margin-bottom:6px;">Last run ${j.started_at ? esc(abs(j.started_at)) : "never"}${j.status ? " · reported " + esc(j.status) : ""} · last 5: ${histHtml}</div>
         ${kv}
+        ${bad ? fixes : ""}
       </div>
       <div class="detail-side">
+        ${bad ? `<div class="att-tools" style="margin-top:0;">${ackTools(key)}</div>` : ""}
         <div><div class="note" style="margin-bottom:4px;">Logs</div>
           <div class="logbox"><code>${esc(log)}</code><button class="btn small" data-copy="${esc(log)}" aria-label="Copy log command">Copy</button></div></div>
         ${jobActions(j)}
+        ${bad ? "" : fixes}
       </div>
     </div>`;
 }
@@ -756,18 +955,15 @@ function renderJobs(jobs) {
     html += `<tr class="group-row"><td colspan="7">${esc(g)} · ${rows.length}</td></tr>`;
     for (const { j, sev, info } of rows) {
       const open = state.expanded.has(j.job_name);
-      const hist = (j.history || []).slice().reverse();
-      const histHtml = hist.length
-        ? `<span class="hist" role="img" aria-label="Last ${hist.length} runs: ${esc(hist.map(h => h.status).join(", "))}">${hist.map(h => `<i class="${h.status === "success" ? "ok" : h.status === "partial" ? "warn" : "crit"}" title="${esc(h.status + " · " + abs(h.started_at))}"></i>`).join("")}</span>`
-        : `<span class="muted">—</span>`;
+      const silenced = (sev === "crit" || sev === "warn") && ackOf("job:" + j.job_name);
       html += `<tr class="job-row ${open ? "open" : ""}" id="job-${esc(j.job_name)}" data-job-row="${esc(j.job_name)}" tabindex="0" role="button" aria-expanded="${open}">
-        <td data-label="Status">${statusBadge(sev, jobWord(j, sev))}</td>
+        <td data-label="Status">${statusBadge(sev, jobWord(j, sev))}${silenced ? `<div class="ackline" title="${esc(ackLine(silenced))}">${silenced.kind === "snooze" ? "snoozed" : "acknowledged"}</div>` : ""}</td>
         <td class="lead"><span class="chev" aria-hidden="true">›</span> <span class="job-name">${esc(info.name || j.job_name)}</span>${j.running ? `<span class="badge running">RUNNING</span>` : ""}${j.is_custom ? `<span class="badge custom">custom</span>` : ""}<div class="job-id" style="margin-left:18px;">${esc(j.job_name)}</div></td>
         <td data-label="Schedule">${esc(j.cadence_label || "—")}</td>
         <td data-label="Last run">${timeEl(j.finished_at || j.started_at, j.started_at ? ago(j.finished_at || j.started_at) : "never")}</td>
         <td data-label="Took" class="r phone-hide">${j.duration_seconds ? esc(dur(j.duration_seconds)) : `<span class="muted">—</span>`}</td>
         <td data-label="Next run">${sev === "none" ? `<span class="muted">off</span>` : j.on_ice ? `<span class="muted">paused</span>` : timeEl(j.next_run_at, until(j.next_run_at))}</td>
-        <td data-label="Last 5" class="phone-hide">${histHtml}</td>
+        <td data-label="Last 24 h" class="phone-hide">${jobSpark(j.job_name)}</td>
       </tr>`;
       if (open) html += `<tr class="detail-row"><td colspan="7">${jobDetail(j, sev)}</td></tr>`;
     }
@@ -779,7 +975,7 @@ function renderTasks(tasks, buf) {
   const body = document.getElementById("tasks-body");
   const rows = Object.entries(tasks || {}).map(([k, t]) => ({ k, t, sev: taskSev(t) }));
   rows.sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev] || ((b.t.error / Math.max(1, b.t.success + b.t.error)) - (a.t.error / Math.max(1, a.t.success + a.t.error))));
-  if (!rows.length) body.innerHTML = `<tr><td colspan="8" class="empty">No background task runs in the last 24 hours.</td></tr>`;
+  if (!rows.length) body.innerHTML = `<tr><td colspan="9" class="empty">No background task runs in the last 24 hours.</td></tr>`;
   else body.innerHTML = rows.map(({ k, t, sev }) => {
     const total = t.success + t.error, rate = total ? (t.error / total) * 100 : 0;
     const info = TASKS[k] || {};
@@ -788,6 +984,7 @@ function renderTasks(tasks, buf) {
       <td class="lead"><span class="job-name">${esc(info.name || k)}</span><div class="job-id">${esc(k)}</div>${info.about ? `<div class="note">${esc(info.about)}</div>` : ""}</td>
       <td data-label="Runs" class="r">${total}</td>
       <td data-label="Failure rate"><div class="rate"><span class="num">${pct(rate)}</span>${meter(rate, sev === "ok" ? "ok" : sev)}</div><div class="note">${t.error} failed</div></td>
+      <td data-label="Last 24 h">${taskSpark(k)}</td>
       <td data-label="Median" class="r">${esc(ms(t.p50_ms))}</td>
       <td data-label="p95" class="r">${esc(ms(t.p95_ms))}</td>
       <td data-label="Last run">${timeEl(t.last_at, ago(t.last_at))}</td>
@@ -862,7 +1059,46 @@ function renderAll() {
   renderDelivery(d.email, d.fcm);
   renderPipelines(d.ei_realtime, d.weekly_digest);
   renderInfra(d.db, d.system);
-  document.title = (items.some(i => i.sev === "crit") ? "✕ " : items.length ? "! " : "") + "Throughline Ops";
+  renderEvents();
+  const live = items.filter(i => !i.silenced);
+  document.title = (live.some(i => i.sev === "crit") ? "✕ " : live.length ? "! " : "") + "Throughline Ops";
+}
+
+/* ---------- activity log ---------- */
+const EV_GROUP = { status: "problems", alert: "problems", recovered: "problems", action: "actions", ack: "actions", deploy: "deploys", restart: "deploys" };
+function eventLook(ev) {
+  const det = ev.detail || {};
+  if (ev.kind === "alert") return ["crit", "!", "Alert"];
+  if (ev.kind === "recovered") return ["ok", "✓", "Recovered"];
+  if (ev.kind === "status") return det.to === "success" || det.to === "ok" ? ["ok", "✓", "Status"] : det.to === "partial" ? ["warn", "!", "Status"] : ["crit", "✕", "Status"];
+  if (ev.kind === "action") return det.ok === false ? ["crit", "✕", "Action"] : ["info", "▸", "Action"];
+  if (ev.kind === "ack") return ["none", "❚❚", "Acknowledge"];
+  if (ev.kind === "deploy") return ["info", "⇡", "Deploy"];
+  if (ev.kind === "restart") return ["none", "↻", "Restart"];
+  return ["none", "•", ev.kind];
+}
+function eventSubject(s) {
+  if (!s) return "";
+  const k = s.replace(/^job:/, "");
+  return (JOBS[k] || TASKS[k] || {}).name || s;
+}
+function renderEvents() {
+  const d = state.data || {};
+  const list = state.moreEvents || d.events || [];
+  const shown = list.filter(ev => state.evFilter === "all" || EV_GROUP[ev.kind] === state.evFilter);
+  const el = document.getElementById("events");
+  el.innerHTML = shown.length ? shown.map(ev => {
+    const [cls, ico, word] = eventLook(ev);
+    return `<div class="ev">
+      ${timeEl(ev.created_at, ago(ev.created_at))}
+      <span class="ev-ico ${cls}" aria-hidden="true">${ico}</span>
+      <div class="ev-body"><span class="sr-only">${esc(word)}: </span><span class="ev-subj">${esc(eventSubject(ev.subject))}</span> <span class="ev-msg">${esc(ev.message || "")}</span></div>
+      <span class="ev-actor">${ev.actor ? "by " + esc(ev.actor) : ""}</span>
+    </div>`;
+  }).join("") : `<div class="empty">${list.length ? "Nothing of this kind in this period." : "No activity recorded yet."}</div>`;
+  document.getElementById("activity-sub").textContent = state.moreEvents ? "Last 7 days" : "Last 48 hours · status changes, alerts, actions and deploys";
+  const ch = d.alert_channels || {};
+  document.getElementById("channels").innerHTML = `Alerts go to: email <b class="${ch.email ? "on" : "off"}">${ch.email ? "on" : "off"}</b> · push <b class="${ch.push ? "on" : "off"}">${ch.push ? "on" : "off"}</b>`;
 }
 
 /* ---------- freshness + refresh ---------- */
@@ -907,22 +1143,61 @@ function schedule() {
 async function jobAction(job, act, confirmMsg) {
   if (confirmMsg && !confirm(confirmMsg)) return;
   try {
-    const res = await fetch(`/admin/api/jobs/${encodeURIComponent(job)}/${act}`, { method: "POST", credentials: "same-origin" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) alert(`Couldn't ${act} ${job}: ${data.error || "HTTP " + res.status}`);
-    else toast(`${job}: ${act} done`);
-  } catch (e) { alert(`Couldn't ${act} ${job}: ${e}`); }
+    await apiSend(`/admin/api/jobs/${encodeURIComponent(job)}/${act}`, "POST");
+    toast(`${job}: ${act} done`);
+  } catch (e) { alert(`Couldn't ${act} ${job}: ${e.message || e}`); }
   refresh();
 }
 async function deleteCustomJob(job) {
   if (!confirm(`Delete custom job "${job}"? Its schedule and run history are removed; log files on disk are kept.`)) return;
   try {
-    const res = await fetch(`/admin/api/custom-jobs/${encodeURIComponent(job)}`, { method: "DELETE", credentials: "same-origin" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) alert(`Delete failed: ${data.error || "HTTP " + res.status}`);
-    else { state.expanded.delete(job); toast(`Deleted ${job}`); }
-  } catch (e) { alert(`Delete failed: ${e}`); }
+    await apiSend(`/admin/api/custom-jobs/${encodeURIComponent(job)}`, "DELETE");
+    state.expanded.delete(job); toast(`Deleted ${job}`);
+  } catch (e) { alert(`Delete failed: ${e.message || e}`); }
   refresh();
+}
+async function runFix(btn, id, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Working…";
+  try {
+    const data = await apiSend(`/admin/api/fix/${encodeURIComponent(id)}`, "POST");
+    alert(`${label}: ${data.message}`);
+  } catch (e) { alert(`${label} failed: ${e.message || e}`); }
+  btn.disabled = false; btn.textContent = label;
+  state.moreEvents = null;
+  refresh();
+}
+async function ackAction(kind, key, hours) {
+  try {
+    if (kind === "ack") {
+      const note = prompt("Acknowledge — optional note (what you're doing about it):", "");
+      if (note === null) return;
+      await apiSend("/admin/api/ack", "POST", { key, note });
+      toast("Acknowledged — reminders stop until it recovers");
+    } else if (kind === "snooze") {
+      await apiSend("/admin/api/snooze", "POST", { key, hours: Number(hours) });
+      toast(`Snoozed for ${hours}h`);
+    } else {
+      await apiSend("/admin/api/unack", "POST", { key });
+      toast("Unmuted");
+    }
+  } catch (e) { alert(`Couldn't update: ${e.message || e}`); }
+  state.moreEvents = null;
+  refresh();
+}
+async function loadMoreEvents() {
+  const btn = document.getElementById("events-more");
+  if (state.moreEvents) { state.moreEvents = null; btn.textContent = "Show last 7 days"; renderEvents(); return; }
+  btn.disabled = true;
+  try {
+    const res = await fetch("/admin/api/events?limit=500&hours=168", { credentials: "same-origin" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    state.moreEvents = (await res.json()).events || [];
+    btn.textContent = "Show last 48 hours";
+    renderEvents();
+  } catch (e) { alert("Couldn't load activity: " + (e.message || e)); }
+  finally { btn.disabled = false; }
 }
 function toggleJob(name) {
   if (state.expanded.has(name)) state.expanded.delete(name); else state.expanded.add(name);
@@ -932,9 +1207,18 @@ function toggleJob(name) {
 }
 
 document.addEventListener("click", (ev) => {
-  const t = ev.target.closest("[data-act],[data-delete],[data-copy],[data-job-row],[data-open-job],[data-filter]");
+  const t = ev.target.closest("[data-act],[data-delete],[data-copy],[data-job-row],[data-open-job],[data-filter],[data-fix],[data-ack],[data-snooze],[data-unack],[data-evfilter]");
   if (!t) return;
-  if (t.dataset.act) { ev.stopPropagation(); jobAction(t.dataset.job, t.dataset.act, t.dataset.confirm); }
+  if (t.dataset.fix) { ev.stopPropagation(); runFix(t, t.dataset.fix, t.dataset.confirm); }
+  else if (t.dataset.ack) { ev.stopPropagation(); ackAction("ack", t.dataset.ack); }
+  else if (t.dataset.snooze) { ev.stopPropagation(); ackAction("snooze", t.dataset.snooze, t.dataset.hours); }
+  else if (t.dataset.unack) { ev.stopPropagation(); ackAction("unack", t.dataset.unack); }
+  else if (t.dataset.evfilter) {
+    state.evFilter = t.dataset.evfilter;
+    document.querySelectorAll("[data-evfilter]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.evfilter === state.evFilter)));
+    renderEvents();
+  }
+  else if (t.dataset.act) { ev.stopPropagation(); jobAction(t.dataset.job, t.dataset.act, t.dataset.confirm); }
   else if (t.dataset.delete) { ev.stopPropagation(); deleteCustomJob(t.dataset.delete); }
   else if (t.dataset.copy !== undefined) { ev.stopPropagation(); copy(t.dataset.copy); }
   else if (t.dataset.openJob) {
@@ -954,6 +1238,13 @@ document.addEventListener("keydown", (ev) => {
 function syncFilterButtons() {
   document.querySelectorAll("[data-filter]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter)));
 }
+// "How to fix" panels stay open across the 30 s refresh.
+document.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (!d.dataset || !d.dataset.rb) return;
+  if (d.open) state.openRb.add(d.dataset.rb); else state.openRb.delete(d.dataset.rb);
+}, true);
+document.getElementById("events-more").addEventListener("click", loadMoreEvents);
 document.getElementById("job-search").addEventListener("input", (e) => { state.search = e.target.value; renderJobs(state.data && state.data.jobs); });
 document.getElementById("refresh-btn").addEventListener("click", refresh);
 document.getElementById("pause-btn").addEventListener("click", (e) => {
@@ -1007,14 +1298,11 @@ document.getElementById("cj-submit").addEventListener("click", async () => {
   }
   btn.disabled = true; set("Creating…");
   try {
-    const res = await fetch("/admin/api/custom-jobs", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.ok) {
-      set(`Created "${job_name}". It fires within 30 seconds of its scheduled time.`, "ok");
-      ["cj-name", "cj-script", "cj-hours", "cj-interval", "cj-logdir"].forEach(id => document.getElementById(id).value = "");
-      refresh();
-    } else set(data.error || `Couldn't create the job (HTTP ${res.status}).`, "error");
-  } catch (e) { set("Couldn't create the job: " + e, "error"); }
+    await apiSend("/admin/api/custom-jobs", "POST", body);
+    set(`Created "${job_name}". It fires within 30 seconds of its scheduled time.`, "ok");
+    ["cj-name", "cj-script", "cj-hours", "cj-interval", "cj-logdir"].forEach(id => document.getElementById(id).value = "");
+    refresh();
+  } catch (e) { set("Couldn't create the job: " + (e.message || e), "error"); }
   finally { btn.disabled = false; }
 });
 
