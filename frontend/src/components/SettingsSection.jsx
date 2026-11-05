@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import Avatar from './Avatar.jsx';
 import PhotoViewer from './PhotoViewer.jsx';
 import MailSettingsCard from './MailSettingsCard.jsx';
+import DeleteAccountCard, { LegalLinks } from './DeleteAccountCard.jsx';
 import { TrashIcon, SunIcon, MoonIcon, CameraIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
 import { confirmDialog, showToast } from '../lib/notify.js';
@@ -210,6 +211,8 @@ export default function SettingsSection({ user, onLogout, onUpdateUser, online, 
       <MailSettingsCard provider="outlook" variant="classic" />
       <MailSettingsCard provider="gmail" variant="classic" />
       <button className="btn secondary" onClick={onLogout}>Log out</button>
+      <LegalLinks />
+      <DeleteAccountCard onDeleted={onLogout} />
       {/* Required attribution -- the checkbox/loading animations (Tasks empty
           state, Friends loading spinners) are CC-BY via react-useanimations. */}
       <p className="hint" style={{ textAlign: 'center', marginTop: 16 }}>

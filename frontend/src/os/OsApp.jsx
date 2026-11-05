@@ -9,6 +9,7 @@ import Avatar from '../components/Avatar.jsx';
 import PhotoViewer from '../components/PhotoViewer.jsx';
 import MailSettingsCard from '../components/MailSettingsCard.jsx';
 import AssistantChat from '../components/assistant/AssistantChat.jsx';
+import DeleteAccountCard, { LegalLinks } from '../components/DeleteAccountCard.jsx';
 import EmailSourceLink from '../components/EmailSourceLink.jsx';
 import {
   CameraIcon, SunIcon, MoonIcon, TrashIcon, HomeIcon, ChatIcon, FriendIcon, MeetIcon, TaskIcon, PhoneIcon,
@@ -1398,6 +1399,8 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme, personaP
               <MailSettingsCard provider="gmail" variant="os" style={{ marginTop: 20 }} />
 
               <button className="secondary-button" style={{ marginTop: 20 }} onClick={auth.logout}>Log out</button>
+              <LegalLinks />
+              <DeleteAccountCard onDeleted={auth.logout} />
             </section>
           </div>
         </main>

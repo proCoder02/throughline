@@ -35,7 +35,7 @@ export default function ChatThread({
         <div className="chat-header-info">
           <div className="chat-header-name">{title}</div>
           <div className="chat-header-sub">
-            {isLive ? <span className="live-badge"><span className="dot" />{liveStatus || 'Listening'}</span> : (subtitle || 'Ask about this conversation')}
+            {isLive ? <span className="live-badge" title="Recording -- make sure everyone here knows"><span className="dot" />{liveStatus || 'Listening'} · make sure everyone here knows</span> : (subtitle || 'Ask about this conversation')}
           </div>
         </div>
         <div className="chat-header-actions">

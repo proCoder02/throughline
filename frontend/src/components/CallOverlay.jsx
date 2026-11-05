@@ -27,7 +27,7 @@ export default function CallOverlay({ incomingCall, activeCall, onAccept, onDecl
           {activeCall.droppedNotices?.map((n) => (
             <div key={n.id} className="call-drop-notice">{n.name} dropped from the call</div>
           ))}
-          <div className="call-recording-notice">This call is being recorded</div>
+          <div className="call-recording-notice">This call is recorded and transcribed</div>
           {activeCall.audioBlocked && (
             <button className="btn call-audio-blocked" onClick={onEnableAudio}>
               Tap to enable audio
@@ -51,7 +51,7 @@ export default function CallOverlay({ incomingCall, activeCall, onAccept, onDecl
           <span className="avatar lg">{(incomingCall.callerName || '?')[0].toUpperCase()}</span>
           <div className="call-title">{incomingCall.callerName}</div>
           <div className="call-sub">Incoming call...</div>
-          <div className="call-recording-notice">This call is being recorded</div>
+          <div className="call-recording-notice">This call is recorded and transcribed</div>
           <div className="call-actions">
             <button className="btn danger" onClick={onDecline}>Decline</button>
             <button className="btn" onClick={onAccept}>

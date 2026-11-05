@@ -56,10 +56,10 @@ export function useAuth() {
     return data;
   }, [setUser]);
 
-  const register = useCallback(async (username, email, password, personalization) => {
+  const register = useCallback(async (username, email, password, personalization, acceptedTerms = false) => {
     const data = await apiJson('/register', {
       method: 'POST',
-      body: JSON.stringify({ username, email, password, personalization }),
+      body: JSON.stringify({ username, email, password, personalization, accepted_terms: acceptedTerms === true }),
     });
     setToken(data.token);
     setUser(data);

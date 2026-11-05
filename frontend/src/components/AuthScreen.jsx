@@ -32,6 +32,7 @@ export default function AuthScreen({ auth }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [identifier, setIdentifier] = useState('');
+  const [agreed, setAgreed] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
@@ -55,12 +56,13 @@ export default function AuthScreen({ auth }) {
       if (!username.trim() || !password) return setError('Enter your username and password.');
       if (mode === 'register' && !email.trim()) return setError('Enter your email -- reminders and password resets go there.');
       if (mode === 'register' && password.length < 6) return setError('Use at least 6 characters for your password.');
+      if (mode === 'register' && !agreed) return setError('Please agree to the Terms of Service and Privacy Policy.');
     }
     if (mode === 'forgot' && !identifier.trim()) return setError('Enter your username or email.');
     if (mode === 'reset' && password.length < 6) return setError('Use at least 6 characters for your new password.');
     setBusy(true);
     try {
-      if (mode === 'register') await auth.register(username.trim(), email.trim(), password, 'personal');
+      if (mode === 'register') await auth.register(username.trim(), email.trim(), password, 'personal', agreed);
       else if (mode === 'login') await auth.login(username.trim(), password);
       else if (mode === 'forgot') {
         const d = await post('/password/forgot', { identifier: identifier.trim() });
@@ -120,6 +122,15 @@ export default function AuthScreen({ auth }) {
             />
           )}
           {mode === 'register' && <div className="auth-field-hint">At least 6 characters.</div>}
+          {mode === 'register' && (
+            <label className="consent-check" htmlFor="auth-agree">
+              <input id="auth-agree" type="checkbox" checked={agreed} onChange={(e) => setAgreed(e.target.checked)} />
+              <span>
+                I agree to the <a href="/terms" target="_blank" rel="noopener">Terms of Service</a> and{' '}
+                <a href="/privacy" target="_blank" rel="noopener">Privacy Policy</a>, and I'll tell people before I record them.
+              </span>
+            </label>
+          )}
           {mode === 'login' && (
             <div className="auth-row">
               <button type="button" className="link-button" onClick={() => switchTo('forgot')}>Forgot password?</button>
@@ -160,6 +171,10 @@ export default function AuthScreen({ auth }) {
           {(mode === 'forgot' || mode === 'reset') && (
             <button type="button" className="link-button" onClick={() => { if (mode === 'reset') dropResetToken(); switchTo('login'); }}>Back to log in</button>
           )}
+        </div>
+        <div className="legal-links" style={{ justifyContent: 'center' }}>
+          <a href="/privacy" target="_blank" rel="noopener">Privacy</a>
+          <a href="/terms" target="_blank" rel="noopener">Terms</a>
         </div>
       </div>
     </main>

@@ -1,0 +1,76 @@
+{% extends "legal/base.html" %}
+{% from "legal/_macros.html" import val %}
+{% set active = 'terms' %}
+{% block title %}Terms of Service{% endblock %}
+{% block content %}
+<h1>Terms of Service</h1>
+<div class="meta">Effective {{ info.effective_date }}</div>
+
+<p>These terms are an agreement between you and {{ val(info.entity, "Company legal name") }} ("we", "us") for
+using Throughline on the web and in our apps. By creating an account or using Throughline you agree to them and to
+our <a href="/privacy">Privacy Policy</a>. If you don't agree, please don't use Throughline.</p>
+
+<h2>1. Who can use Throughline</h2>
+<p>You must be at least 18 years old, or the age of majority where you live, and able to make a binding agreement.
+You're responsible for keeping your password safe and for everything done with your account.</p>
+
+<h2>2. Recording other people</h2>
+<p>Throughline records only when you start a recording or a call, but <strong>you</strong> decide whom you record.
+You agree to:</p>
+<ul>
+  <li>tell people before you record them, and get their consent wherever the law requires it;</li>
+  <li>not record anyone secretly, or where they reasonably expect privacy and haven't agreed;</li>
+  <li>follow all laws on recording, privacy and data protection that apply to you and to them.</li>
+</ul>
+<p>You are responsible for the recordings you make and for what you do with them.</p>
+
+<h2>3. Acceptable use</h2>
+<p>Don't use Throughline to:</p>
+<ul>
+  <li>break the law, or harass, threaten, stalk or harm anyone;</li>
+  <li>collect information about people without a lawful reason;</li>
+  <li>send spam or misleading emails or messages through the assistant;</li>
+  <li>try to access other people's accounts or data, disrupt the service, or get around its limits or security;</li>
+  <li>copy, resell or reverse-engineer the service, except where the law allows it.</li>
+</ul>
+
+<h2>4. AI output</h2>
+<p>Throughline uses AI to transcribe, summarise and answer. AI can be wrong: transcripts can mishear, summaries can
+miss things, and answers can be inaccurate. Check anything important before you rely on it, and don't use
+Throughline as a substitute for professional medical, legal, financial or emergency advice.</p>
+
+<h2>5. Actions taken for you</h2>
+<p>Some features act for you &mdash; sending an email, a message or a reminder, or placing a food order. Throughline
+shows you what it will do and only acts after you confirm. You're responsible for what you approve.</p>
+
+<h2>6. Your content</h2>
+<p>You own what you record, write and upload. You give us permission to store and process it only to provide
+Throughline to you, as described in the Privacy Policy. You confirm you have the right to give us that content.</p>
+
+<h2>7. Connected services</h2>
+<p>If you connect Gmail, Outlook, Swiggy or another service, your use of it is also governed by that service's own
+terms. We're not responsible for those services, and you can disconnect them at any time.</p>
+
+<h2>8. Changes and availability</h2>
+<p>We may change, add or remove features. We'll try to keep Throughline available, but we can't promise it will
+always be uninterrupted or error-free. If we change these terms in a way that matters, we'll tell you in the app
+and ask you to agree again.</p>
+
+<h2>9. Ending your account</h2>
+<p>You can delete your account at any time in Settings or at <a href="/account/delete">/account/delete</a>. We may
+suspend or close an account that breaks these terms or puts others at risk, and will tell you why unless the law
+or safety prevents it.</p>
+
+<h2>10. Disclaimers and liability</h2>
+<p>Throughline is provided "as is". To the extent the law allows, we disclaim all warranties not stated in these
+terms, and we are not liable for indirect or consequential losses, or for losses caused by AI output you relied
+on, by recordings you made, or by connected services. Nothing in these terms limits liability that can't be
+limited by law.</p>
+
+<h2>11. Governing law</h2>
+<p>These terms are governed by the laws of {{ val(info.jurisdiction, "Governing law / jurisdiction") }}.</p>
+
+<h2>12. Contact</h2>
+<p>{{ val(info.entity, "Company legal name") }}, {{ val(info.address, "Registered address") }}<br>
+Email: {% if info.contact_email %}<a href="mailto:{{ info.contact_email }}">{{ info.contact_email }}</a>{% else %}{{ val('', "Contact email") }}{% endif %}</p>
+{% endblock %}

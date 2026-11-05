@@ -982,6 +982,26 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
 @media (prefers-reduced-motion: reduce) { .app-loading-bar, .app-loading-block { animation: none; } }
 @media (max-width: 859px) { .app-loading-rail { display: none; } .app-loading-main { padding: 72px 16px 16px; } }
 
+/* Consent dialogs (components/ConsentHost.jsx) */
+.consent-card { max-width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow-y: auto; }
+.consent-card .confirm-message p { margin: 0 0 var(--space-2); }
+.consent-card .confirm-message ul { margin: 0 0 var(--space-2); padding-left: 18px; }
+.consent-card .confirm-message li { margin: 4px 0; }
+.consent-card .confirm-message strong { color: var(--wa-text); }
+.consent-icon { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: color-mix(in srgb, var(--wa-accent) 16%, transparent); color: var(--wa-accent-dark); margin-bottom: var(--space-3); }
+.consent-icon svg { width: 20px; height: 20px; }
+.consent-check { display: flex; gap: 10px; align-items: flex-start; margin-top: var(--space-3); font-size: var(--text-sm); font-weight: 600; color: var(--wa-text); cursor: pointer; }
+.consent-check input { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--wa-accent); flex-shrink: 0; }
+.listen-notice { font-size: var(--text-xs); color: var(--wa-text-soft); text-align: center; margin-top: 6px; }
+
+/* Danger zone: delete account */
+.danger-zone { border: 1px solid color-mix(in srgb, var(--wa-danger) 40%, var(--wa-border)); border-radius: var(--radius-md); padding: var(--space-4); margin-top: var(--space-5); }
+.danger-zone h3 { margin: 0 0 4px; font-size: var(--text-md); color: var(--wa-danger); }
+.danger-zone p { margin: 0 0 var(--space-3); font-size: var(--text-sm); color: var(--wa-text-soft); }
+.danger-zone .field { margin-top: 4px; }
+.danger-zone label { display: block; font-size: var(--text-sm); font-weight: 600; margin-top: var(--space-3); color: var(--wa-text); }
+.legal-links { display: flex; gap: var(--space-4); flex-wrap: wrap; font-size: var(--text-sm); margin-top: var(--space-4); }
+
 /* "Personalize Throughline" reminder card on Home */
 .personalize-card { display: flex; align-items: center; gap: var(--space-3); }
 .personalize-card .personalize-text { flex: 1; min-width: 0; }

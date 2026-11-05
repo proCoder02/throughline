@@ -17,6 +17,8 @@ import { startRingtone, stopRingtone, unlockAudio } from './ringtone.js';
 import IconRail from './components/IconRail.jsx';
 import { MenuIcon } from './icons.jsx';
 import { SECTION_TITLES } from './lib/nav.js';
+import { ensureRecordingNotice, resetConsentCache } from './lib/consent.js';
+import ConsentHost from './components/ConsentHost.jsx';
 
 // "Skip for now" on the onboarding questions is remembered per account on
 // this device, so it isn't shown again on every visit -- the Home screens
@@ -77,6 +79,9 @@ export default function App() {
   const [personaCompleted, setPersonaCompleted] = useState(null);
   const [personaOpen, setPersonaOpen] = useState(false);
   const userId = auth.user?.id;
+
+  // Consent answers are per account -- never reuse another user's.
+  useEffect(() => { resetConsentCache(); }, [userId]);
 
   useEffect(() => {
     if (!userId) return;
@@ -170,6 +175,9 @@ export default function App() {
 
   const acceptIncomingCall = async () => {
     const incoming = notify.incomingCall;
+    // Asked before the incoming-call card closes, so cancelling the
+    // recording notice leaves the call ringing (it can still be declined).
+    if (!(await ensureRecordingNotice())) return;
     notify.clearIncomingCall();
     try { await call.joinCall(incoming.callId); } catch (e) { showToast('Could not join call: ' + e.message, 'error'); }
   };
@@ -246,6 +254,7 @@ export default function App() {
         onEnableAudio={call.enableAudio}
       />
       <NotificationHost />
+      <ConsentHost key={userId} onLogout={auth.logout} />
       {personaOpen && (
         <div className="persona-overlay">
           <PersonaOnboarding

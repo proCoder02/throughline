@@ -48,6 +48,8 @@ from ops.alerts import ops_alert_worker
 import chat_followup
 import chat_summary
 import mail_sent_box
+import legal
+import storage as storage_module
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
 from ops.tracking import record_fcm_send, record_heartbeat
@@ -1275,6 +1277,10 @@ def register():
     )
     user_id = cur.fetchone()["id"]
     db.commit()
+    # Ticked "I agree to the Terms and Privacy Policy" on the sign-up form.
+    # Optional so older app versions without the box can still register.
+    if data.get("accepted_terms") is True:
+        legal.record_consent(cur, db, user_id, "terms")
 
     session["user_id"] = user_id
     session["username"] = username
@@ -9177,6 +9183,12 @@ def _public_base_url():
         base = "https://" + base[len("http://"):]
     return base
 
+
+app.register_blueprint(legal.create_legal_blueprint(
+    get_db=get_db, dict_cursor=dict_cursor, login_required=login_required, current_user_id=current_user_id,
+    check_password_hash=check_password_hash, redis_client=redis_client, storage=storage_module,
+    send_plain_email=send_plain_email,
+))
 
 from password_reset import create_password_reset_blueprint
 app.register_blueprint(create_password_reset_blueprint(

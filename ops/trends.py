@@ -11,6 +11,9 @@ _LEVEL = {"success": 0, "skipped": 0, "running": 0, "partial": 1, "error": 2, "f
 
 
 def _slot(ts, start) -> int | None:
+    # Hour buckets come back as naive UTC (see the AT TIME ZONE in the queries).
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
     i = int((ts - start).total_seconds() // 3600)
     return i if 0 <= i < HOURS else None
 
@@ -23,7 +26,7 @@ def _start():
 def job_trends(cur) -> dict:
     start = _start()
     cur.execute(
-        "SELECT job_name, date_trunc('hour', started_at) AS h, array_agg(DISTINCT status) AS statuses "
+        "SELECT job_name, date_trunc('hour', started_at AT TIME ZONE 'UTC') AS h, array_agg(DISTINCT status) AS statuses "
         "FROM ops.job_runs WHERE started_at >= %s GROUP BY 1, 2",
         (start,),
     )
@@ -40,7 +43,7 @@ def job_trends(cur) -> dict:
 def task_trends(cur) -> dict:
     start = _start()
     cur.execute(
-        "SELECT task, date_trunc('hour', created_at) AS h, "
+        "SELECT task, date_trunc('hour', created_at AT TIME ZONE 'UTC') AS h, "
         "count(*) FILTER (WHERE status = 'success') AS ok, count(*) FILTER (WHERE status = 'error') AS err "
         "FROM ops.task_runs WHERE created_at >= %s GROUP BY 1, 2",
         (start,),
