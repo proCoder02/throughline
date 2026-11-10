@@ -8,7 +8,10 @@ conditions, so nothing outside a person's teams reaches a page or the AI.
 Each function returns an SQL condition over alias x, using the named
 parameter %(me)s for the viewer's user id."""
 
-MY_UNITS = "(SELECT unit_id FROM corp.unit_members WHERE user_id = %(me)s)"
+# Units I'm in, in organisations where my access isn't suspended.
+MY_UNITS = ("(SELECT um.unit_id FROM corp.unit_members um JOIN corp.units uu ON uu.id = um.unit_id "
+            "JOIN corp.members mm ON mm.org_id = uu.org_id AND mm.user_id = um.user_id AND mm.status = 'active' "
+            "WHERE um.user_id = %(me)s)")
 
 
 def meetings() -> str:
@@ -28,7 +31,8 @@ def decisions() -> str:
 
 def threads() -> str:
     return (f"((x.kind = 'team' AND x.unit_id IN {MY_UNITS}) OR (x.kind = 'direct' AND EXISTS ("
-            "SELECT 1 FROM corp.thread_members t WHERE t.thread_id = x.id AND t.user_id = %(me)s)))")
+            "SELECT 1 FROM corp.thread_members t WHERE t.thread_id = x.id AND t.user_id = %(me)s) AND EXISTS ("
+            "SELECT 1 FROM corp.members mm WHERE mm.org_id = x.org_id AND mm.user_id = %(me)s AND mm.status = 'active')))")
 
 
 def blockers() -> str:

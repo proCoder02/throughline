@@ -222,6 +222,10 @@ CREATE TABLE IF NOT EXISTS corp.work_notes (
     PRIMARY KEY (org_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS corp.job_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- Suspended members keep their place and history but can't open the organisation.
+ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'suspended'));
 """
 
 

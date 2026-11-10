@@ -11,6 +11,8 @@ export function useCorpOrg() {
   // status: loading | unavailable | error | none (no organisation yet) | ready
   const [status, setStatus] = useState('loading');
   const [orgs, setOrgs] = useState([]);
+  const [suspended, setSuspended] = useState([]); // organisations where an admin paused my access
+  const [canCreate, setCanCreate] = useState(true);
   const [data, setData] = useState(null); // {org, me, units}
   const [error, setError] = useState(null);
 
@@ -24,7 +26,10 @@ export function useCorpOrg() {
 
   const reload = useCallback(async (preferId) => {
     try {
-      const { orgs: list } = await corpApi.me();
+      const me = await corpApi.me();
+      const list = me.orgs.filter((o) => o.status !== 'suspended');
+      setSuspended(me.orgs.filter((o) => o.status === 'suspended'));
+      setCanCreate(me.can_create !== false);
       setOrgs(list);
       if (!list.length) { setData(null); setStatus('none'); return; }
       const want = preferId || readOrgId();
@@ -39,7 +44,7 @@ export function useCorpOrg() {
   useEffect(() => { reload(); }, [reload]);
 
   return {
-    status, error, orgs, data, reload, openOrg,
+    status, error, orgs, data, reload, openOrg, suspended, canCreate,
     // Most write endpoints answer with the fresh organisation view.
     apply: (d) => { if (d && d.org) setData((prev) => ({ ...prev, ...d })); },
   };

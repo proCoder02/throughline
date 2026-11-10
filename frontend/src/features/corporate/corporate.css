@@ -274,3 +274,12 @@
 .corp-alert-title { font-weight: 700; }
 .corp-alert-body { grid-column: 1; font-size: var(--text-sm); color: var(--wa-text-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .corp-alert-hint { grid-column: 2; grid-row: 1 / 3; align-self: center; color: var(--wa-accent); font-size: var(--text-sm); font-weight: 600; }
+.corp-gap { margin-left: 8px; }
+.corp-remove-panel { flex-basis: 100%; margin-top: var(--space-2); padding: var(--space-3); border: 1px solid var(--wa-danger); border-radius: var(--radius-md); display: flex; flex-direction: column; gap: var(--space-2); }
+.corp-remove-panel p { margin: 0; }
+.corp-person { flex-wrap: wrap; }
+.corp-ask-admin { text-align: center; display: flex; flex-direction: column; align-items: center; gap: var(--space-2); }
+.corp-ask-admin h2, .corp-ask-admin p { margin: 0; }
+.corp-email { font-weight: 700; font-size: var(--text-lg); word-break: break-all; }
+.corp-secondary { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; border-style: dashed; }
+.corp-csv { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }

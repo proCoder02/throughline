@@ -49,6 +49,15 @@ BUILTIN_SUBPROCESS_INFO = {
 _nudge_runner = None  # set via register_nudge_runner(); None until app.py calls it
 
 
+# Other in-process jobs that can run one cycle on demand ("Run now"),
+# registered by their feature at startup -- e.g. Corporate's five steps.
+_runners: dict = {}
+
+
+def register_runner(job_name: str, fn) -> None:
+    _runners[job_name] = fn
+
+
 def register_nudge_runner(run_nudge_cycle_fn) -> None:
     """app.py calls this once at startup with a zero-arg callable that
     triggers one nudge cycle immediately (see app.py's wiring) -- this is
@@ -115,6 +124,9 @@ def start_now(job_name: str) -> dict:
         if _nudge_runner is None:
             raise ActionNotSupported("nudge runner not wired up yet (app.py startup order issue)")
         threading.Thread(target=_nudge_runner, daemon=True).start()
+        return {"started": True}
+    if kind == "in_process" and job_name in _runners:
+        threading.Thread(target=_runners[job_name], daemon=True).start()
         return {"started": True}
     if kind == "in_process":
         raise ActionNotSupported(

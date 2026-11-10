@@ -151,37 +151,71 @@ def daily_brief(cur, push) -> int:
     return sent
 
 
-def run_once(conn, cur, call_llm, push=None) -> dict:
-    out = {}
-    for name, fn in (("overdue", lambda: mark_overdue(cur)), ("chat", lambda: extract_chats(cur, call_llm)),
-                     ("evidence", lambda: check_evidence(cur, call_llm, push)), ("radar", lambda: radar(cur, call_llm, push)),
-                     ("brief", lambda: daily_brief(cur, push))):
+# Each step is its own job on the ops dashboard (ops/jobs.py lists them under "Corporate").
+STEPS = {
+    "corp_overdue": lambda cur, llm, push: mark_overdue(cur),
+    "corp_chat_extract": lambda cur, llm, push: extract_chats(cur, llm),
+    "corp_evidence": lambda cur, llm, push: check_evidence(cur, llm, push),
+    "corp_radar": lambda cur, llm, push: radar(cur, llm, push),
+    "corp_daily_brief": lambda cur, llm, push: daily_brief(cur, push),
+}
+
+
+def run_step(conn, cur, name, call_llm, push=None, report=None, paused=None, force=False):
+    """One step, reported to ops as one job run. report(cur, conn, job_name,
+    started_at, status, detail) and paused(job_name) are the host's ops hooks;
+    without them the step just runs. force=True ignores Pause (dashboard "Run now")."""
+    started = datetime.now(timezone.utc)
+    if not force and paused and paused(name):
+        if report:
+            report(cur, conn, name, started, "skipped", {"paused": True})
+        return "paused"
+    try:
+        n = STEPS[name](cur, call_llm, push)
+        conn.commit()
+        if report:
+            report(cur, conn, name, started, "success", {"handled": n})
+        return n
+    except Exception as e:  # noqa: BLE001 -- one step failing must not stop the others
+        conn.rollback()
+        if report:
+            report(cur, conn, name, started, "error", {"error": str(e)[:300]})
+        return f"error: {e!r}"[:200]
+
+
+def run_once(conn, cur, call_llm, push=None, report=None, paused=None) -> dict:
+    return {name: run_step(conn, cur, name, call_llm, push, report, paused) for name in STEPS}
+
+
+def start(get_raw_connection, release_raw_connection, dict_cursor, call_llm, push=None, spawn=None,
+          report=None, paused=None, register_runner=None) -> None:
+    from .schema import ensure_corp_schema
+
+    def with_conn(fn):
+        conn = None
         try:
-            out[name] = fn()
-            conn.commit()
-        except Exception as e:  # noqa: BLE001 -- one step failing must not stop the others
-            conn.rollback()
-            out[name] = f"error: {e!r}"[:200]
-    return out
+            conn = get_raw_connection()
+            cur = dict_cursor(conn)
+            ensure_corp_schema(cur, conn)
+            return fn(conn, cur)
+        finally:
+            if conn is not None:
+                release_raw_connection(conn)
 
-
-def start(get_raw_connection, release_raw_connection, dict_cursor, call_llm, push=None, spawn=None) -> None:
     def loop():
-        from .schema import ensure_corp_schema
         time.sleep(30)
         while True:
-            conn = None
             try:
-                conn = get_raw_connection()
-                cur = dict_cursor(conn)
-                ensure_corp_schema(cur, conn)
-                result = run_once(conn, cur, call_llm, push)
+                result = with_conn(lambda conn, cur: run_once(conn, cur, call_llm, push, report, paused))
                 if any(v for v in result.values()):
                     print(f"[corporate] jobs: {result}")
             except Exception as e:  # noqa: BLE001
                 print(f"[corporate] jobs failed: {e!r}")
-            finally:
-                if conn is not None:
-                    release_raw_connection(conn)
             time.sleep(INTERVAL)
+
+    # Dashboard "Run now": one step, immediately, even if paused.
+    if register_runner:
+        for name in STEPS:
+            register_runner(name, lambda name=name: with_conn(
+                lambda conn, cur: run_step(conn, cur, name, call_llm, push, report, paused, force=True)))
     (spawn or (lambda f: __import__("threading").Thread(target=f, daemon=True).start()))(loop)

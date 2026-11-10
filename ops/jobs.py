@@ -23,6 +23,9 @@ JOB_STALE_HOURS = {
     "email_reminder_worker": 0.2, "call_ring_timeout_worker": 0.2,
     "ops_alert_check": 0.5,  # diagnostic heartbeat -- see alerts.py's record_completed_run call
     "custom_job_scheduler": 0.2,
+    # Corporate (corporate/jobs.py): every 15 min; stale after ~3 missed runs.
+    "corp_overdue": 0.75, "corp_chat_extract": 0.75, "corp_evidence": 0.75,
+    "corp_radar": 0.75, "corp_daily_brief": 0.75,
 }
 
 # Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
@@ -57,6 +60,12 @@ JOB_SCHEDULE = {
         "kind": "interval", "interval_seconds": HEARTBEAT_SECONDS,
         "cadence_label": "Continuous (30s loop; heartbeat every 5 min)",
     },
+    "corp_overdue": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
+    "corp_chat_extract": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
+    "corp_evidence": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
+    "corp_radar": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
+    "corp_daily_brief": {"kind": "interval", "interval_seconds": 900,
+                         "cadence_label": "Checked every 15 min; sends once a day after 09:00 IST"},
 }
 
 # job_name -> how this job can be controlled from the dashboard:
@@ -76,6 +85,8 @@ JOB_CONTROL_KIND = {
     "call_ring_timeout_worker": "in_process",
     "ops_alert_check": "none",
     "custom_job_scheduler": "none",  # pausing it would silently stop every custom job
+    "corp_overdue": "in_process", "corp_chat_extract": "in_process", "corp_evidence": "in_process",
+    "corp_radar": "in_process", "corp_daily_brief": "in_process",
 }
 # Probe-backed jobs (ops/probe.py, registered via ops/checks.py) are merged
 # in by job_status() -- they're health checks, so always control_kind "none".
@@ -87,7 +98,20 @@ JOB_HISTORY_LIMIT = 5
 JOB_FEATURE_FLAG = {
     "nudge_cycle": "NUDGE_FEATURE_ENABLED",
     "ei_pipeline": "EMOTIONAL_INTELLIGENCE_ENABLED",
+    **{n: "CORPORATE_ENABLED" for n in ("corp_overdue", "corp_chat_extract", "corp_evidence", "corp_radar",
+                                         "corp_daily_brief")},
 }
+
+# Which side of the product a job serves -- the dashboard groups jobs by this.
+# Anything not listed (infrastructure checks, the alert checker, custom jobs) is "common".
+JOB_AREA = {
+    "ei_pipeline": "personal", "nudge_cycle": "personal", "email_reminder_worker": "personal",
+    "call_ring_timeout_worker": "personal", "rq_worker_calls": "personal",
+}
+
+
+def job_area(job_name: str) -> str:
+    return "corporate" if job_name.startswith("corp_") else JOB_AREA.get(job_name, "common")
 
 
 def job_disabled(job_name: str) -> bool:
@@ -215,6 +239,7 @@ def job_status(cur, conn) -> list:
             "running": job_name in running,
             "control_kind": control_kind.get(job_name, "subprocess" if job_name in custom_jobs else "none"),
             "is_custom": job_name in custom_jobs,
+            "area": job_area(job_name),
             "history": [{"status": r["status"], "started_at": r["started_at"].isoformat() if r["started_at"] else None} for r in history],
         }
 

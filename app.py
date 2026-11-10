@@ -53,7 +53,8 @@ import llm_gateway
 import storage as storage_module
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
-from ops.tracking import record_fcm_send, record_heartbeat
+from ops.tracking import record_fcm_send, record_heartbeat, record_completed_run as _ops_record_completed_run
+from ops.actions import register_runner as _ops_register_runner
 from ops import checks as ops_checks
 from ops import tasks as ops_tasks
 from ops import notify as ops_notify
@@ -9228,7 +9229,10 @@ try:
         if os.getenv("CORPORATE_JOBS", "true").strip().lower() != "false":
             from corporate import jobs as _corp_jobs
             _corp_jobs.start(get_raw_connection, release_raw_connection, dict_cursor, _corp_llm.background(call_llm),
-                             push=send_fcm_to_user, spawn=_spawn_background)
+                             push=send_fcm_to_user, spawn=_spawn_background,
+                             # ops dashboard: each step is a job (pause / run now / history).
+                             report=_ops_record_completed_run, paused=_ops_is_on_ice,
+                             register_runner=_ops_register_runner)
         print("[corporate] enabled")
 except Exception as e:
     print(f"[corporate] not registered: {e!r}")

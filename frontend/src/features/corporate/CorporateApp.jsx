@@ -13,6 +13,7 @@ import StructurePage from './pages/StructurePage.jsx';
 import PeoplePage from './pages/PeoplePage.jsx';
 import SetupPage from './pages/SetupPage.jsx';
 import JoinPage from './pages/JoinPage.jsx';
+import WelcomePage from './pages/WelcomePage.jsx';
 import MessagesPage from './pages/MessagesPage.jsx';
 import MeetingsPage, { MeetingDetail } from './pages/MeetingsPage.jsx';
 import CommitmentsPage from './pages/CommitmentsPage.jsx';
@@ -82,7 +83,7 @@ export default function CorporateApp({ auth }) {
       </div></div>
     );
   } else if (corp.status === 'none') {
-    body = <SetupPage corp={corp} first />;
+    body = <WelcomePage corp={corp} />;
   } else {
     body = (
       <Routes>
@@ -125,9 +126,11 @@ export default function CorporateApp({ auth }) {
                     <span className="corp-unread" aria-label={`${unread.byOrg[corp.data.org.id]} unread`}>{unread.byOrg[corp.data.org.id]}</span>)}
                 </NavLink>
               ))}
-              <NavLink to="/app/corp/new" className={({ isActive }) => 'corp-nav-item subtle' + (isActive ? ' active' : '')}>
-                <PlusIcon aria-hidden="true" /><span>New organisation</span>
-              </NavLink>
+              {corp.canCreate && (
+                <NavLink to="/app/corp/new" className={({ isActive }) => 'corp-nav-item subtle' + (isActive ? ' active' : '')}>
+                  <PlusIcon aria-hidden="true" /><span>New organisation</span>
+                </NavLink>
+              )}
             </nav>
           </>
         )}

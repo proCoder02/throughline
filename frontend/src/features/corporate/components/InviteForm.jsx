@@ -6,6 +6,20 @@ import { corpApi, managerLabel } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
 import { CopyIcon } from '../../../icons.jsx';
 
+const TEMPLATE = 'email,team,team_role,role\nname@company.com,Database Team,member,member\nlead@company.com,Backend,lead,member\n';
+
+// A spreadsheet saved as CSV: email is required; team (exact name from Structure),
+// team_role (member / head / lead) and role (member / admin) are optional.
+export function parseCsv(text) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const cells = (l) => l.split(',').map((c) => c.trim().replace(/^"(.*)"$/, '$1'));
+  let cols = ['email', 'team', 'team_role', 'role'];
+  const first = cells(lines[0]).map((c) => c.toLowerCase().replace(/\s+/g, '_'));
+  if (first.includes('email')) { cols = first; lines.shift(); }
+  return lines.map((l) => Object.fromEntries(cells(l).map((v, i) => [cols[i] || `col${i}`, v])));
+}
+
 export default function InviteForm({ corp, presetUnitId, prefill, onSent }) {
   const { org, me, units } = corp.data;
   const invitable = units.filter((u) => u.manage_people);
@@ -44,6 +58,17 @@ export default function InviteForm({ corp, presetUnitId, prefill, onSent }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  const uploadCsv = async (file) => {
+    if (!file) return;
+    const rows = parseCsv(await file.text());
+    if (!rows.length) { showToast('That file has no rows.', 'error'); return; }
+    if (rows.length > 200) { showToast('Up to 200 people per file. Split it into smaller files.', 'error'); return; }
+    setBusy(true);
+    try { setResult(await corpApi.inviteRows(org.id, rows)); onSent?.(); }
+    catch (err) { showToast(err.message, 'error'); }
+    finally { setBusy(false); }
   };
 
   const copy = (link) => {
@@ -88,6 +113,15 @@ export default function InviteForm({ corp, presetUnitId, prefill, onSent }) {
           )}
         </div>
         <div className="corp-actions">
+          <div className="corp-csv">
+            <label className="corp-btn">Upload a CSV
+              <input type="file" accept=".csv,text/csv" hidden disabled={busy}
+                onChange={(e) => { uploadCsv(e.target.files[0]); e.target.value = ''; }} />
+            </label>
+            <a className="corp-link corp-small" download="throughline-invites.csv"
+              href={`data:text/csv;charset=utf-8,${encodeURIComponent(TEMPLATE)}`}>Template</a>
+          </div>
+          <span style={{ flex: 1 }} />
           <button className="corp-btn primary" disabled={busy || !emails.trim() || (needsUnit && !unitId)}>
             {busy ? 'Sending…' : 'Send invitations'}
           </button>
@@ -105,7 +139,7 @@ export default function InviteForm({ corp, presetUnitId, prefill, onSent }) {
               <ul className="corp-list">
                 {result.created.map((c) => (
                   <li key={c.id} className="corp-invite-link">
-                    <span className="corp-row-title">{c.email}</span>
+                    <span className="corp-row-title">{c.email}{c.team ? <span className="corp-muted"> · {c.team}</span> : null}</span>
                     <button className="corp-btn small" onClick={() => copy(c.link)}><CopyIcon aria-hidden="true" /> Copy link</button>
                   </li>
                 ))}
@@ -114,6 +148,9 @@ export default function InviteForm({ corp, presetUnitId, prefill, onSent }) {
           )}
           {result.already_members.length > 0 && <p className="corp-muted">Already in the organisation: {result.already_members.join(', ')}</p>}
           {result.invalid.length > 0 && <p className="corp-warn">Not valid email addresses: {result.invalid.join(', ')}</p>}
+          {result.errors?.length > 0 && (
+            <ul className="corp-warn corp-small">{result.errors.map((e) => <li key={e.email}>{e.email}: {e.error}</li>)}</ul>
+          )}
         </div>
       )}
     </section>

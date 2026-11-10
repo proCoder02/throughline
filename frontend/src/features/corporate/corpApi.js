@@ -35,7 +35,12 @@ export const corpApi = {
   members: (id) => apiJson(`${org(id)}/members`),
   updateMember: (id, userId, changes) =>
     apiJson(`${org(id)}/members/${userId}`, { method: 'PATCH', ...json(changes) }),
-  removeMember: (id, userId) => apiJson(`${org(id)}/members/${userId}`, { method: 'DELETE' }),
+  removeMember: (id, userId, reassignTo = null) =>
+    apiJson(`${org(id)}/members/${userId}`, { method: 'DELETE', ...json({ reassign_to: reassignTo }) }),
+  setAccess: (id, userId, status) => apiJson(`${org(id)}/members/${userId}`, { method: 'PATCH', ...json({ status }) }),
+  inviteRows: (id, rows) => post(`${org(id)}/invites`, { rows }),
+  myInvites: () => apiJson('/corp/invites/mine'),
+  acceptMine: (inviteId) => post(`/corp/invites/mine/${inviteId}/accept`, {}),
 
   invites: (id) => apiJson(`${org(id)}/invites`),
   invite: (id, { emails, role, unitId, unitRole }) =>

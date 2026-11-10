@@ -14,3 +14,13 @@ INVITE_DAYS = int(os.getenv("CORPORATE_INVITE_DAYS", "14"))
 MAX_INVITES_PER_REQUEST = 200
 NAME_MAX = 120
 TITLE_MAX = 120
+
+
+def creation_allowed(email: str) -> bool:
+    """Who may create a new organisation. CORPORATE_ORG_CREATION=open (default):
+    anyone. =closed: only the emails in CORPORATE_CREATORS (comma separated) --
+    for selling Throughline to companies yourself and inviting each owner."""
+    if os.getenv("CORPORATE_ORG_CREATION", "open").strip().lower() != "closed":
+        return True
+    allowed = {e.strip().lower() for e in os.getenv("CORPORATE_CREATORS", "").split(",") if e.strip()}
+    return (email or "").strip().lower() in allowed

@@ -30,7 +30,7 @@ import threading
 from flask import Blueprint, jsonify, request
 
 from . import invites, orgs, units
-from .config import MAX_INVITES_PER_REQUEST, NAME_MAX, TITLE_MAX
+from .config import MAX_INVITES_PER_REQUEST, NAME_MAX, TITLE_MAX, creation_allowed
 from .errors import CorpError
 from .roles import (INVITE_ROLES, UNIT_KINDS, UNIT_ROLES, can_create_under, can_edit_unit, can_invite,
                     can_manage_people, can_remove_member, can_set_org_role, capabilities, valid_parent)
@@ -110,7 +110,9 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
     @login_required
     def me():
         _, cur = db_cur()
-        return jsonify({"enabled": True, "orgs": orgs.my_orgs(cur, current_user_id())})
+        user_id = current_user_id()
+        return jsonify({"enabled": True, "orgs": orgs.my_orgs(cur, user_id),
+                        "can_create": creation_allowed(my_email(cur, user_id))})
 
     @bp.route("/corp/orgs", methods=["POST"])
     @login_required
@@ -122,6 +124,9 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         if not isinstance(departments, list) or len(departments) > 50:
             raise CorpError(400, "Up to 50 departments can be added at once.")
         user_id = current_user_id()
+        if not creation_allowed(my_email(cur, user_id)):
+            raise CorpError(403, "New organisations are set up by the Throughline team. "
+                                 "If your company already uses Throughline, ask its admin to invite you.")
         org_id = orgs.create_org(cur, user_id, name)
         seen = set()
         for d in departments:
@@ -171,6 +176,7 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         ctx = orgs.load_context(cur, org_id, current_user_id())
         if ctx.is_owner:
             raise CorpError(400, "The owner can't leave. Delete the organisation instead.")
+        orgs.hand_over_commitments(cur, org_id, ctx.user_id, None, ctx.user_id)
         orgs.remove_member(cur, org_id, ctx.user_id)
         conn.commit()
         return jsonify({"ok": True})
@@ -289,6 +295,13 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         if not target_role:
             raise CorpError(404, "That person isn't in this organisation.")
         data = body()
+        if "status" in data:
+            status = data.get("status")
+            if status not in ("active", "suspended"):
+                raise CorpError(400, "status must be active or suspended.")
+            if not ctx.is_admin or user_id == ctx.user_id or target_role == "owner" or (target_role == "admin" and not ctx.is_owner):
+                raise CorpError(403, "You can't change this person's access.")
+            orgs.set_status(cur, org_id, user_id, status)
         role = data.get("role")
         if role is not None and role != target_role and not can_set_org_role(ctx, target_role, role):
             raise CorpError(403, "Only the owner can change organisation roles.")
@@ -311,9 +324,15 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
             raise CorpError(404, "That person isn't in this organisation.")
         if not can_remove_member(ctx, user_id, target_role):
             raise CorpError(403, "You can't remove this person.")
+        to = body().get("reassign_to")
+        if to is not None:
+            to = _int(to, "person")
+            if to == user_id or not orgs.member_role(cur, org_id, to):
+                raise CorpError(400, "Hand their commitments to someone staying in the organisation.")
+        moved = orgs.hand_over_commitments(cur, org_id, user_id, to, ctx.user_id)
         orgs.remove_member(cur, org_id, user_id)
         conn.commit()
-        return jsonify({"members": orgs.list_members(cur, org_id, show_email=True)})
+        return jsonify({"members": orgs.list_members(cur, org_id, show_email=True), "handed_over": moved})
 
     # ------------------------------------------------------------- invites
 
@@ -332,38 +351,73 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
     @bp.route("/corp/orgs/<int:org_id>/invites", methods=["POST"])
     @login_required
     def create_invites(org_id):
+        """Two shapes: {emails, role, unit_id, unit_role} -- one setting for a list of
+        addresses -- or {rows: [{email, team, team_role, role}]} from a CSV file, where
+        each row can go to a different team. Permissions are checked per invitation."""
         conn, cur = db_cur()
         ctx = orgs.load_context(cur, org_id, current_user_id())
         data = body()
-        role = data.get("role", "member")
-        if role not in INVITE_ROLES:
-            raise CorpError(400, "role must be admin or member.")
-        unit_id = data.get("unit_id")
-        unit_role = data.get("unit_role") or "member"
-        if unit_id is not None:
-            unit_id = unit_in_org(ctx, unit_id)
+        entries, invalid, errors = [], [], []  # entries: (email, role, unit_id, unit_role)
+
+        def check(email, role, unit_id, unit_role):
+            if role not in INVITE_ROLES:
+                return "role must be admin or member"
             if unit_role not in UNIT_ROLES:
-                raise CorpError(400, "unit_role must be manager or member.")
-        if not can_invite(ctx, role, unit_id, unit_role):
-            raise CorpError(403, "You can't send this invitation.")
-        emails, invalid = invites.parse_emails(data.get("emails", data.get("email")))
-        if not emails:
+                return "team role must be manager or member"
+            if not can_invite(ctx, role, unit_id, unit_role):
+                return "you can't send this invitation"
+            return None
+
+        if isinstance(data.get("rows"), list):
+            by_name: dict = {}
+            for u in ctx.units.values():
+                by_name.setdefault(u["name"].strip().lower(), []).append(u["id"])
+            for i, r in enumerate(data["rows"][:MAX_INVITES_PER_REQUEST + 1], start=1):
+                r = r if isinstance(r, dict) else {}
+                email = invites.normalize_email(r.get("email"))
+                if not email:
+                    invalid.append(str(r.get("email") or f"row {i}")); continue
+                team = str(r.get("team") or "").strip().lower()
+                ids = by_name.get(team, []) if team else [None]
+                if len(ids) != 1:
+                    errors.append({"email": email, "error": "no team with that name" if not ids else
+                                   "more than one team has that name; use Structure to pick"}); continue
+                role, unit_role = str(r.get("role") or "member").lower(), str(r.get("team_role") or "member").lower()
+                unit_role = {"head": "manager", "lead": "manager"}.get(unit_role, unit_role)
+                problem = check(email, role, ids[0], unit_role)
+                if problem:
+                    errors.append({"email": email, "error": problem}); continue
+                entries.append((email, role, ids[0], unit_role))
+        else:
+            role = data.get("role", "member")
+            unit_id = data.get("unit_id")
+            unit_role = data.get("unit_role") or "member"
+            if unit_id is not None:
+                unit_id = unit_in_org(ctx, unit_id)
+            problem = check("", role, unit_id, unit_role)
+            if problem:
+                raise CorpError(403 if "can't" in problem else 400, problem[0].upper() + problem[1:] + ".")
+            emails, invalid = invites.parse_emails(data.get("emails", data.get("email")))
+            entries = [(e, role, unit_id, unit_role) for e in emails]
+        if not entries and not errors and not invalid:
             raise CorpError(400, "Add at least one valid email address.")
-        if len(emails) > MAX_INVITES_PER_REQUEST:
+        if len(entries) > MAX_INVITES_PER_REQUEST:
             raise CorpError(400, f"At most {MAX_INVITES_PER_REQUEST} invitations at once.")
         cur.execute(
             "SELECT lower(u.email) AS email FROM corp.members m JOIN users u ON u.id = m.user_id "
             "WHERE m.org_id = %s AND lower(u.email) = ANY(%s)",
-            (org_id, emails),
+            (org_id, [e[0] for e in entries] or [""]),
         )
         already = {r["email"] for r in cur.fetchall()}
         base = (public_base_url() if public_base_url else request.host_url).rstrip("/")
-        created = []
-        for email in emails:
-            if email in already:
+        created, seen = [], set()
+        for email, role, unit_id, unit_role in entries:
+            if email in already or email in seen:
                 continue
+            seen.add(email)
             invite_id, token = invites.create(cur, org_id, email, role, unit_id, unit_role, ctx.user_id)
-            created.append({"id": invite_id, "email": email, "link": f"{base}/app/corp/join/{token}"})
+            created.append({"id": invite_id, "email": email, "link": f"{base}/app/corp/join/{token}",
+                            "team": ctx.units[unit_id]["name"] if unit_id else None})
         conn.commit()
 
         emailed = bool(send_plain_email and created)
@@ -371,11 +425,10 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
             org_name = orgs.get_org(cur, org_id)["name"]
             cur.execute("SELECT username FROM users WHERE id = %s", (ctx.user_id,))
             inviter = cur.fetchone()["username"]
-            where = f" ({ctx.units[unit_id]['name']})" if unit_id else ""
-            jobs = [(c["email"], c["link"]) for c in created]
+            jobs = [(c["email"], c["link"], f" ({c['team']})" if c["team"] else "") for c in created]
 
             def _send():
-                for to, link in jobs:
+                for to, link, where in jobs:
                     try:
                         send_plain_email(
                             to, f"{inviter} invited you to {org_name} on Throughline",
@@ -388,7 +441,7 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
             threading.Thread(target=_send, daemon=True).start()
 
         return jsonify({"created": created, "already_members": sorted(already), "invalid": invalid,
-                        "emailed": emailed}), 201
+                        "errors": errors, "emailed": emailed}), 201
 
     @bp.route("/corp/orgs/<int:org_id>/invites/<int:invite_id>", methods=["DELETE"])
     @login_required
@@ -432,6 +485,10 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         row = invites.get_by_token(cur, token, for_update=True)
         if not row:
             raise CorpError(404, "This invitation link isn't valid.")
+        return join(conn, cur, row)
+
+    def join(conn, cur, row):
+        """Shared by the email link and the in-app "You've been invited" list."""
         status = invites.status_of(row)
         if status != "pending":
             raise CorpError(410, {"accepted": "This invitation has already been used.",
@@ -449,6 +506,34 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         invites.mark_accepted(cur, row["id"], user_id)
         conn.commit()
         return jsonify({"ok": True, "org_id": row["org_id"]})
+
+    @bp.route("/corp/invites/mine", methods=["GET"])
+    @login_required
+    def my_invites():
+        """Pending invitations sent to my account's email -- so someone who
+        never clicked the email link is still offered "Join", not "Create"."""
+        _, cur = db_cur()
+        user_id = current_user_id()
+        email = my_email(cur, user_id)
+        cur.execute(
+            "SELECT i.id, o.name AS org_name, un.name AS unit_name, un.kind AS unit_kind, i.unit_role, i.role, "
+            "inv.username AS invited_by, i.expires_at FROM corp.invites i JOIN corp.orgs o ON o.id = i.org_id "
+            "LEFT JOIN corp.units un ON un.id = i.unit_id LEFT JOIN users inv ON inv.id = i.invited_by "
+            "WHERE lower(i.email) = %s AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() "
+            "AND NOT EXISTS (SELECT 1 FROM corp.members m WHERE m.org_id = i.org_id AND m.user_id = %s) "
+            "ORDER BY i.created_at DESC", (email, user_id))
+        rows = [dict(r) | {"expires_at": r["expires_at"].isoformat()} for r in cur.fetchall()]
+        return jsonify({"email": email, "invites": rows})
+
+    @bp.route("/corp/invites/mine/<int:invite_id>/accept", methods=["POST"])
+    @login_required
+    def accept_my_invite(invite_id):
+        conn, cur = db_cur()
+        cur.execute("SELECT * FROM corp.invites WHERE id = %s FOR UPDATE", (invite_id,))
+        row = cur.fetchone()
+        if not row:
+            raise CorpError(404, "Invitation not found.")
+        return join(conn, cur, row)  # the email check inside stops anyone else using it
 
     if call_llm:  # work memory: chat, meetings, ledger, decisions, ask, brief (routes_work.py)
         from .routes_work import register

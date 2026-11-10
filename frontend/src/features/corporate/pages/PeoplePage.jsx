@@ -48,7 +48,7 @@ function PendingInvites({ corp, version }) {
   );
 }
 
-function MemberRow({ m, corp, user, onChanged }) {
+function MemberRow({ m, corp, user, onChanged, everyone }) {
   const { org, me } = corp.data;
   const isMe = m.user_id === user.id;
   const [editingTitle, setEditingTitle] = useState(false);
@@ -60,10 +60,18 @@ function MemberRow({ m, corp, user, onChanged }) {
     e.preventDefault();
     run(async () => { const d = await corpApi.updateMember(org.id, m.user_id, { title }); setEditingTitle(false); return d; });
   };
-  const remove = async () => {
-    const ok = await confirmDialog({ title: `Remove ${m.username} from ${org.name}?`, danger: true, confirmLabel: 'Remove',
-      message: 'They lose access to the organisation and leave all its departments and teams.' });
-    if (ok) run(() => corpApi.removeMember(org.id, m.user_id));
+  // Leavers: their open commitments go to someone else (or stay ownerless, flagged), never silently lost.
+  const [removing, setRemoving] = useState(false);
+  const [heir, setHeir] = useState('');
+  const remove = () => run(async () => {
+    const d = await corpApi.removeMember(org.id, m.user_id, heir ? Number(heir) : null);
+    if (d.handed_over) showToast(`${d.handed_over} open commitment${d.handed_over === 1 ? '' : 's'} handed over.`, 'success');
+    return d;
+  });
+  const setAccess = async (status) => {
+    if (status === 'suspended' && !(await confirmDialog({ title: `Pause ${m.username}'s access?`, confirmLabel: 'Pause access',
+      message: 'They keep their place, teams and history, but can’t open the organisation until you restore access.' }))) return;
+    run(() => corpApi.setAccess(org.id, m.user_id, status));
   };
 
   const navigate = useNavigate();
@@ -71,13 +79,14 @@ function MemberRow({ m, corp, user, onChanged }) {
     try { const r = await corpApi.direct(org.id, m.user_id); navigate(`/app/corp/messages?t=${r.thread_id}`); } catch (e) { showToast(e.message, 'error'); }
   };
   const canRemove = !isMe && m.role !== 'owner' && (m.role === 'admin' ? me.org_owner : me.org_admin);
+  const suspended = m.status === 'suspended';
   const canEditTitle = me.org_admin || isMe;
 
   return (
     <li className="corp-person">
       <Avatar url={m.profile_picture_url} name={m.username} />
       <span className="corp-row-main">
-        <span className="corp-row-title">{m.username}{isMe ? ' (you)' : ''}</span>
+        <span className="corp-row-title">{m.username}{isMe ? ' (you)' : ''}{suspended && <span className="corp-status overdue corp-gap">Access paused</span>}</span>
         {editingTitle ? (
           <form className="corp-inline" onSubmit={saveTitle}>
             <input aria-label="Job title" value={title} onChange={(e) => setTitle(e.target.value)} maxLength={120} autoFocus />
@@ -109,9 +118,30 @@ function MemberRow({ m, corp, user, onChanged }) {
         <span className={'corp-role ' + m.role}>{ORG_ROLE_LABELS[m.role]}</span>
       )}
       {canRemove && (
-        <button className="corp-icon-btn danger" title="Remove from organisation" aria-label={`Remove ${m.username}`} onClick={remove}>
+        <button className="corp-btn small" onClick={() => setAccess(suspended ? 'active' : 'suspended')}>
+          {suspended ? 'Restore access' : 'Pause access'}
+        </button>
+      )}
+      {canRemove && (
+        <button className="corp-icon-btn danger" title="Remove from organisation" aria-label={`Remove ${m.username}`} onClick={() => setRemoving((v) => !v)}>
           <TrashIcon />
         </button>
+      )}
+      {removing && (
+        <div className="corp-remove-panel" role="group" aria-label={`Remove ${m.username}`}>
+          <p>Remove <strong>{m.username}</strong> from {org.name}? They leave every department and team.</p>
+          <label className="corp-field compact"><span>Hand their open commitments to</span>
+            <select value={heir} onChange={(e) => setHeir(e.target.value)}>
+              <option value="">No one yet (marked “needs an owner”)</option>
+              {everyone.filter((x) => x.user_id !== m.user_id && x.status !== 'suspended').map((x) => (
+                <option key={x.user_id} value={x.user_id}>{x.username}</option>))}
+            </select>
+          </label>
+          <div className="corp-actions">
+            <button className="corp-btn" onClick={() => setRemoving(false)}>Cancel</button>
+            <button className="corp-btn danger" onClick={remove}>Remove</button>
+          </div>
+        </div>
       )}
     </li>
   );
@@ -180,7 +210,7 @@ export default function PeoplePage({ corp, user }) {
           )
         ) : (
           <ul className="corp-list">
-            {shown.map((m) => <MemberRow key={m.user_id} m={m} corp={corp} user={user} onChanged={changed} />)}
+            {shown.map((m) => <MemberRow key={m.user_id} m={m} corp={corp} user={user} onChanged={changed} everyone={members} />)}
           </ul>
         )}
       </section>

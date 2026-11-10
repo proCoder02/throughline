@@ -9,7 +9,7 @@ import { BuildingIcon, CloseIcon } from '../../../icons.jsx';
 
 const SUGGESTED = ['Engineering', 'Product', 'Sales', 'Marketing', 'Finance', 'HR', 'Operations'];
 
-export default function SetupPage({ corp, first = false }) {
+export default function SetupPage({ corp, first = false, onCancel }) {
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [departments, setDepartments] = useState([]);
@@ -46,10 +46,7 @@ export default function SetupPage({ corp, first = false }) {
         <div>
           <h1>{first ? 'Set up your organisation' : 'New organisation'}</h1>
           <p className="corp-muted">
-            {first
-              ? 'You’ll be its owner. Then you can add departments and teams, and invite colleagues. '
-                + 'Been invited by your company? Open the link from your invitation email instead.'
-              : 'You’ll be its owner.'}
+            You’ll be its owner. Then you can add departments and teams, and invite colleagues.
           </p>
         </div>
       </header>
@@ -86,7 +83,7 @@ export default function SetupPage({ corp, first = false }) {
         </div>
 
         <div className="corp-actions">
-          {!first && <button type="button" className="corp-btn" onClick={() => navigate('/app/corp')}>Cancel</button>}
+          {(onCancel || !first) && <button type="button" className="corp-btn" onClick={onCancel || (() => navigate('/app/corp'))}>Cancel</button>}
           <button className="corp-btn primary" disabled={!name.trim() || saving}>
             {saving ? 'Creating…' : 'Create organisation'}
           </button>

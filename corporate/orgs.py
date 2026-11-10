@@ -17,7 +17,7 @@ def clean_name(value, max_len: int, what: str) -> str:
 
 def my_orgs(cur, user_id: int) -> list:
     cur.execute(
-        "SELECT o.id, o.name, m.role, "
+        "SELECT o.id, o.name, m.role, m.status, "
         "(SELECT count(*) FROM corp.members x WHERE x.org_id = o.id) AS member_count "
         "FROM corp.members m JOIN corp.orgs o ON o.id = m.org_id "
         "WHERE m.user_id = %s ORDER BY o.name",
@@ -42,10 +42,12 @@ def get_org(cur, org_id: int) -> dict | None:
 def load_context(cur, org_id: int, user_id: int) -> OrgContext:
     """The caller's view of an organisation. 404 (not 403) when they aren't
     in it, so organisation ids can't be probed."""
-    cur.execute("SELECT role FROM corp.members WHERE org_id = %s AND user_id = %s", (org_id, user_id))
+    cur.execute("SELECT role, status FROM corp.members WHERE org_id = %s AND user_id = %s", (org_id, user_id))
     row = cur.fetchone()
     if not row:
         raise CorpError(404, "Organisation not found.")
+    if row["status"] != "active":
+        raise CorpError(403, "An admin has paused your access to this organisation.")
     cur.execute("SELECT id, parent_id, kind, name FROM corp.units WHERE org_id = %s", (org_id,))
     units = {r["id"]: dict(r) for r in cur.fetchall()}
     cur.execute(
@@ -65,7 +67,7 @@ def member_role(cur, org_id: int, user_id: int) -> str | None:
 
 def list_members(cur, org_id: int, show_email: bool) -> list:
     cur.execute(
-        "SELECT m.user_id, u.username, u.email, u.profile_picture_url, m.role, m.title, m.joined_at "
+        "SELECT m.user_id, u.username, u.email, u.profile_picture_url, m.role, m.title, m.joined_at, m.status "
         "FROM corp.members m JOIN users u ON u.id = m.user_id WHERE m.org_id = %s "
         "ORDER BY (m.role = 'owner') DESC, (m.role = 'admin') DESC, lower(u.username)",
         (org_id,),
@@ -93,6 +95,25 @@ def set_member(cur, org_id: int, user_id: int, *, role=None, title=None) -> None
         cur.execute("UPDATE corp.members SET role = %s WHERE org_id = %s AND user_id = %s", (role, org_id, user_id))
     if title is not None:
         cur.execute("UPDATE corp.members SET title = %s WHERE org_id = %s AND user_id = %s", (title, org_id, user_id))
+
+
+def hand_over_commitments(cur, org_id: int, user_id: int, to_user_id=None, actor_id=None) -> int:
+    """A leaver's open commitments go to someone else, or stay with no owner
+    (their name kept) so the team sees they need picking up. History is kept."""
+    from . import ledger
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    name = (cur.fetchone() or {}).get("username") or "former member"
+    cur.execute("UPDATE corp.commitments SET owner_id = %s, owner_name = %s, updated_at = now() "
+                "WHERE org_id = %s AND owner_id = %s AND status IN ('detected', 'open', 'overdue') RETURNING id",
+                (to_user_id, None if to_user_id else f"{name} (left)", org_id, user_id))
+    ids = [r["id"] for r in cur.fetchall()]
+    for cid in ids:
+        ledger.event(cur, cid, actor_id, "reassigned", from_user=name, to_user_id=to_user_id)
+    return len(ids)
+
+
+def set_status(cur, org_id: int, user_id: int, status: str) -> None:
+    cur.execute("UPDATE corp.members SET status = %s WHERE org_id = %s AND user_id = %s", (status, org_id, user_id))
 
 
 def remove_member(cur, org_id: int, user_id: int) -> None:

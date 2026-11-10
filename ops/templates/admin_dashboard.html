@@ -207,6 +207,7 @@
   .badge { font-size: 10.5px; font-weight: 700; letter-spacing: .03em; padding: 1px 7px; border-radius: var(--radius-pill); margin-left: 6px; vertical-align: 1px; }
   .badge.running { background: var(--ok-bg); color: var(--ok); }
   .badge.custom { background: var(--hover); color: var(--text-soft); }
+  .badge.kind { background: transparent; color: var(--text-soft); border: 1px solid var(--line, var(--hover)); font-weight: 500; }
   .hist { display: inline-flex; gap: 3px; }
   .hist i { width: 7px; height: 16px; border-radius: 2px; background: var(--hover); display: inline-block; }
   .hist i.ok { background: var(--ok); } .hist i.warn { background: var(--warn); } .hist i.crit { background: var(--crit); }
@@ -526,13 +527,25 @@ const JOBS = {
   rq_worker_calls:          { name: "Call-recording worker",    group: "Always-on workers",  about: "RQ worker for the 'calls' queue: turns uploaded call recordings into conversations." },
   costlens_flush:           { name: "CostLens upload",          group: "Always-on workers",  about: "Sends API/DB usage records to CostLens every 5 seconds." },
   redis:                    { name: "Redis",                    group: "Infrastructure",     about: "Cache, live-event queue and job queue." },
+  corp_overdue:             { name: "Overdue commitments",      group: "Scheduled jobs",     about: "Marks open commitments past their due date as overdue." },
+  corp_chat_extract:        { name: "Commitments from chat",    group: "Scheduled jobs",     about: "Reads team and direct chats with 5+ new messages and adds the promises made there." },
+  corp_evidence:            { name: "Evidence check",           group: "Scheduled jobs",     about: "Closes a commitment when later chat or meetings show it was done (AI only when there's new activity)." },
+  corp_radar:               { name: "Risk radar",               group: "Scheduled jobs",     about: "Links a blocker in one team to a commitment in another and alerts both owners." },
+  corp_daily_brief:         { name: "Daily work brief",         group: "Scheduled jobs",     about: "Once a day after 09:00 IST: push with what each person owes, is owed, and what's at risk." },
 };
-const GROUP_ORDER = ["Scheduled jobs", "Always-on workers", "Infrastructure", "Custom jobs"];
+// Jobs are grouped by the side of the product they serve (ops/jobs.py JOB_AREA).
+const AREA_LABEL = { personal: "Personal", corporate: "Corporate", common: "Common (shared infrastructure)" };
+const GROUP_ORDER = ["Personal", "Corporate", "Common (shared infrastructure)"];
 const JOB_LOGS = {
   ei_pipeline: null, // file path from detail.log_file, below
   nudge_cycle: 'journalctl -u throughline -g "nudge_engine"',
   email_reminder_worker: 'journalctl -u throughline -g "email_reminder_worker"',
   call_ring_timeout_worker: 'journalctl -u throughline -g "call_ring_timeout_worker"',
+  corp_overdue: 'journalctl -u throughline -g "\\[corporate\\]"',
+  corp_chat_extract: 'journalctl -u throughline -g "\\[corporate\\]"',
+  corp_evidence: 'journalctl -u throughline -g "\\[corporate\\]"',
+  corp_radar: 'journalctl -u throughline -g "\\[corporate\\]"',
+  corp_daily_brief: 'journalctl -u throughline -g "\\[corporate\\]"',
   custom_job_scheduler: 'journalctl -u throughline -g "ops.scheduler"',
   notify_pubsub_listener: 'journalctl -u throughline -g "notify pubsub listener"',
   rq_worker_calls: 'journalctl -u throughline -g "ops.probe"',
@@ -944,7 +957,7 @@ function renderJobs(jobs) {
   if (!shown.length) { body.innerHTML = `<tr><td colspan="7" class="empty">${all.length ? "No jobs match this filter." : "No jobs recorded yet."}</td></tr>`; return; }
   const groups = {};
   for (const x of shown) {
-    const g = x.j.is_custom ? "Custom jobs" : (x.info.group || (x.j.control_kind === "none" ? "Always-on workers" : "Scheduled jobs"));
+    const g = AREA_LABEL[x.j.area] || AREA_LABEL.common;
     (groups[g] = groups[g] || []).push(x);
   }
   let html = "";
@@ -958,7 +971,7 @@ function renderJobs(jobs) {
       const silenced = (sev === "crit" || sev === "warn") && ackOf("job:" + j.job_name);
       html += `<tr class="job-row ${open ? "open" : ""}" id="job-${esc(j.job_name)}" data-job-row="${esc(j.job_name)}" tabindex="0" role="button" aria-expanded="${open}">
         <td data-label="Status">${statusBadge(sev, jobWord(j, sev))}${silenced ? `<div class="ackline" title="${esc(ackLine(silenced))}">${silenced.kind === "snooze" ? "snoozed" : "acknowledged"}</div>` : ""}</td>
-        <td class="lead"><span class="chev" aria-hidden="true">›</span> <span class="job-name">${esc(info.name || j.job_name)}</span>${j.running ? `<span class="badge running">RUNNING</span>` : ""}${j.is_custom ? `<span class="badge custom">custom</span>` : ""}<div class="job-id" style="margin-left:18px;">${esc(j.job_name)}</div></td>
+        <td class="lead"><span class="chev" aria-hidden="true">›</span> <span class="job-name">${esc(info.name || j.job_name)}</span>${!j.is_custom && info.group ? `<span class="badge kind">${esc(info.group)}</span>` : ""}${j.running ? `<span class="badge running">RUNNING</span>` : ""}${j.is_custom ? `<span class="badge custom">custom</span>` : ""}<div class="job-id" style="margin-left:18px;">${esc(j.job_name)}</div></td>
         <td data-label="Schedule">${esc(j.cadence_label || "—")}</td>
         <td data-label="Last run">${timeEl(j.finished_at || j.started_at, j.started_at ? ago(j.finished_at || j.started_at) : "never")}</td>
         <td data-label="Took" class="r phone-hide">${j.duration_seconds ? esc(dur(j.duration_seconds)) : `<span class="muted">—</span>`}</td>
