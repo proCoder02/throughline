@@ -58,6 +58,17 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
                 (spawn or (lambda f: f()))(lambda uid=uid: push(uid, title, text, data))
 
     # ------------------------------------------------------------- chat
+    @bp.route("/corp/presence", methods=["POST"])
+    @login_required
+    def presence():
+        """An open, visible, recently used web tab says "I'm here" about once a
+        minute; while that holds, phone pushes for work messages are skipped."""
+        conn, cur = db_cur()
+        cur.execute("INSERT INTO corp.presence (user_id, active_until) VALUES (%s, now() + interval '2 minutes') "
+                    "ON CONFLICT (user_id) DO UPDATE SET active_until = EXCLUDED.active_until", (current_user_id(),))
+        conn.commit()
+        return jsonify({"ok": True})
+
     @bp.route("/corp/unread", methods=["GET"])
     @login_required
     def unread_total():
@@ -118,7 +129,10 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
         me = cur.fetchone()["username"]
         where = ctx.units[t["unit_id"]]["name"] if t["kind"] == "team" else me
         others = [u for u in chat.recipients(cur, t) if u != ctx.user_id]
-        notify(others, where, (f"{me}: " if t["kind"] == "team" else "") + text[:120],
+        # Phone push only for people not active on the website right now (they get the live alert there).
+        cur.execute("SELECT user_id FROM corp.presence WHERE user_id = ANY(%s) AND active_until > now()", (others or [0],))
+        on_web = {r["user_id"] for r in cur.fetchall()}
+        notify([u for u in others if u not in on_web], where, (f"{me}: " if t["kind"] == "team" else "") + text[:120],
                {"type": "corp_message", "org_id": str(org_id), "thread_id": str(tid)})
         if live:  # open tabs get it instantly: badge, toast, desktop notification
             event = {"type": "corp_message", "org_id": org_id, "thread_id": tid, "message_id": mid, "team": t["kind"] == "team",

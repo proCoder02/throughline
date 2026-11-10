@@ -1,5 +1,5 @@
-// Meetings -> team memory. Add one by recording in the browser, uploading a
-// file (e.g. a Zoom/Teams recording), pasting notes, or importing a
+// Meetings -> team memory. Add one by recording in the browser, pasting
+// notes, or importing a
 // conversation already recorded with Listen or a call.
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
@@ -9,7 +9,7 @@ import { ensureRecordingNotice } from '../../../lib/consent.js';
 import { CommitmentRow, CommonGroundCard, UnitSelect, fmtDate, myUnits } from '../components/work.jsx';
 import { SparkleIcon } from '../../../icons.jsx';
 
-const MODES = [['record', 'Record now'], ['upload', 'Upload a file'], ['text', 'Paste notes'], ['import', 'From my conversations']];
+const MODES = [['record', 'Record now'], ['text', 'Paste notes'], ['import', 'From my conversations']];
 
 function NewMeeting({ corp, onCreated }) {
   const orgId = corp.data.org.id;
@@ -17,7 +17,6 @@ function NewMeeting({ corp, onCreated }) {
   const [unitId, setUnitId] = useState(myUnits(corp)[0]?.id ?? null);
   const [title, setTitle] = useState('');
   const [text, setText] = useState('');
-  const [file, setFile] = useState(null);
   const [convs, setConvs] = useState(null);
   const [convId, setConvId] = useState('');
   const [rec, setRec] = useState(null); // {recorder, chunks, started}
@@ -64,7 +63,6 @@ function NewMeeting({ corp, onCreated }) {
   };
   const go = (e) => {
     e.preventDefault();
-    if (mode === 'upload' && file) submit(form(file, file.name));
     if (mode === 'text') submit({ title: title || 'Meeting notes', unit_id: unitId, text });
     if (mode === 'import' && convId) submit({ title, unit_id: unitId, conversation_id: Number(convId) });
   };
@@ -86,7 +84,6 @@ function NewMeeting({ corp, onCreated }) {
           ? <div className="corp-inline"><span className="corp-rec-dot" aria-hidden="true" /> Recording {Math.floor(secs / 60)}:{String(secs % 60).padStart(2, '0')}
               <button type="button" className="corp-btn primary" onClick={stopRec}>Stop and save</button></div>
           : <button type="button" className="corp-btn primary" onClick={startRec} disabled={busy}>Start recording</button>)}
-        {mode === 'upload' && <input type="file" accept="audio/*,video/*" aria-label="Recording file" onChange={(e) => setFile(e.target.files[0] || null)} />}
         {mode === 'text' && <textarea rows={6} aria-label="Notes or transcript" value={text} onChange={(e) => setText(e.target.value)} placeholder="Paste the notes or transcript" />}
         {mode === 'import' && (
           <select aria-label="Conversation" value={convId} onChange={(e) => setConvId(e.target.value)}>
@@ -95,7 +92,7 @@ function NewMeeting({ corp, onCreated }) {
           </select>
         )}
         {mode !== 'record' && (
-          <div className="corp-actions"><button className="corp-btn primary" disabled={busy || (mode === 'upload' && !file) || (mode === 'text' && text.trim().length < 20) || (mode === 'import' && !convId)}>
+          <div className="corp-actions"><button className="corp-btn primary" disabled={busy || (mode === 'text' && text.trim().length < 20) || (mode === 'import' && !convId)}>
             {busy ? 'Adding…' : 'Add meeting'}</button></div>
         )}
         <p className="corp-muted corp-small">{unitId ? 'Only members of this team will see it.' : 'Only you will see it.'} Summary, decisions and commitments are pulled out automatically.</p>

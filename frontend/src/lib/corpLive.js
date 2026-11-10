@@ -50,5 +50,26 @@ export function onCorpEvent(msg) {
   window.dispatchEvent(new CustomEvent('tl:corp', { detail: msg }));
 }
 
+// "I'm active on the website": while a visible tab has been used in the last
+// 2 minutes, the server skips phone pushes for work messages (like Teams).
+let lastInput = Date.now();
+export function startPresence() {
+  const mark = () => { lastInput = Date.now(); };
+  const ping = () => {
+    if (document.visibilityState !== 'visible' || Date.now() - lastInput > 120000) return;
+    api('/corp/presence', { method: 'POST' }).catch(() => {});
+  };
+  const onVisible = () => { if (document.visibilityState === 'visible') { mark(); ping(); } };
+  ['mousemove', 'keydown', 'touchstart', 'scroll'].forEach((e) => window.addEventListener(e, mark, { passive: true }));
+  document.addEventListener('visibilitychange', onVisible);
+  ping();
+  const t = setInterval(ping, 60000);
+  return () => {
+    clearInterval(t);
+    ['mousemove', 'keydown', 'touchstart', 'scroll'].forEach((e) => window.removeEventListener(e, mark));
+    document.removeEventListener('visibilitychange', onVisible);
+  };
+}
+
 export const desktopAlertsState = () => (typeof Notification === 'undefined' ? 'unsupported' : Notification.permission);
 export const askDesktopAlerts = () => (typeof Notification === 'undefined' ? Promise.resolve('unsupported') : Notification.requestPermission());

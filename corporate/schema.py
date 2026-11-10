@@ -223,6 +223,13 @@ CREATE TABLE IF NOT EXISTS corp.work_notes (
 );
 CREATE TABLE IF NOT EXISTS corp.job_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
+-- "Active on the website" (pinged by open, visible tabs): phone pushes for work
+-- messages are skipped while it's in the future -- the person already sees them.
+CREATE TABLE IF NOT EXISTS corp.presence (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    active_until TIMESTAMPTZ NOT NULL
+);
+
 -- Suspended members keep their place and history but can't open the organisation.
 ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'suspended'));

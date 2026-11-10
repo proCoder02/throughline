@@ -3,12 +3,14 @@
 // tab is in the background, and the unread count in the tab title.
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { refreshUnread, useCorpUnread } from '../lib/corpLive.js';
+import { refreshUnread, startPresence, useCorpUnread } from '../lib/corpLive.js';
 
 export default function CorpAlerts() {
   const navigate = useNavigate();
   const { total } = useCorpUnread();
   const [toast, setToast] = useState(null);
+
+  useEffect(startPresence, []);
 
   useEffect(() => {
     refreshUnread();
