@@ -2,8 +2,7 @@
 call_llm(messages) -> str, so the rest of Corporate never knows which
 provider is behind it.
 
-  with_groq_fallback(call_llm)  people-facing work: Ollama Cloud first, Groq when it fails
-                                (out of credit, rate limited, down)
+  with_groq_fallback(call_llm)  people-facing work: as is (failover is in the llm/ package)
   background(call_llm)          background jobs: the self-hosted model (LOCAL_LLM_URL)
                                 first, then the people-facing chain
 
@@ -55,9 +54,9 @@ def _chain(*fns):
 
 
 def with_groq_fallback(call_llm):
-    if os.getenv("CORPORATE_GROQ_FALLBACK", "true").lower() == "false" or not os.getenv("GROQ_API_KEY"):
-        return call_llm
-    return _chain(call_llm, groq_chat)
+    """Kept for callers: provider failover (Ollama, OpenRouter, Groq) now lives in
+    the llm/ package, which app.py's call_llm already uses -- no second chain here."""
+    return call_llm
 
 
 def background(call_llm):

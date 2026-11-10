@@ -45,11 +45,10 @@ if not DB_URL:
     raise SystemExit("DATABASE_URL is required")
 
 
-def call_llm(messages: list[dict]) -> str:
+def _ollama_post(payload: dict) -> dict:
     api_key = os.getenv("OLLAMA_API_KEY") or os.getenv("olama_api_key")
     if not api_key:
         raise RuntimeError("Missing Ollama API key")
-    payload = {"model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"), "messages": messages, "stream": False}
     response = requests.post(
         "https://ollama.com/api/chat",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -57,7 +56,18 @@ def call_llm(messages: list[dict]) -> str:
         timeout=180,
     )
     response.raise_for_status()
-    return response.json().get("message", {}).get("content", "")
+    return response.json()
+
+
+def call_llm(messages: list[dict]) -> str:
+    """Through the llm/ package (Ollama, OpenRouter, Groq -- the next one answers if
+    one fails), like app.py -- so this keeps working when Ollama is out of credit."""
+    try:
+        import llm
+        return llm.chat(messages, ollama_post=_ollama_post).get("content", "")
+    except ImportError:
+        return _ollama_post({"model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"), "messages": messages,
+                             "stream": False}).get("message", {}).get("content", "")
 
 
 def fetch_subject_persona(cur, subject_name: str, question: str | None = None) -> dict:

@@ -1,4 +1,4 @@
-
+﻿
 import os
 import re
 import io
@@ -49,7 +49,7 @@ import chat_followup
 import chat_summary
 import mail_sent_box
 import legal
-import llm_gateway
+import llm
 import storage as storage_module
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
@@ -1834,8 +1834,8 @@ def call_llm(messages):
         # this just needs to be generous enough for genuine long content.
         "options": {"repeat_penalty": 1.3, "num_predict": 6000},
     }
-    # llm_gateway picks the provider (OpenRouter first when configured, Ollama Cloud as fallback).
-    return llm_gateway.chat(messages, ollama_post=_post_ollama_chat, ollama_options=payload["options"])["content"]
+    # The llm/ package picks the provider (Ollama, then OpenRouter, then Groq -- skipping any that recently failed).
+    return llm.chat(messages, ollama_post=_post_ollama_chat, ollama_options=payload["options"])["content"]
 
 
 def call_llm_with_tools(messages, tools):
@@ -1844,7 +1844,7 @@ def call_llm_with_tools(messages, tools):
     tool_calls) instead of just the text, and passes the OpenAI-style
     `tools` array through. gpt-oss (the default OLLAMA_MODEL) was built
     with native function calling, so no model swap is needed for this."""
-    return llm_gateway.chat(messages, tools=tools, ollama_post=_post_ollama_chat)
+    return llm.chat(messages, tools=tools, ollama_post=_post_ollama_chat)
 
 
 # ---------------------------------------------------------------------------
@@ -2358,7 +2358,6 @@ def _tool_send_email_draft(cur, db, user_id, args):
     if payload.get("ok"):
         payload["_action_card"] = _email_status_card(cur, payload)
     return payload
-
 
 def _email_status_card(cur, payload):
     """Re-shows the email as a resolved card, so the chat displays the real
