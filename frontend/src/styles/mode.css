@@ -1,0 +1,54 @@
+/* Personal / Corporate switch and the one-time chooser. */
+
+.mode-switch {
+  display: flex; gap: 2px; padding: 3px;
+  background: var(--wa-bg-app); border: 1px solid var(--wa-border);
+  border-radius: var(--radius-pill);
+}
+.mode-switch-btn {
+  flex: 1; border: 0; background: transparent; color: var(--wa-text-soft);
+  font: inherit; font-size: var(--text-sm); font-weight: 500;
+  padding: 6px 10px; border-radius: var(--radius-pill); cursor: pointer;
+}
+.mode-switch-btn:hover:not(.active) { color: var(--wa-text); }
+.mode-switch-btn.active { background: var(--wa-accent-solid); color: #fff; }
+.mode-switch-btn:focus-visible { outline: 2px solid var(--wa-accent); outline-offset: 1px; }
+.mode-switch-btn:disabled { cursor: progress; }
+
+.mode-chooser {
+  flex: 1; min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+  padding: var(--space-6) var(--space-4); background: var(--wa-bg-app); color: var(--wa-text);
+}
+.mode-chooser-inner { width: 100%; max-width: 720px; }
+.mode-chooser h1 { font-size: var(--text-3xl); margin: 0 0 var(--space-2); text-align: center; }
+.mode-chooser-sub { color: var(--wa-text-soft); text-align: center; margin: 0 0 var(--space-8); }
+.mode-chooser-options { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+@media (max-width: 600px) { .mode-chooser-options { grid-template-columns: 1fr; } }
+
+.mode-card {
+  position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2);
+  text-align: left; padding: var(--space-6); border-radius: var(--radius-2xl);
+  background: var(--wa-panel); border: 1px solid var(--wa-border); color: var(--wa-text);
+  font: inherit; cursor: pointer; transition: border-color .15s, transform .15s;
+}
+.mode-card:hover { border-color: var(--wa-accent); transform: translateY(-1px); }
+.mode-card:focus-visible { outline: 2px solid var(--wa-accent); outline-offset: 2px; }
+.mode-card.current { border-color: var(--wa-accent-dark); }
+.mode-card-icon {
+  width: 44px; height: 44px; border-radius: var(--radius-xl); display: grid; place-items: center;
+  background: color-mix(in srgb, var(--wa-accent) 16%, transparent); color: var(--wa-accent);
+}
+.mode-card-icon svg { width: 24px; height: 24px; }
+.mode-card-title { font-size: var(--text-xl); font-weight: 600; }
+.mode-card-text { font-size: var(--text-sm); color: var(--wa-text-soft); line-height: 1.5; }
+.mode-card-badge {
+  position: absolute; top: var(--space-4); right: var(--space-4);
+  font-size: var(--text-2xs); color: var(--wa-accent); border: 1px solid currentColor;
+  border-radius: var(--radius-pill); padding: 1px 8px;
+}
+
+/* In the Personal "os" sidebar, under the logo. The sidebar shrinks to an
+   icon column under 1000px, too narrow for two labels. */
+.tl-os .os-mode-switch { margin: -14px 4px 18px; }
+@media (max-width: 1000px) { .tl-os .os-mode-switch { display: none; } }
+.mode-badge { margin-left: 6px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--wa-danger); color: #fff; font-size: 11px; font-weight: 700; display: inline-grid; place-items: center; vertical-align: 1px; }

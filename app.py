@@ -49,6 +49,7 @@ import chat_followup
 import chat_summary
 import mail_sent_box
 import legal
+import llm_gateway
 import storage as storage_module
 from ops.dashboard import admin_bp
 from ops.scheduler import custom_job_scheduler
@@ -1830,8 +1831,8 @@ def call_llm(messages):
         # this just needs to be generous enough for genuine long content.
         "options": {"repeat_penalty": 1.3, "num_predict": 6000},
     }
-    result = _post_ollama_chat(payload)
-    return result.get("message", {}).get("content", "")
+    # llm_gateway picks the provider (OpenRouter first when configured, Ollama Cloud as fallback).
+    return llm_gateway.chat(messages, ollama_post=_post_ollama_chat, ollama_options=payload["options"])["content"]
 
 
 def call_llm_with_tools(messages, tools):
@@ -1840,14 +1841,7 @@ def call_llm_with_tools(messages, tools):
     tool_calls) instead of just the text, and passes the OpenAI-style
     `tools` array through. gpt-oss (the default OLLAMA_MODEL) was built
     with native function calling, so no model swap is needed for this."""
-    payload = {
-        "model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"),
-        "messages": messages,
-        "tools": tools,
-        "stream": False,
-    }
-    result = _post_ollama_chat(payload)
-    return result.get("message", {}) or {}
+    return llm_gateway.chat(messages, tools=tools, ollama_post=_post_ollama_chat)
 
 
 # ---------------------------------------------------------------------------
@@ -3026,7 +3020,9 @@ def run_agent_tool_loop(cur, db, user_id, messages):
                 tool_activity.append(activity)
             mail_sources.extend(result.pop("_mail_sources", None) or [])
 
-            messages.append({"role": "tool", "content": json.dumps(result)})
+            # tool_call_id: OpenAI-style providers (OpenRouter, Groq) match each result to its call.
+            messages.append({"role": "tool", "content": json.dumps(result),
+                             **({"tool_call_id": call["id"]} if call.get("id") else {})})
 
     # Ran out of turns (or got an empty answer). A bare call_llm on a transcript ending in tool
     # results came back EMPTY (confirmed live: flight-spend questions that
@@ -9184,10 +9180,13 @@ def _public_base_url():
     return base
 
 
+# Features add (cur, user_id) callables here to run just before an account is deleted.
+_account_delete_hooks = []
+
 app.register_blueprint(legal.create_legal_blueprint(
     get_db=get_db, dict_cursor=dict_cursor, login_required=login_required, current_user_id=current_user_id,
     check_password_hash=check_password_hash, redis_client=redis_client, storage=storage_module,
-    send_plain_email=send_plain_email,
+    send_plain_email=send_plain_email, before_delete=_account_delete_hooks,
 ))
 
 from password_reset import create_password_reset_blueprint
@@ -9209,6 +9208,30 @@ try:
         print("[meet] enabled")
 except Exception as e:
     print(f"[meet] not registered: {e!r}")
+
+
+# Throughline Corporate (corporate/) -- organisations, departments, teams,
+# invitations. Self-contained, off unless CORPORATE_ENABLED=true.
+try:
+    from corporate import create_corporate_blueprint, is_enabled as _corporate_enabled
+    from corporate import llm as _corp_llm
+    if _corporate_enabled():
+        app.register_blueprint(create_corporate_blueprint(
+            get_db=get_db, dict_cursor=dict_cursor, login_required=login_required,
+            current_user_id=current_user_id, send_plain_email=send_plain_email,
+            public_base_url=_public_base_url, call_llm=_corp_llm.with_groq_fallback(call_llm), transcribe=transcribe_audio_bytes,
+            push=send_fcm_to_user, spawn=_spawn_background, get_raw_connection=get_raw_connection,
+            release_raw_connection=release_raw_connection, live=push_notification,
+        ))
+        from corporate.orgs import hand_over as _corp_hand_over
+        _account_delete_hooks.append(_corp_hand_over)
+        if os.getenv("CORPORATE_JOBS", "true").strip().lower() != "false":
+            from corporate import jobs as _corp_jobs
+            _corp_jobs.start(get_raw_connection, release_raw_connection, dict_cursor, _corp_llm.background(call_llm),
+                             push=send_fcm_to_user, spawn=_spawn_background)
+        print("[corporate] enabled")
+except Exception as e:
+    print(f"[corporate] not registered: {e!r}")
 
 
 # Under a WSGI server (gunicorn etc.) this module is imported, not run as

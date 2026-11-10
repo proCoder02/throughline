@@ -77,3 +77,5 @@ export const EyeOffIcon = (props) => <svg {...base} {...props}><path d="M3 3l18 
 export const ShareIcon = (props) => <svg {...base} {...props}><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="M8.2 10.8l7.6-4.4M8.2 13.2l7.6 4.4"/></svg>;
 export const ChartIcon = (props) => <svg {...base} {...props}><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>;
 export const RetryIcon =(props) => <svg {...base} {...props}><path d="M3 12a9 9 0 0115.5-6.2L21 8M21 3v5h-5M21 12a9 9 0 01-15.5 6.2L3 16M3 21v-5h5"/></svg>;
+export const BuildingIcon = (props) => <svg {...base} {...props}><path d="M4 21V5a2 2 0 012-2h8a2 2 0 012 2v16M16 9h2a2 2 0 012 2v10M2 21h20"/><path d="M8 7h4M8 11h4M8 15h4"/></svg>;
+export const OrgTreeIcon = (props) => <svg {...base} {...props}><rect x="9" y="3" width="6" height="5" rx="1"/><rect x="2" y="16" width="6" height="5" rx="1"/><rect x="16" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M5 16v-4h14v4"/></svg>;

@@ -5,6 +5,7 @@ import {
   HomeIcon, MeetIcon, ChatIcon, TaskIcon, ProfileIcon, FriendIcon, SettingsIcon, ClockIcon, CloseIcon,
 } from '../icons.jsx';
 import { NAV_ITEMS } from '../lib/nav.js';
+import ModeSwitch from './ModeSwitch.jsx';
 
 const ICONS = { home: HomeIcon, chats: ChatIcon, tasks: TaskIcon, friends: FriendIcon, profiles: ProfileIcon, meet: MeetIcon, settings: SettingsIcon };
 
@@ -54,6 +55,7 @@ export default function AppDrawer({ open, onClose, active, notify, onOpenConvers
               {badge > 0 && <span className="app-drawer-badge">{badge > 9 ? '9+' : badge}</span>}
             </button>
           ))}
+          <ModeSwitch current="personal" variant="drawer" onDone={onClose} />
         </div>
 
         <div className="app-drawer-section-title">

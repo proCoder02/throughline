@@ -8,6 +8,7 @@ import DirectMessageThread from '../components/DirectMessageThread.jsx';
 import Avatar from '../components/Avatar.jsx';
 import PhotoViewer from '../components/PhotoViewer.jsx';
 import MailSettingsCard from '../components/MailSettingsCard.jsx';
+import ModeSwitch from '../components/ModeSwitch.jsx';
 import AssistantChat from '../components/assistant/AssistantChat.jsx';
 import DeleteAccountCard, { LegalLinks } from '../components/DeleteAccountCard.jsx';
 import EmailSourceLink from '../components/EmailSourceLink.jsx';
@@ -527,6 +528,7 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme, personaP
             <div className="logo-mark">T</div>
             <div className="logo-text">Throughline</div>
           </div>
+          <div className="os-mode-switch"><ModeSwitch current="personal" /></div>
 
           <nav aria-label="Main">
             <div className="nav-section">

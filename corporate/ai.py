@@ -1,0 +1,139 @@
+"""Every AI prompt Corporate uses, in one place. Prompts are short and every
+input is capped, to keep token use low. call_llm(messages) -> str is handed
+in by the host app."""
+from __future__ import annotations
+
+import json
+import os
+import re
+from datetime import date
+
+TRANSCRIPT_CAP = 16000
+EVIDENCE_CAP = 5000
+DISCUSSION_CAP = 10000
+ASK_CAP = 12000
+
+
+def parse_json(text):
+    m = re.search(r"\{.*\}", text or "", re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except ValueError:
+        return None
+
+
+class AIUnavailable(Exception):
+    """The AI service itself failed (down, out of credit, rate limited) --
+    different from a reply we couldn't read. Callers tell the user plainly
+    instead of saving empty results."""
+
+    def __init__(self, cause):
+        text = str(cause)
+        if "402" in text or "Payment Required" in text:
+            msg = "The AI service has reached its usage limit. Please try again later."
+        elif "429" in text:
+            msg = "The AI service is busy. Please try again in a minute."
+        else:
+            msg = "The AI service isn't reachable right now. Please try again later."
+        super().__init__(msg)
+        self.cause = text[:300]
+
+
+def _call(call_llm, messages) -> str:
+    try:
+        return call_llm(messages) or ""
+    except AIUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise AIUnavailable(e) from e
+
+
+def _collect(task: str, messages: list, raw: str) -> None:
+    """Training examples for the self-hosted model (ml/README.md): when
+    CORPORATE_COLLECT_DIR is set, every answer that parsed is saved as one JSONL
+    line per task. Off by default; only ever enable it on test data."""
+    folder = os.getenv("CORPORATE_COLLECT_DIR")
+    if not folder:
+        return
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, f"{task}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"messages": messages + [{"role": "assistant", "content": raw.strip()}]}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _ask(call_llm, system: str, user: str, task: str = "other"):
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    raw = _call(call_llm, messages)
+    out = parse_json(raw)
+    if out is not None:
+        _collect(task, messages, raw)
+    return out
+
+
+def clip(text: str, cap: int) -> str:
+    text = text or ""
+    return text if len(text) <= cap else text[: cap // 3] + "\n...\n" + text[-(cap * 2 // 3):]
+
+
+EXTRACT_SYS = (
+    "Extract from a work discussion. JSON only: "
+    '{"summary":"<=4 sentences","decisions":[{"title":"<=8 words","text":"","made_by":null,"quote":"","updates_id":null}],'
+    '"commitments":[{"text":"","owner":null,"owed_to":null,"due":null,"quote":""}],'
+    '"blockers":[{"text":"","quote":""}]}. '
+    "Only explicit items. due = YYYY-MM-DD from today's date, or null. owner/owed_to = names as said, or null. "
+    "updates_id = id of an existing decision this one changes, else null. quote = short exact words. Empty lists if none."
+)
+
+
+def extract(call_llm, text: str, people: list, decisions: list, summary: bool = True):
+    known = ", ".join(people) or "unknown"
+    existing = "\n".join(f"[{d['id']}] {d['title']}: {d['text'][:160]}" for d in decisions[:30]) or "none"
+    sys = EXTRACT_SYS if summary else EXTRACT_SYS.replace('"summary":"<=4 sentences",', "")
+    out = _ask(call_llm, sys, f"Today: {date.today().isoformat()}\nPeople: {known}\nExisting decisions:\n{existing}\n\n"
+                              f"Discussion:\n{clip(text, TRANSCRIPT_CAP)}", task="extract")
+    out = out if isinstance(out, dict) else {}
+    return {k: out.get(k) if isinstance(out.get(k), list) else [] for k in ("decisions", "commitments", "blockers")} | {
+        "summary": str(out.get("summary") or "")[:1500]}
+
+
+def evidence(call_llm, commitment: str, owner: str, activity: str):
+    out = _ask(call_llm,
+               'Did the new activity show this commitment was fulfilled? JSON only: {"done":true|false,"quote":"exact words or empty"}. '
+               "Say done only on clear evidence.",
+               f"Commitment ({owner or 'unknown owner'}): {commitment}\n\nNew activity:\n{clip(activity, EVIDENCE_CAP)}", task="evidence")
+    return bool(out and out.get("done") is True), str((out or {}).get("quote") or "")[:400]
+
+
+def radar(call_llm, blocker: str, candidates: list):
+    lines = "\n".join(f"[{c['id']}] {c['text'][:200]} (due {c['due_date']})" for c in candidates[:25])
+    out = _ask(call_llm,
+               'Which commitments could this blocker delay? JSON only: {"ids":[ids],"why":"one short sentence"}. '
+               "Only clear links on the same work item.",
+               f"Blocker: {blocker}\n\nCommitments:\n{lines}", task="radar")
+    ids = [i for i in (out or {}).get("ids") or [] if isinstance(i, int)]
+    return ids, str((out or {}).get("why") or "")[:300]
+
+
+def common_ground(call_llm, discussion: str, notes: list):
+    extra = ("\nWork notes the participants chose to share:\n" + "\n".join(notes)) if notes else ""
+    out = _ask(call_llm,
+               "Help a work group reach common ground. Use only what was said (and shared notes). Neutral, no judging people. "
+               'JSON only: {"positions":[{"name":"","position":"<=15 words"}],"agreed":["..."],"open":["..."],"options":["..."]}',
+               f"Discussion:\n{clip(discussion, DISCUSSION_CAP)}{extra}", task="common_ground")
+    if not isinstance(out, dict):
+        return None
+    return {k: [x for x in (out.get(k) or []) if x][:8] for k in ("positions", "agreed", "open", "options")}
+
+
+def answer(call_llm, question: str, sources: str):
+    text = _call(call_llm, [
+        {"role": "system", "content": "Answer a work question only from the sources. Cite like [M3], [D2], [C5], [T7]. "
+                                      "If the sources don't say, reply that you don't have that yet. Be brief, plain text."},
+        {"role": "user", "content": f"Sources:\n{clip(sources, ASK_CAP)}\n\nQuestion: {question}"},
+    ]).strip()
+    # Models sometimes cite with full-width brackets or add markdown bold.
+    return re.sub(r"[【［]([MDCT]\d+)[】］]", r"[\1]", text).replace("**", "")

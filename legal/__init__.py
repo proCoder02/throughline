@@ -194,7 +194,10 @@ def _note_failure(key) -> None:
 # --------------------------------------------------------------- blueprint
 
 def create_legal_blueprint(*, get_db, dict_cursor, login_required, current_user_id, check_password_hash,
-                           redis_client=None, storage=None, send_plain_email=None):
+                           redis_client=None, storage=None, send_plain_email=None, before_delete=None):
+    """before_delete: callables (cur, user_id) run in the same transaction just
+    before the account's rows are deleted -- e.g. Corporate handing over
+    ownership of organisations. A list, so features can add to it later."""
     bp = Blueprint("legal", __name__, template_folder="templates")
 
     @bp.route("/privacy")
@@ -261,6 +264,8 @@ def create_legal_blueprint(*, get_db, dict_cursor, login_required, current_user_
 
         user_id, email, username = row["id"], row["email"], row["username"]
         try:
+            for hook in (before_delete or []):
+                hook(cur, user_id)
             counts = delete_account_data(cur, db, user_id)
         except Exception as e:
             db.rollback()

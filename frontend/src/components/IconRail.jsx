@@ -1,6 +1,7 @@
 import Avatar from './Avatar.jsx';
 import { HomeIcon, ChatIcon, TaskIcon, ProfileIcon, FriendIcon, MeetIcon, SettingsIcon } from '../icons.jsx';
 import { NAV_ITEMS } from '../lib/nav.js';
+import ModeSwitch from './ModeSwitch.jsx';
 
 const ICONS = { home: HomeIcon, chats: ChatIcon, tasks: TaskIcon, friends: FriendIcon, profiles: ProfileIcon, meet: MeetIcon };
 // Desktop's Home is the full "os" screen (see lib/nav.js homePath).
@@ -29,6 +30,7 @@ export default function IconRail({ active, onSelect, username, profilePictureUrl
         );
       })}
       <div className="rail-spacer" />
+      <ModeSwitch current="personal" variant="rail" />
       <button
         className={'rail-btn' + (active === 'settings' ? ' active' : '')}
         title="Settings"

@@ -4,6 +4,7 @@ import App from './App.jsx';
 import ChatsSection from './components/ChatsSection.jsx';
 import HomeSection from './components/HomeSection.jsx';
 import { PHONE_BREAKPOINT_PX } from './hooks/useIsPhone.js';
+import { cachedMode, modeHome } from './lib/mode.js';
 
 // Phase 1 of the frontend rewrite (see the approved plan): map every route
 // 1:1 to today's five sections with zero visual/behavioral change. Route
@@ -49,6 +50,10 @@ const SettingsSection = lazy(() => import('./components/SettingsSection.jsx'));
 const OsApp = lazy(() => import('./os/OsApp.jsx'));
 // Throughline Meet (QR on the web) -- self-contained in features/meet/.
 const MeetPage = lazy(() => import('./features/meet/MeetPage.jsx'));
+// Throughline Corporate -- self-contained in features/corporate/, its own
+// screen layout under /app/corp. The Personal side above is untouched.
+const CorporateApp = lazy(() => import('./features/corporate/CorporateApp.jsx'));
+const ModeChooser = lazy(() => import('./components/ModeChooser.jsx'));
 
 // Same fallback markup App.jsx's old shared <Suspense> used, per-route now
 // instead of one boundary wrapping all four -- no observable difference
@@ -136,12 +141,33 @@ function DefaultRedirect() {
   const navigate = useNavigate();
   useEffect(() => {
     const isPhone = window.innerWidth < PHONE_BREAKPOINT_PX;
+    // Personal or Corporate (lib/mode.js): the side last used on this
+    // device; a device that has never picked gets the chooser once.
+    const mode = cachedMode();
     // Keeps the query string -- the Outlook OAuth callback lands on
     // /app?outlook=connected and App.jsx reads it after this redirect.
-    navigate((isPhone ? '/app/home' : '/app/os') + window.location.search, { replace: true });
+    navigate((mode ? modeHome(mode, isPhone) : '/app/choose') + window.location.search, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return null;
+}
+
+function CorpRoute() {
+  const { auth } = useOutletContext();
+  return (
+    <Suspense fallback={LAZY_FALLBACK}>
+      <CorporateApp auth={auth} />
+    </Suspense>
+  );
+}
+
+function ChooseRoute() {
+  const { auth } = useOutletContext();
+  return (
+    <Suspense fallback={LAZY_FALLBACK}>
+      <ModeChooser username={auth.user.username} />
+    </Suspense>
+  );
 }
 
 function OsRoute() {
@@ -171,6 +197,8 @@ export const router = createBrowserRouter([
       // linked to. A single route object keeps OsApp mounted across them.
       { path: 'os/*', element: <OsRoute /> },
       { path: 'meet', element: <Suspense fallback={LAZY_FALLBACK}><MeetPage /></Suspense> },
+      { path: 'corp/*', element: <CorpRoute /> },
+      { path: 'choose', element: <ChooseRoute /> },
       // Anything unrecognized under /app (including a stale bookmark to a
       // future IA path not built yet) falls back to the default section
       // rather than a blank/error screen.

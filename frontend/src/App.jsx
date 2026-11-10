@@ -19,6 +19,7 @@ import { MenuIcon } from './icons.jsx';
 import { SECTION_TITLES } from './lib/nav.js';
 import { ensureRecordingNotice, resetConsentCache } from './lib/consent.js';
 import ConsentHost from './components/ConsentHost.jsx';
+import CorpAlerts from './components/CorpAlerts.jsx';
 
 // "Skip for now" on the onboarding questions is remembered per account on
 // this device, so it isn't shown again on every visit -- the Home screens
@@ -192,6 +193,9 @@ export default function App() {
   // (active/onSelect) are otherwise completely unchanged. Strips the /app
   // prefix (see router.jsx for why every client route lives under it).
   const section = location.pathname.replace(/^\/app\/?/, '').split('/')[0] || 'os';
+  // Corporate (features/corporate/) and the Personal/Corporate chooser draw
+  // their own whole screen -- no Personal rail, drawer or top bar there.
+  const ownScreen = section === 'corp' || section === 'choose';
 
   return (
     <div className="app-shell">
@@ -201,7 +205,7 @@ export default function App() {
           IconRail, completely unchanged -- the "os" screen renders its own
           full sidebar there (see os/OsApp.jsx), so IconRail stays hidden
           for it same as before. */}
-      {isPhone ? (
+      {ownScreen ? null : isPhone ? (
         <>
           <div className="phone-topbar">
             <button onClick={() => setDrawerOpen(true)} aria-label="Open menu" aria-haspopup="true">
@@ -254,6 +258,7 @@ export default function App() {
         onEnableAudio={call.enableAudio}
       />
       <NotificationHost />
+      <CorpAlerts />
       <ConsentHost key={userId} onLogout={auth.logout} />
       {personaOpen && (
         <div className="persona-overlay">
