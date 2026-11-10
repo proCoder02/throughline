@@ -4,7 +4,7 @@
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import ModeSwitch from '../../components/ModeSwitch.jsx';
 import Avatar from '../../components/Avatar.jsx';
-import { BuildingIcon, ChatIcon, CheckIcon, FriendIcon, HomeIcon, MicIcon, OrgTreeIcon, PlusIcon, SearchIcon, TaskIcon } from '../../icons.jsx';
+import { BuildingIcon, ChatIcon, CheckIcon, FriendIcon, HomeIcon, MicIcon, OrgTreeIcon, PlusIcon, SearchIcon, SettingsIcon, TaskIcon } from '../../icons.jsx';
 import { useCorpOrg } from './useCorpOrg.js';
 import { askDesktopAlerts, desktopAlertsState, useCorpUnread } from '../../lib/corpLive.js';
 import { useState } from 'react';
@@ -19,10 +19,11 @@ import MeetingsPage, { MeetingDetail } from './pages/MeetingsPage.jsx';
 import CommitmentsPage from './pages/CommitmentsPage.jsx';
 import DecisionsPage from './pages/DecisionsPage.jsx';
 import AskPage from './pages/AskPage.jsx';
+import SettingsPage from './pages/SettingsPage.jsx';
 import './corporate.css';
 
 const NAV = [
-  { to: '/app/corp', label: 'Overview', Icon: HomeIcon, end: true },
+  { to: '/app/corp', label: 'Home', Icon: HomeIcon, end: true },
   { to: '/app/corp/messages', label: 'Messages', Icon: ChatIcon },
   { to: '/app/corp/meetings', label: 'Meetings', Icon: MicIcon },
   { to: '/app/corp/commitments', label: 'Commitments', Icon: TaskIcon },
@@ -30,6 +31,7 @@ const NAV = [
   { to: '/app/corp/ask', label: 'Ask', Icon: SearchIcon },
   { to: '/app/corp/structure', label: 'Structure', Icon: OrgTreeIcon },
   { to: '/app/corp/people', label: 'People', Icon: FriendIcon },
+  { to: '/app/corp/settings', label: 'Settings', Icon: SettingsIcon },
 ];
 
 function Unavailable() {
@@ -87,7 +89,8 @@ export default function CorporateApp({ auth }) {
   } else {
     body = (
       <Routes>
-        <Route index element={<OverviewPage corp={corp} />} />
+        <Route index element={<OverviewPage corp={corp} user={user} />} />
+        <Route path="settings" element={<SettingsPage corp={corp} />} />
         <Route path="structure" element={<StructurePage corp={corp} user={user} />} />
         <Route path="people" element={<PeoplePage corp={corp} user={user} />} />
         <Route path="messages" element={<MessagesPage corp={corp} user={user} />} />
