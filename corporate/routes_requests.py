@@ -169,7 +169,17 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
         if row["supports_id"]:
             p = access.one(cur, "commitments", access.commitments(), row["supports_id"], ctx.user_id, org_id)
             parent = {"id": p["id"], "text": p["text"], "due_date": p["due_date"].isoformat() if p["due_date"] else None} if p else {"hidden": True}
-        return jsonify({"updates": ups, "supporting": kids, "supports": parent})
+        # One thread: what happened (events) and what people wrote (notes), oldest first.
+        # Events that only mirror a note (update/blocker/unblocked) are left out -- the note is the record.
+        cur.execute("SELECT e.kind, e.detail, e.at, us.username AS actor FROM corp.commitment_events e "
+                    "LEFT JOIN users us ON us.id = e.actor_id WHERE e.commitment_id = %s "
+                    "AND e.kind NOT IN ('update', 'blocker', 'unblocked') ORDER BY e.id", (cid,))
+        thread = [{"type": "event", "kind": r["kind"], "detail": r["detail"], "actor": r["actor"], "at": r["at"].isoformat()}
+                  for r in cur.fetchall()]
+        thread += [{"type": "note", "kind": u["kind"], "text": u["text"], "actor": u["author"], "at": u["created_at"]} for u in ups]
+        thread.sort(key=lambda x: x["at"])
+        return jsonify({"updates": ups, "supporting": kids, "supports": parent, "thread": thread,
+                        "closed": row["status"] in ("done", "dropped", "declined")})
 
     @bp.route(P + "/commitments/<int:cid>/updates", methods=["POST"])
     @login_required

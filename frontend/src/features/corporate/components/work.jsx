@@ -37,8 +37,7 @@ export function UnitSelect({ corp, value, onChange, allowNone, label = 'Team' })
 export function CommitmentRow({ corp, c, onChanged }) {
   const orgId = corp.data.org.id;
   const [busy, setBusy] = useState(false);
-  const [history, setHistory] = useState(null);
-  const [showUpdates, setShowUpdates] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
   const act = async (action, data) => {
     setBusy(true);
     try { await corpApi.commitmentAction(orgId, c.id, action, data); onChanged?.(); }
@@ -48,10 +47,6 @@ export function CommitmentRow({ corp, c, onChanged }) {
   const done = () => { const note = window.prompt('How was it done? (optional)', ''); if (note !== null) act('done', { note }); };
   const drop = () => { const reason = window.prompt('Why is it dropped?', ''); if (reason) act('drop', { reason }); };
   const due = () => { const v = window.prompt('New due date (YYYY-MM-DD)', c.due_date || ''); if (v !== null) act('edit', { due_date: v || null }); };
-  const toggleHistory = async () => {
-    if (history) { setHistory(null); return; }
-    try { setHistory((await corpApi.commitment(orgId, c.id)).history); } catch (e) { showToast(e.message, 'error'); }
-  };
   const live = ['detected', 'open', 'overdue'].includes(c.status);
   return (
     <li className="corp-commit">
@@ -65,11 +60,6 @@ export function CommitmentRow({ corp, c, onChanged }) {
         {c.risk_note && <div className="corp-risk">At risk: {c.risk_note}</div>}
         {c.evidence && <div className="corp-evidence">✓ {c.evidence}</div>}
         {c.quote && !c.evidence && <div className="corp-quote">“{c.quote}”</div>}
-        {history && (
-          <ol className="corp-history">
-            {history.map((h, i) => <li key={i}>{fmtDate(h.at)} · {h.kind}{h.actor ? ` by ${h.actor}` : ''}{h.detail?.reason ? `: ${h.detail.reason}` : ''}{h.detail?.due_date ? ` → ${fmtDate(h.detail.due_date)}` : ''}</li>)}
-          </ol>
-        )}
       </div>
       <StatusChip status={c.status} atRisk={c.at_risk || !!c.risk_note} />
       <div className="corp-commit-actions">
@@ -79,11 +69,10 @@ export function CommitmentRow({ corp, c, onChanged }) {
         {c.can_change && (live || c.status === 'requested') && (
           <button className="corp-btn small" disabled={busy} onClick={drop}>{c.status === 'requested' ? 'Withdraw' : 'Drop'}</button>)}
         {c.can_change && ['done', 'dropped'].includes(c.status) && <button className="corp-btn small" disabled={busy} onClick={() => act('reopen')}>Reopen</button>}
-        <button className="corp-link" onClick={() => setShowUpdates((v) => !v)}>
-          {showUpdates ? 'Hide updates' : c.supporting_count > 0 ? `Updates · depends on ${c.supporting_count}` : 'Updates'}</button>
-        <button className="corp-link" onClick={toggleHistory}>{history ? 'Hide history' : 'History'}</button>
+        <button className="corp-link act-toggle" aria-expanded={showActivity} onClick={() => setShowActivity((v) => !v)}>
+          {showActivity ? 'Hide activity' : c.supporting_count > 0 ? `Activity · depends on ${c.supporting_count}` : 'Activity'}</button>
       </div>
-      {showUpdates && <div className="corp-commit-updates"><Suspense fallback={null}><Updates corp={corp} c={c} onChanged={onChanged} /></Suspense></div>}
+      {showActivity && <div className="corp-commit-updates"><Suspense fallback={null}><Updates corp={corp} c={c} onChanged={onChanged} /></Suspense></div>}
     </li>
   );
 }
