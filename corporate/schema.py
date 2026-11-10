@@ -230,6 +230,69 @@ CREATE TABLE IF NOT EXISTS corp.presence (
     active_until TIMESTAMPTZ NOT NULL
 );
 
+-- ---- Projects, external contacts, cross-team requests (iteration 3)
+
+CREATE TABLE IF NOT EXISTS corp.projects (
+    id SERIAL PRIMARY KEY,
+    org_id INTEGER NOT NULL REFERENCES corp.orgs (id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    client TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    start_date DATE,
+    end_date DATE,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'on_hold', 'closed')),
+    created_by INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Who can see a project: its members only (lead = can edit it).
+CREATE TABLE IF NOT EXISTS corp.project_members (
+    project_id INTEGER NOT NULL REFERENCES corp.projects (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('lead', 'member')),
+    PRIMARY KEY (project_id, user_id)
+);
+-- People outside the company (client ministry officials, vendor contacts), with
+-- their position and who they report to -- the stakeholder map.
+CREATE TABLE IF NOT EXISTS corp.contacts (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES corp.projects (id) ON DELETE CASCADE,
+    side TEXT NOT NULL DEFAULT 'client' CHECK (side IN ('client', 'vendor', 'partner')),
+    organisation TEXT NOT NULL DEFAULT '',
+    department TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    position TEXT NOT NULL DEFAULT '',
+    reports_to INTEGER REFERENCES corp.contacts (id) ON DELETE SET NULL,
+    email TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_corp_contacts_project ON corp.contacts (project_id);
+
+ALTER TABLE corp.commitments ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES corp.projects (id) ON DELETE SET NULL;
+ALTER TABLE corp.commitments ADD COLUMN IF NOT EXISTS supports_id INTEGER REFERENCES corp.commitments (id) ON DELETE SET NULL;
+ALTER TABLE corp.commitments ADD COLUMN IF NOT EXISTS contact_id INTEGER REFERENCES corp.contacts (id) ON DELETE SET NULL;
+ALTER TABLE corp.commitments ADD COLUMN IF NOT EXISTS requested_by INTEGER REFERENCES users (id) ON DELETE SET NULL;
+ALTER TABLE corp.commitments ADD COLUMN IF NOT EXISTS requested_due DATE;
+ALTER TABLE corp.commitments ADD COLUMN IF NOT EXISTS risk_note TEXT;
+ALTER TABLE corp.commitments DROP CONSTRAINT IF EXISTS commitments_status_check;
+ALTER TABLE corp.commitments ADD CONSTRAINT commitments_status_check
+    CHECK (status IN ('requested', 'detected', 'open', 'overdue', 'done', 'dropped', 'declined'));
+ALTER TABLE corp.commitments DROP CONSTRAINT IF EXISTS commitments_source_type_check;
+ALTER TABLE corp.commitments ADD CONSTRAINT commitments_source_type_check
+    CHECK (source_type IN ('meeting', 'thread', 'manual', 'request'));
+CREATE INDEX IF NOT EXISTS idx_corp_commitments_supports ON corp.commitments (supports_id);
+CREATE INDEX IF NOT EXISTS idx_corp_commitments_project ON corp.commitments (project_id);
+
+-- Progress notes and blockers on one commitment, visible to whoever can see it.
+CREATE TABLE IF NOT EXISTS corp.commitment_updates (
+    id SERIAL PRIMARY KEY,
+    commitment_id INTEGER NOT NULL REFERENCES corp.commitments (id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    kind TEXT NOT NULL DEFAULT 'update' CHECK (kind IN ('update', 'blocker', 'unblocked')),
+    text TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Suspended members keep their place and history but can't open the organisation.
 ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'suspended'));

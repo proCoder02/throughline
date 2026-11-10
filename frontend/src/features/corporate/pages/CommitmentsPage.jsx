@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
 import { CommitmentRow, UnitSelect, myUnits } from '../components/work.jsx';
+import { AskTeam, IncomingRequests } from '../components/Requests.jsx';
 
 function AddCommitment({ corp, onAdded }) {
   const [text, setText] = useState('');
@@ -46,7 +47,9 @@ export default function CommitmentsPage({ corp }) {
     <div className="corp-page">
       <header className="corp-page-head"><div><h1>Commitments</h1>
         <p className="corp-muted">Promises from meetings and chat stay open until there’s evidence they were done.</p></div></header>
+      <IncomingRequests corp={corp} onChanged={load} />
       <AddCommitment corp={corp} onAdded={load} />
+      <section className="corp-card"><h2>Ask another team</h2><AskTeam corp={corp} onSent={load} /></section>
       <section className="corp-card">
         <div className="corp-inline wrap">
           <div className="corp-seg" role="group" aria-label="Show">

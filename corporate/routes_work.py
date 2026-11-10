@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from flask import jsonify, request
 
-from . import access, chat, insights, ledger, meetings, orgs
+from . import access, chat, deps, insights, ledger, meetings, orgs
 from .errors import CorpError
 from .roles import can_manage_people
 
@@ -264,6 +264,9 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
         extra = {"mine": " AND x.owner_id = %(me)s", "owed": " AND x.owed_to_id = %(me)s",
                  "team": " AND x.unit_id = %(unit)s" if p["unit"] else ""}.get(scope, "")
         cur.execute("SELECT x.*, COALESCE(o.username, x.owner_name) AS owner, COALESCE(w.username, x.owed_to_name) AS owed_to, "
+                    "(SELECT name FROM corp.contacts ct WHERE ct.id = x.contact_id) AS contact_name, "
+                    "(SELECT name FROM corp.projects pj WHERE pj.id = x.project_id) AS project_name, "
+                    "(SELECT count(*) FROM corp.commitments k WHERE k.supports_id = x.id) AS supporting_count, "
                     "un.name AS unit_name, EXISTS (SELECT 1 FROM corp.risks r WHERE r.commitment_id = x.id AND r.resolved_at IS NULL) AS at_risk "
                     "FROM corp.commitments x LEFT JOIN users o ON o.id = x.owner_id LEFT JOIN users w ON w.id = x.owed_to_id "
                     f"LEFT JOIN corp.units un ON un.id = x.unit_id WHERE x.org_id = %(org)s AND {access.commitments()}{extra} "
@@ -289,6 +292,13 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
                 raise CorpError(400, "People must be in the organisation.")
         cid = ledger.add_commitment(cur, org_id, unit_id, text, owner_id=owner, owed_to_id=owed, due=d.get("due_date"),
                                     status="open", actor_id=ctx.user_id)
+        # Optional: part of a project, owed to an outside contact (e.g. the client), or supporting another commitment.
+        extra = {k: int(d[k]) for k in ("project_id", "contact_id", "supports_id") if d.get(k)}
+        if extra.get("supports_id") and not access.one(cur, "commitments", access.commitments(), extra["supports_id"], ctx.user_id, org_id):
+            raise CorpError(404, "Commitment not found.")
+        if extra:
+            cur.execute(f"UPDATE corp.commitments SET {', '.join(f'{k} = %s' for k in extra)} WHERE id = %s", (*extra.values(), cid))
+            deps.evaluate(cur, extra.get("supports_id"), push, ctx.user_id)
         conn.commit()
         return jsonify({"id": cid}), 201
 
@@ -319,6 +329,9 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
         if action == "edit" and d.get("owner_id") and not orgs.member_role(cur, org_id, int(d["owner_id"])):
             raise CorpError(400, "The owner must be in the organisation.")
         ledger.apply_action(cur, ctx, row, action, d)
+        # Dependencies: re-check what this supports, and (if its own date moved) what supports it.
+        deps.evaluate(cur, row["supports_id"], push, ctx.user_id)
+        deps.evaluate(cur, cid, push, ctx.user_id)
         if action == "done":
             cur.execute("UPDATE corp.risks SET resolved_at = now() WHERE commitment_id = %s AND resolved_at IS NULL", (cid,))
         conn.commit()

@@ -1,9 +1,11 @@
 // Small pieces shared by the work-memory pages.
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { corpApi } from '../corpApi.js';
+const Updates = lazy(() => import('./Updates.jsx'));
 import { showToast } from '../../../lib/notify.js';
 
-export const STATUS_LABEL = { detected: 'To confirm', open: 'Open', overdue: 'Overdue', done: 'Done', dropped: 'Dropped' };
+export const STATUS_LABEL = { requested: 'Requested', detected: 'To confirm', open: 'Open', overdue: 'Overdue', done: 'Done',
+  dropped: 'Dropped', declined: 'Declined' };
 export const fmtDate = (d) => (d ? new Date(d.length === 10 ? d + 'T00:00:00' : d).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) : '');
 
 export function StatusChip({ status, atRisk }) {
@@ -36,6 +38,7 @@ export function CommitmentRow({ corp, c, onChanged }) {
   const orgId = corp.data.org.id;
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState(null);
+  const [showUpdates, setShowUpdates] = useState(false);
   const act = async (action, data) => {
     setBusy(true);
     try { await corpApi.commitmentAction(orgId, c.id, action, data); onChanged?.(); }
@@ -57,7 +60,9 @@ export function CommitmentRow({ corp, c, onChanged }) {
         <div className="corp-row-sub">
           {c.owner || c.owner_name || 'No owner'}{(c.owed_to || c.owed_to_name) ? ` → ${c.owed_to || c.owed_to_name}` : ''}
           {c.due_date ? ` · due ${fmtDate(c.due_date)}` : ''}{c.unit_name ? ` · ${c.unit_name}` : ''}
+          {c.contact_name ? ` · for ${c.contact_name}` : ''}{c.project_name ? ` · ${c.project_name}` : ''}
         </div>
+        {c.risk_note && <div className="corp-risk">At risk: {c.risk_note}</div>}
         {c.evidence && <div className="corp-evidence">✓ {c.evidence}</div>}
         {c.quote && !c.evidence && <div className="corp-quote">“{c.quote}”</div>}
         {history && (
@@ -66,15 +71,19 @@ export function CommitmentRow({ corp, c, onChanged }) {
           </ol>
         )}
       </div>
-      <StatusChip status={c.status} atRisk={c.at_risk} />
+      <StatusChip status={c.status} atRisk={c.at_risk || !!c.risk_note} />
       <div className="corp-commit-actions">
         {c.can_change && c.status === 'detected' && <button className="corp-btn small primary" disabled={busy} onClick={() => act('confirm')}>Confirm</button>}
         {c.can_change && live && <button className="corp-btn small" disabled={busy} onClick={done}>Done</button>}
         {c.can_change && live && <button className="corp-btn small" disabled={busy} onClick={due}>Due date</button>}
-        {c.can_change && live && <button className="corp-btn small" disabled={busy} onClick={drop}>Drop</button>}
-        {c.can_change && !live && <button className="corp-btn small" disabled={busy} onClick={() => act('reopen')}>Reopen</button>}
+        {c.can_change && (live || c.status === 'requested') && (
+          <button className="corp-btn small" disabled={busy} onClick={drop}>{c.status === 'requested' ? 'Withdraw' : 'Drop'}</button>)}
+        {c.can_change && ['done', 'dropped'].includes(c.status) && <button className="corp-btn small" disabled={busy} onClick={() => act('reopen')}>Reopen</button>}
+        <button className="corp-link" onClick={() => setShowUpdates((v) => !v)}>
+          {showUpdates ? 'Hide updates' : c.supporting_count > 0 ? `Updates · depends on ${c.supporting_count}` : 'Updates'}</button>
         <button className="corp-link" onClick={toggleHistory}>{history ? 'Hide history' : 'History'}</button>
       </div>
+      {showUpdates && <div className="corp-commit-updates"><Suspense fallback={null}><Updates corp={corp} c={c} onChanged={onChanged} /></Suspense></div>}
     </li>
   );
 }

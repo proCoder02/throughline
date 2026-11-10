@@ -74,6 +74,24 @@ export const corpApi = {
   workNote: (id) => apiJson(`${org(id)}/work-note`),
   saveWorkNote: (id, note, sharing) => apiJson(`${org(id)}/work-note`, { method: 'PUT', ...json({ note, sharing }) }),
 
+  // ---- projects, contacts (stakeholder map), cross-team requests, updates
+  projects: (id) => apiJson(`${org(id)}/projects`),
+  createProject: (id, data) => post(`${org(id)}/projects`, data),
+  project: (id, p) => apiJson(`${org(id)}/projects/${p}`),
+  editProject: (id, p, data) => apiJson(`${org(id)}/projects/${p}`, { method: 'PATCH', ...json(data) }),
+  deleteProject: (id, p) => apiJson(`${org(id)}/projects/${p}`, { method: 'DELETE' }),
+  projectMember: (id, p, userId, role) => apiJson(`${org(id)}/projects/${p}/members/${userId}`, role
+    ? { method: 'PUT', ...json({ role }) } : { method: 'DELETE' }),
+  addContact: (id, p, data) => post(`${org(id)}/projects/${p}/contacts`, data),
+  editContact: (id, p, c, data) => apiJson(`${org(id)}/projects/${p}/contacts/${c}`, { method: 'PATCH', ...json(data) }),
+  deleteContact: (id, p, c) => apiJson(`${org(id)}/projects/${p}/contacts/${c}`, { method: 'DELETE' }),
+  request: (id, data) => post(`${org(id)}/requests`, data),
+  incoming: (id) => apiJson(`${org(id)}/requests/incoming`),
+  acceptRequest: (id, c, data) => post(`${org(id)}/requests/${c}/accept`, data),
+  declineRequest: (id, c, reason) => post(`${org(id)}/requests/${c}/decline`, { reason }),
+  updates: (id, c) => apiJson(`${org(id)}/commitments/${c}/updates`),
+  postUpdate: (id, c, kind, text) => post(`${org(id)}/commitments/${c}/updates`, { kind, text }),
+
   previewInvite: (token) => apiJson(`/corp/invites/${encodeURIComponent(token)}`),
   acceptInvite: (token) => post(`/corp/invites/${encodeURIComponent(token)}/accept`, {}),
 };

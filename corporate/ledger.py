@@ -7,7 +7,7 @@ from datetime import date
 
 from .errors import CorpError
 
-STATUSES = ("detected", "open", "overdue", "done", "dropped")
+STATUSES = ("requested", "detected", "open", "overdue", "done", "dropped", "declined")
 
 
 def org_people(cur, org_id: int) -> dict:
@@ -113,7 +113,7 @@ def ingest(cur, org_id, unit_id, source_type, source_id, result, actor_id=None, 
 
 def commitment_view(r) -> dict:
     d = dict(r)
-    for k in ("due_date", "created_at", "updated_at", "checked_at"):
+    for k in ("due_date", "created_at", "updated_at", "checked_at", "requested_due"):
         if d.get(k) is not None:
             d[k] = d[k].isoformat()
     return d
@@ -130,6 +130,8 @@ def can_change(ctx, row) -> bool:
 
 def apply_action(cur, ctx, row, action: str, data: dict) -> None:
     cid, me = row["id"], ctx.user_id
+    if row["status"] in ("requested", "declined") and action not in ("drop", "edit"):
+        raise CorpError(400, "This is a request: the receiving team accepts or declines it.")
     if action == "confirm":
         if row["status"] != "detected":
             raise CorpError(400, "Only a detected commitment can be confirmed.")

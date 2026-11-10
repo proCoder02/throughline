@@ -22,8 +22,10 @@ def mark_overdue(cur) -> int:
     cur.execute("UPDATE corp.commitments SET status = 'overdue', updated_at = now() WHERE status = 'open' "
                 "AND due_date < (now() AT TIME ZONE 'Asia/Kolkata')::date RETURNING id")
     ids = [r["id"] for r in cur.fetchall()]
+    from . import deps
     for cid in ids:
         ledger.event(cur, cid, None, "overdue")
+        deps.evaluate_parent_of(cur, cid)  # a late supporting item puts the promise it supports at risk
     return len(ids)
 
 

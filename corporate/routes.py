@@ -540,4 +540,8 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         register(bp, db_cur=db_cur, login_required=login_required, current_user_id=current_user_id, call_llm=call_llm,
                  transcribe=transcribe, push=push, spawn=spawn, get_raw_connection=get_raw_connection,
                  release_raw_connection=release_raw_connection, dict_cursor=dict_cursor, live=live)
+        from . import routes_projects, routes_requests
+        routes_requests.register(bp, db_cur=db_cur, login_required=login_required, current_user_id=current_user_id,
+                                 push=push, spawn=spawn)
+        routes_projects.register(bp, db_cur=db_cur, login_required=login_required, current_user_id=current_user_id)
     return bp

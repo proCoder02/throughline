@@ -20,8 +20,9 @@ def meetings() -> str:
 
 
 def commitments() -> str:
-    return (f"(x.unit_id IN {MY_UNITS} OR x.owner_id = %(me)s OR x.owed_to_id = %(me)s "
-            "OR (x.unit_id IS NULL AND x.created_by = %(me)s))")
+    return (f"(x.unit_id IN {MY_UNITS} OR x.owner_id = %(me)s OR x.owed_to_id = %(me)s OR x.requested_by = %(me)s "
+            "OR (x.unit_id IS NULL AND x.created_by = %(me)s) "
+            "OR x.project_id IN (SELECT project_id FROM corp.project_members WHERE user_id = %(me)s))")
 
 
 def decisions() -> str:
