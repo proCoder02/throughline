@@ -23,7 +23,7 @@ MAX_AUDIO = 60 * 1024 * 1024
 
 
 def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcribe=None, push=None, spawn=None,
-             get_raw_connection=None, release_raw_connection=None, dict_cursor=None, live=None):
+             get_raw_connection=None, release_raw_connection=None, dict_cursor=None, live=None, mail_linked=None):
     """live(user_id, event): the host's real-time socket push (open browser tabs)."""
     P = "/corp/orgs/<int:org_id>"
 
@@ -431,11 +431,45 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
             raise CorpError(403, "You can only ask about teams you're in.")
         return jsonify(insights.ask(cur, call_llm, org_id, ctx.user_id, q, int(unit) if unit is not None else None))
 
+    @bp.route(P + "/catch-up", methods=["POST"])
+    @login_required
+    def catch_up(org_id):
+        """{days} for "catch me up"; {project_id, contact_id} for meeting prep."""
+        _, cur, ctx = ctx_for(org_id)
+        d = body()
+        days = min(max(int(d.get("days") or 7), 1), 60)
+        project_id = int(d["project_id"]) if d.get("project_id") else None
+        if project_id:
+            cur.execute("SELECT 1 FROM corp.projects p LEFT JOIN corp.project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+                        "WHERE p.id = %s AND p.org_id = %s AND (pm.user_id IS NOT NULL OR %s)", (ctx.user_id, project_id, org_id, ctx.is_admin))
+            if not cur.fetchone():
+                raise CorpError(404, "Project not found.")
+        contact_id = int(d["contact_id"]) if d.get("contact_id") else None
+        return jsonify(insights.catch_up(cur, call_llm, org_id, ctx.user_id, days, project_id, contact_id))
+
     @bp.route(P + "/brief", methods=["GET"])
     @login_required
     def brief(org_id):
         _, cur, ctx = ctx_for(org_id)
         return jsonify(insights.brief(cur, org_id, ctx.user_id))
+
+    @bp.route(P + "/mail-link", methods=["GET", "PUT"])
+    @login_required
+    def mail_link(org_id):
+        """Opt in to promises from my work email (the mailbox connected in Personal)."""
+        conn, cur, ctx = ctx_for(org_id)
+        linked = mail_linked(cur, ctx.user_id) if mail_linked else []
+        if request.method == "PUT":
+            on = bool(body().get("enabled"))
+            if on and not linked:
+                raise CorpError(400, "Connect Gmail or Outlook first: Personal, Settings, Email.")
+            cur.execute("INSERT INTO corp.mail_links (org_id, user_id, enabled) VALUES (%s,%s,%s) "
+                        "ON CONFLICT (org_id, user_id) DO UPDATE SET enabled = EXCLUDED.enabled", (org_id, ctx.user_id, on))
+            conn.commit()
+        cur.execute("SELECT enabled FROM corp.mail_links WHERE org_id = %s AND user_id = %s", (org_id, ctx.user_id))
+        row = cur.fetchone()
+        cur.execute("SELECT count(*) AS n FROM corp.mail_items WHERE org_id = %s AND user_id = %s", (org_id, ctx.user_id))
+        return jsonify({"enabled": bool(row and row["enabled"]), "connected": linked, "read": cur.fetchone()["n"]})
 
     @bp.route(P + "/work-note", methods=["GET", "PUT"])
     @login_required

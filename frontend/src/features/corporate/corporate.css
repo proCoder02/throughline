@@ -418,3 +418,10 @@
 .act-compose { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--wa-border); padding-top: var(--space-3); }
 .act-compose .corp-seg { margin-bottom: 0; align-self: flex-start; }
 .act-compose input { flex: 1; }
+
+/* ---- catch me up / meeting prep ---- */
+.cu { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; }
+.cu-body { border-top: 1px solid var(--wa-border); padding-top: var(--space-3); }
+.cu-sources { display: flex; flex-wrap: wrap; gap: 6px; }
+.cu-sources .corp-tag { text-decoration: none; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.stk-detail .cu { flex-basis: 100%; order: 3; }

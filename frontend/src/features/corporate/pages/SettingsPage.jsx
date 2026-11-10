@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom';
 import { corpApi, ORG_ROLE_LABELS } from '../corpApi.js';
 import { confirmDialog, showToast } from '../../../lib/notify.js';
 import { WorkNote } from '../components/Brief.jsx';
+import WorkEmail from '../components/WorkEmail.jsx';
 
 function OrgSettings({ corp }) {
   const navigate = useNavigate();
@@ -74,6 +75,7 @@ export default function SettingsPage({ corp }) {
     <div className="corp-page narrow">
       <header className="corp-page-head"><div><h1>Settings</h1>
         <p className="corp-muted">{org.name} · you’re {me.role === 'owner' ? 'the owner' : `${me.role === 'admin' ? 'an' : 'a'} ${ORG_ROLE_LABELS[me.role].toLowerCase()}`}</p></div></header>
+      <WorkEmail corp={corp} />
       <WorkNote corp={corp} />
       <OrgSettings key={org.id} corp={corp} />
     </div>

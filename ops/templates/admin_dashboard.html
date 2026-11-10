@@ -531,6 +531,7 @@ const JOBS = {
   corp_chat_extract:        { name: "Commitments from chat",    group: "Scheduled jobs",     about: "Reads team and direct chats with 5+ new messages and adds the promises made there." },
   corp_evidence:            { name: "Evidence check",           group: "Scheduled jobs",     about: "Closes a commitment when later chat or meetings show it was done (AI only when there's new activity)." },
   corp_radar:               { name: "Risk radar",               group: "Scheduled jobs",     about: "Links a blocker in one team to a commitment in another and alerts both owners." },
+  corp_mail:                { name: "Promises from email",      group: "Scheduled jobs",     about: "Reads new sent/received email of people who opted in; promises become commitments to confirm, excerpts become evidence." },
   corp_daily_brief:         { name: "Daily work brief",         group: "Scheduled jobs",     about: "Once a day after 09:00 IST: push with what each person owes, is owed, and what's at risk." },
 };
 // Jobs are grouped by the side of the product they serve (ops/jobs.py JOB_AREA).

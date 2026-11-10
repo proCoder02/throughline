@@ -129,6 +129,16 @@ def common_ground(call_llm, discussion: str, notes: list):
     return {k: [x for x in (out.get(k) or []) if x][:8] for k in ("positions", "agreed", "open", "options")}
 
 
+def catch_up(call_llm, who: str, focus: str, sources: str) -> str:
+    text = _call(call_llm, [
+        {"role": "system", "content": "Write a short work catch-up from the sources only. Plain text, no markdown bold. "
+                                      "Sections, each 1-4 lines starting with '- ': What changed, Decided, At risk, Needs you. "
+                                      "Skip a section with nothing in it. Cite sources like [M3], [D2], [C5]. Be specific: names, dates."},
+        {"role": "user", "content": f"For: {who}. Focus: {focus}.\n\nSources:\n{clip(sources, ASK_CAP)}"},
+    ]).strip()
+    return re.sub(r"[\u3010\uff3b]([MDC]\d+)[\u3011\uff3d]", r"[\1]", text).replace("**", "")
+
+
 def answer(call_llm, question: str, sources: str):
     text = _call(call_llm, [
         {"role": "system", "content": "Answer a work question only from the sources. Cite like [M3], [D2], [C5], [T7]. "

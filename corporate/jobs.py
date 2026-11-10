@@ -58,6 +58,8 @@ def _activity_since(cur, c, since) -> str:
         cur.execute("SELECT title, summary, transcript FROM corp.meetings WHERE unit_id = %s AND status = 'ready' "
                     "AND created_at > %s ORDER BY id LIMIT 3", (c["unit_id"], since))
         parts += [f"Meeting {r['title']}: {r['summary']}\n{ai.clip(r['transcript'], 1500)}" for r in cur.fetchall()]
+    from . import mail
+    parts += mail.recent_for(cur, [c["owner_id"], c["owed_to_id"]], since)  # opted-in work email
     if c["owner_id"] and c["owed_to_id"]:
         lo, hi = sorted((c["owner_id"], c["owed_to_id"]))
         cur.execute("SELECT us.username, m.body FROM corp.messages m JOIN corp.threads t ON t.id = m.thread_id "
@@ -160,7 +162,14 @@ STEPS = {
     "corp_evidence": lambda cur, llm, push: check_evidence(cur, llm, push),
     "corp_radar": lambda cur, llm, push: radar(cur, llm, push),
     "corp_daily_brief": lambda cur, llm, push: daily_brief(cur, push),
+    "corp_mail": lambda cur, llm, push: _mail_scan(cur, llm),
 }
+_mail_handler = None  # set by start(): the host's mail tool lookup
+
+
+def _mail_scan(cur, llm):
+    from . import mail
+    return mail.scan(cur, cur.connection, llm, _mail_handler)
 
 
 def run_step(conn, cur, name, call_llm, push=None, report=None, paused=None, force=False):
@@ -190,7 +199,9 @@ def run_once(conn, cur, call_llm, push=None, report=None, paused=None) -> dict:
 
 
 def start(get_raw_connection, release_raw_connection, dict_cursor, call_llm, push=None, spawn=None,
-          report=None, paused=None, register_runner=None) -> None:
+          report=None, paused=None, register_runner=None, mail_handler=None) -> None:
+    global _mail_handler
+    _mail_handler = mail_handler
     from .schema import ensure_corp_schema
 
     def with_conn(fn):

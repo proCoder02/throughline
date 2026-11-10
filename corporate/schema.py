@@ -293,6 +293,37 @@ CREATE TABLE IF NOT EXISTS corp.commitment_updates (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Work calls (corporate/calls.py): one meeting per call, however many sides were recorded.
+ALTER TABLE corp.meetings ADD COLUMN IF NOT EXISTS call_id INTEGER;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_corp_meetings_call ON corp.meetings (org_id, call_id) WHERE call_id IS NOT NULL;
+ALTER TABLE corp.meetings DROP CONSTRAINT IF EXISTS meetings_source_check;
+ALTER TABLE corp.meetings ADD CONSTRAINT meetings_source_check CHECK (source IN ('upload', 'record', 'text', 'import', 'call', 'email'));
+
+-- Work email (corporate/mail.py): opt-in per person; what's been read, with a short
+-- excerpt kept as evidence for commitments. Visible to that person only.
+CREATE TABLE IF NOT EXISTS corp.mail_links (
+    org_id INTEGER NOT NULL REFERENCES corp.orgs (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS corp.mail_items (
+    id SERIAL PRIMARY KEY,
+    org_id INTEGER NOT NULL REFERENCES corp.orgs (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    message_key TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    sender TEXT NOT NULL DEFAULT '',
+    excerpt TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (org_id, user_id, message_key)
+);
+ALTER TABLE corp.commitments DROP CONSTRAINT IF EXISTS commitments_source_type_check;
+ALTER TABLE corp.commitments ADD CONSTRAINT commitments_source_type_check
+    CHECK (source_type IN ('meeting', 'thread', 'manual', 'request', 'email'));
+
 -- Suspended members keep their place and history but can't open the organisation.
 ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'suspended'));

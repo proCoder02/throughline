@@ -49,6 +49,60 @@ def _my_units(cur, me) -> set:
     return {r["unit_id"] for r in cur.fetchall()}
 
 
+def catch_up(cur, call_llm, org_id: int, me: int, days: int = 7, project_id=None, contact_id=None) -> dict:
+    """A brief of what happened that the viewer may see: meetings, decisions,
+    commitments (opened, closed, at risk, blocked) -- for the last N days, or
+    scoped to a project / one client contact (meeting prep)."""
+    p = {"org": org_id, "me": me, "days": days, "proj": project_id, "contact": contact_id}
+    scope_c = (" AND x.project_id = %(proj)s" if project_id else "") + (" AND x.contact_id = %(contact)s" if contact_id else "")
+    since = "now() - (%(days)s || ' days')::interval"
+    srcs, parts = [], []
+    if not project_id:
+        cur.execute(f"SELECT x.id, x.title, x.summary, x.created_at FROM corp.meetings x WHERE x.org_id = %(org)s "
+                    f"AND x.status = 'ready' AND x.created_at > {since} AND {access.meetings()} ORDER BY x.created_at DESC LIMIT 8", p)
+        for r in cur.fetchall():
+            srcs.append({"ref": f"M{r['id']}", "type": "meeting", "id": r["id"], "title": r["title"]})
+            parts.append(f"[M{r['id']}] Meeting {r['created_at']:%d %b} \"{r['title']}\": {r['summary'][:500]}")
+        cur.execute(f"SELECT x.id, x.title, x.version, v.text FROM corp.decisions x JOIN corp.decision_versions v ON v.decision_id = x.id "
+                    f"AND v.version = x.version WHERE x.org_id = %(org)s AND x.updated_at > {since} AND {access.decisions()} "
+                    "ORDER BY x.updated_at DESC LIMIT 10", p)
+        for r in cur.fetchall():
+            srcs.append({"ref": f"D{r['id']}", "type": "decision", "id": r["id"], "title": r["title"]})
+            parts.append(f"[D{r['id']}] Decision{' (changed, v' + str(r['version']) + ')' if r['version'] > 1 else ''}: {r['title']}: {r['text'][:300]}")
+    recent = "" if (project_id or contact_id) else f" AND (x.updated_at > {since} OR x.status IN ('open','overdue','requested'))"
+    cur.execute("SELECT x.id, x.text, x.status, x.due_date, x.risk_note, x.owner_id, x.owed_to_id, COALESCE(o.username, x.owner_name) AS owner, "
+                "COALESCE(w.username, x.owed_to_name, ct.name) AS owed_to, un.name AS unit_name, "
+                "(SELECT text FROM corp.commitment_updates u WHERE u.commitment_id = x.id AND u.kind = 'blocker' "
+                " AND NOT EXISTS (SELECT 1 FROM corp.commitment_updates z WHERE z.commitment_id = x.id AND z.kind = 'unblocked' AND z.id > u.id) "
+                " ORDER BY u.id DESC LIMIT 1) AS blocker "
+                "FROM corp.commitments x LEFT JOIN users o ON o.id = x.owner_id LEFT JOIN users w ON w.id = x.owed_to_id "
+                "LEFT JOIN corp.contacts ct ON ct.id = x.contact_id LEFT JOIN corp.units un ON un.id = x.unit_id "
+                f"WHERE x.org_id = %(org)s AND x.status NOT IN ('dropped') AND {access.commitments()}{scope_c}{recent} "
+                "ORDER BY (x.status IN ('overdue')) DESC, (x.risk_note IS NOT NULL) DESC, x.due_date NULLS LAST LIMIT 40", p)
+    for r in cur.fetchall():
+        srcs.append({"ref": f"C{r['id']}", "type": "commitment", "id": r["id"], "title": r["text"][:80]})
+        mine = " (you owe this)" if r["owner_id"] == me else " (owed to you)" if r["owed_to_id"] == me else ""
+        parts.append(f"[C{r['id']}] {r['status']}{mine}: {r['text']} -- {r['owner'] or '?'} -> {r['owed_to'] or '-'}"
+                     f"{', due ' + format(r['due_date'], '%d %b') if r['due_date'] else ''}{', ' + r['unit_name'] if r['unit_name'] else ''}"
+                     f"{'; AT RISK: ' + r['risk_note'] if r['risk_note'] else ''}{'; BLOCKED: ' + r['blocker'] if r['blocker'] else ''}")
+    if not parts:
+        return {"brief": "Nothing new in what you can see for this period.", "sources": []}
+    cur.execute("SELECT username FROM users WHERE id = %s", (me,))
+    who = cur.fetchone()["username"]
+    focus = "the last %d days" % days
+    if project_id:
+        cur.execute("SELECT name, client FROM corp.projects WHERE id = %s", (project_id,))
+        pr = cur.fetchone()
+        focus = f"project {pr['name']}" + (f" for {pr['client']}" if pr and pr["client"] else "")
+    if contact_id:
+        cur.execute("SELECT name, position FROM corp.contacts WHERE id = %s", (contact_id,))
+        c = cur.fetchone()
+        focus = f"preparing for a meeting with {c['name']}{', ' + c['position'] if c and c['position'] else ''}: what was promised to them and its status"
+    text = ai.catch_up(call_llm, who, focus, "\n".join(parts))
+    used = [s for s in srcs if f"[{s['ref']}]" in text]
+    return {"brief": text or "Couldn't write the brief just now.", "sources": used}
+
+
 def ask(cur, call_llm, org_id: int, me: int, question: str, unit_id=None) -> dict:
     p = {"org": org_id, "me": me, "q": question, "unit": unit_id}
     uf = " AND x.unit_id = %(unit)s" if unit_id else ""

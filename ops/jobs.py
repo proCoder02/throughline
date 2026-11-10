@@ -25,7 +25,7 @@ JOB_STALE_HOURS = {
     "custom_job_scheduler": 0.2,
     # Corporate (corporate/jobs.py): every 15 min; stale after ~3 missed runs.
     "corp_overdue": 0.75, "corp_chat_extract": 0.75, "corp_evidence": 0.75,
-    "corp_radar": 0.75, "corp_daily_brief": 0.75,
+    "corp_radar": 0.75, "corp_daily_brief": 0.75, "corp_mail": 0.75,
 }
 
 # Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
@@ -64,6 +64,7 @@ JOB_SCHEDULE = {
     "corp_chat_extract": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
     "corp_evidence": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
     "corp_radar": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min"},
+    "corp_mail": {"kind": "interval", "interval_seconds": 900, "cadence_label": "Every 15 min (people who opted in)"},
     "corp_daily_brief": {"kind": "interval", "interval_seconds": 900,
                          "cadence_label": "Checked every 15 min; sends once a day after 09:00 IST"},
 }
@@ -86,7 +87,7 @@ JOB_CONTROL_KIND = {
     "ops_alert_check": "none",
     "custom_job_scheduler": "none",  # pausing it would silently stop every custom job
     "corp_overdue": "in_process", "corp_chat_extract": "in_process", "corp_evidence": "in_process",
-    "corp_radar": "in_process", "corp_daily_brief": "in_process",
+    "corp_radar": "in_process", "corp_daily_brief": "in_process", "corp_mail": "in_process",
 }
 # Probe-backed jobs (ops/probe.py, registered via ops/checks.py) are merged
 # in by job_status() -- they're health checks, so always control_kind "none".
@@ -99,7 +100,7 @@ JOB_FEATURE_FLAG = {
     "nudge_cycle": "NUDGE_FEATURE_ENABLED",
     "ei_pipeline": "EMOTIONAL_INTELLIGENCE_ENABLED",
     **{n: "CORPORATE_ENABLED" for n in ("corp_overdue", "corp_chat_extract", "corp_evidence", "corp_radar",
-                                         "corp_daily_brief")},
+                                         "corp_daily_brief", "corp_mail")},
 }
 
 # Which side of the product a job serves -- the dashboard groups jobs by this.

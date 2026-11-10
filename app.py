@@ -236,7 +236,9 @@ redis_pubsub_client = redis.from_url(
 # TimeoutErrors. RQ has no equivalent graceful-degradation path, so this
 # client gets a more forgiving timeout instead.
 rq_redis_client = redis.from_url(
-    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=5, socket_timeout=10
+    # decode_responses must stay off: RQ stores each job as pickled bytes, and a
+    # decoding client makes the worker fail on the first job it reads.
+    REDIS_URL, decode_responses=False, protocol=2, socket_connect_timeout=5, socket_timeout=10
 )
 
 # Call-recording processing queue (Deepgram transcription + conversation
@@ -6804,6 +6806,11 @@ def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
         cache_delete(f"user:{pid}:conversation:{conv_id}", f"user:{pid}:conversations")
 
 
+# Callables (call_id, user_id, conversation_id, transcript, category) run after a
+# call recording has become a conversation. Features register themselves at startup.
+_call_ready_hooks = []
+
+
 def process_own_call_recording_job(call_id, user_id, audio_path, content_type, category):
     """RQ job (queued from _upload_own_call_recording below, or called
     inline as a fallback if Redis/RQ is unreachable): transcribes via
@@ -6857,6 +6864,11 @@ def process_own_call_recording_job(call_id, user_id, audio_path, content_type, c
     cache_delete(f"user:{user_id}:conversations")
     assign_shared_call_title(call_id, user_id, conversation_id, raw_transcript)
     run_background_analysis(user_id, conversation_id, raw_transcript, lambda *a, **k: None)
+    for hook in _call_ready_hooks:  # features that build on calls (Corporate: work call -> meeting)
+        try:
+            hook(call_id, user_id, conversation_id, raw_transcript, category)
+        except Exception as e:
+            print(f"[calls] call-ready hook failed: {e!r}")
     push_notification(user_id, {
         "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
     })
@@ -9216,6 +9228,7 @@ except Exception as e:
 try:
     from corporate import create_corporate_blueprint, is_enabled as _corporate_enabled
     from corporate import llm as _corp_llm
+    import mail_common  # work email for Corporate (mail_linked / mail_handler below)
     if _corporate_enabled():
         app.register_blueprint(create_corporate_blueprint(
             get_db=get_db, dict_cursor=dict_cursor, login_required=login_required,
@@ -9223,16 +9236,21 @@ try:
             public_base_url=_public_base_url, call_llm=_corp_llm.with_groq_fallback(call_llm), transcribe=transcribe_audio_bytes,
             push=send_fcm_to_user, spawn=_spawn_background, get_raw_connection=get_raw_connection,
             release_raw_connection=release_raw_connection, live=push_notification,
+            mail_linked=lambda cur, uid: [p.PROVIDER for p, _ in mail_common._linked(cur, uid)],
         ))
         from corporate.orgs import hand_over as _corp_hand_over
         _account_delete_hooks.append(_corp_hand_over)
-        if os.getenv("CORPORATE_JOBS", "true").strip().lower() != "false":
+        from corporate.calls import make_hook as _corp_call_hook
+        _call_ready_hooks.append(_corp_call_hook(get_raw_connection, release_raw_connection, dict_cursor,
+                                                 _corp_llm.with_groq_fallback(call_llm)))
+        # Background jobs run in the web process only -- not again in worker.py.
+        if IS_WEB_ROLE and os.getenv("CORPORATE_JOBS", "true").strip().lower() != "false":
             from corporate import jobs as _corp_jobs
             _corp_jobs.start(get_raw_connection, release_raw_connection, dict_cursor, _corp_llm.background(call_llm),
                              push=send_fcm_to_user, spawn=_spawn_background,
                              # ops dashboard: each step is a job (pause / run now / history).
                              report=_ops_record_completed_run, paused=_ops_is_on_ice,
-                             register_runner=_ops_register_runner)
+                             register_runner=_ops_register_runner, mail_handler=mail_common.get_tool_handler)
         print("[corporate] enabled")
 except Exception as e:
     print(f"[corporate] not registered: {e!r}")

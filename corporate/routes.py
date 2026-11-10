@@ -45,7 +45,8 @@ def _int(value, what="id"):
 
 def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_user_id,
                                send_plain_email=None, public_base_url=None, call_llm=None, transcribe=None,
-                               push=None, spawn=None, get_raw_connection=None, release_raw_connection=None, live=None) -> Blueprint:
+                               push=None, spawn=None, get_raw_connection=None, release_raw_connection=None, live=None,
+                               mail_linked=None) -> Blueprint:
     """send_plain_email(to, subject, body) and public_base_url() are optional:
     without them invitations still work, the inviter just shares the link."""
     from .schema import ensure_corp_schema
@@ -539,7 +540,7 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         from .routes_work import register
         register(bp, db_cur=db_cur, login_required=login_required, current_user_id=current_user_id, call_llm=call_llm,
                  transcribe=transcribe, push=push, spawn=spawn, get_raw_connection=get_raw_connection,
-                 release_raw_connection=release_raw_connection, dict_cursor=dict_cursor, live=live)
+                 release_raw_connection=release_raw_connection, dict_cursor=dict_cursor, live=live, mail_linked=mail_linked)
         from . import routes_projects, routes_requests
         routes_requests.register(bp, db_cur=db_cur, login_required=login_required, current_user_id=current_user_id,
                                  push=push, spawn=spawn)

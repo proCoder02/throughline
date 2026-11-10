@@ -9,6 +9,7 @@ import { confirmDialog, showToast } from '../../../lib/notify.js';
 import { CommitmentRow, StatusChip, fmtDate } from '../components/work.jsx';
 import { AskTeam } from '../components/Requests.jsx';
 import { HEALTH } from './ProjectsPage.jsx';
+import CatchUp from '../components/CatchUp.jsx';
 
 // Reporting tree from flat contacts; a broken or circular chain becomes a root.
 function trees(contacts) {
@@ -117,6 +118,8 @@ export default function ProjectPage({ corp }) {
         <p className="corp-muted">{[p.start_date && `from ${fmtDate(p.start_date)}`, p.end_date && `ends ${fmtDate(p.end_date)}`, `${members.length} on the team`].filter(Boolean).join(' · ')}</p>
       </div><span className={'proj-health big ' + hTone}>{hLabel}</span></header>
 
+      <section className="corp-card"><CatchUp corp={corp} label="Project brief" periods={false} params={{ project_id: Number(id) }} /></section>
+
       <div className="proj-kpis">
         <div><b>{n.open}</b><span>open</span></div>
         <div className={n.at_risk ? 'warn' : ''}><b>{n.at_risk}</b><span>at risk</span></div>
@@ -149,7 +152,9 @@ export default function ProjectPage({ corp }) {
               <>
                 <span><strong>{sel.name}</strong> · {sel.position}{sel.department ? `, ${sel.department}` : ''}{sel.organisation ? ` · ${sel.organisation}` : ''}
                   {sel.email ? ` · ${sel.email}` : ''}</span>
-                <span className="corp-inline"><button className="corp-btn small" onClick={() => setEditing(sel)}>Edit</button>
+                <span className="corp-inline"><CatchUp key={sel.id} corp={corp} label={`Prepare for meeting with ${sel.name}`} periods={false}
+                  params={{ project_id: Number(id), contact_id: sel.id }} />
+                  <button className="corp-btn small" onClick={() => setEditing(sel)}>Edit</button>
                   <button className="corp-btn small danger" onClick={() => removeContact(sel)}>Remove</button></span>
               </>)}
           </div>

@@ -92,6 +92,10 @@ export const corpApi = {
   updates: (id, c) => apiJson(`${org(id)}/commitments/${c}/updates`),
   postUpdate: (id, c, kind, text) => post(`${org(id)}/commitments/${c}/updates`, { kind, text }),
 
+  catchUp: (id, data) => post(`${org(id)}/catch-up`, data),
+  mailLink: (id) => apiJson(`${org(id)}/mail-link`),
+  setMailLink: (id, enabled) => apiJson(`${org(id)}/mail-link`, { method: 'PUT', ...json({ enabled }) }),
+
   previewInvite: (token) => apiJson(`/corp/invites/${encodeURIComponent(token)}`),
   acceptInvite: (token) => post(`/corp/invites/${encodeURIComponent(token)}/accept`, {}),
 };

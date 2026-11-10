@@ -8,6 +8,7 @@ import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
 import { fmtDate } from '../components/work.jsx';
 import { ChatIcon, CheckIcon, MicIcon, PlusIcon, SearchIcon } from '../../../icons.jsx';
+import CatchUp from '../components/CatchUp.jsx';
 
 const DAY = 86400000;
 const greeting = () => { const h = new Date().getHours(); return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'; };
@@ -123,6 +124,8 @@ export default function OverviewPage({ corp, user }) {
       </nav>
 
       {me.org_admin && <Setup corp={corp} />}
+
+      <section className="corp-card home-catchup"><CatchUp corp={corp} /></section>
 
       <section className="corp-card home-needs" aria-labelledby="h-needs">
         <h2 id="h-needs">Needs you {b && needs.length > 0 && <span className="home-count">{needs.length}</span>}</h2>
