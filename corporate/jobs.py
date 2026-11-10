@@ -87,7 +87,7 @@ def check_evidence(cur, call_llm, push=None) -> int:
             ledger.event(cur, c["id"], None, "done", evidence=quote, by="evidence check")
             closed += 1
             if push and c["owed_to_id"]:
-                push(c["owed_to_id"], "Commitment done", f"{c['owner'] or 'Someone'}: {c['text'][:90]}", {"type": "corp_commitment"})
+                push(c["owed_to_id"], "Commitment done", f"{c['owner'] or 'Someone'}: {c['text'][:90]}", {"type": "corp_commitment", "org_id": c["org_id"], "commitment_id": c["id"]})
     return closed
 
 
@@ -122,11 +122,11 @@ def radar(cur, call_llm, push=None) -> int:
                 due = c["due_date"].strftime("%d %b")
                 for uid in {c["owner_id"], c["owed_to_id"]} - {None}:
                     push(uid, "May slip", f"“{c['text'][:70]}”, due {due}: a blocker was logged in {b['unit_name']}.",
-                         {"type": "corp_risk"})
+                         {"type": "corp_risk", "org_id": b["org_id"], "commitment_id": c["id"]})
                 cur.execute("SELECT user_id FROM corp.unit_members WHERE unit_id = %s AND role = 'manager'", (b["unit_id"],))
                 for r in cur.fetchall():
                     push(r["user_id"], "Your blocker affects another team",
-                         f"“{b['text'][:60]}” may delay a commitment due {due}.", {"type": "corp_risk"})
+                         f"“{b['text'][:60]}” may delay a commitment due {due}.", {"type": "corp_risk", "org_id": b["org_id"]})
     return found
 
 

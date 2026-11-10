@@ -38,10 +38,12 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
     def body():
         return request.get_json(silent=True) or {}
 
-    def tell(uids, title, text):
+    def tell(uids, title, text, org_id=None, cid=None):
+        # org_id + commitment_id let a tapped phone notification open the item itself.
+        data = {"type": "corp_request", **({"org_id": org_id} if org_id else {}), **({"commitment_id": cid} if cid else {})}
         if push:
             for uid in set(uids) - {None}:
-                (spawn or (lambda f: f()))(lambda uid=uid: push(uid, title, text, {"type": "corp_request"}))
+                (spawn or (lambda f: f()))(lambda uid=uid: push(uid, title, text, data))
 
     def visible(cur, ctx, org_id, cid):
         row = access.one(cur, "commitments", access.commitments(), cid, ctx.user_id, org_id)
@@ -85,7 +87,7 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
         conn.commit()
         cur.execute("SELECT username FROM users WHERE id = %s", (ctx.user_id,))
         who = cur.fetchone()["username"]
-        tell(managers(cur, unit_id), f"Request for {ctx.units[unit_id]['name']}", f"{who}: {text[:90]} (by {due:%d %b})")
+        tell(managers(cur, unit_id), f"Request for {ctx.units[unit_id]['name']}", f"{who}: {text[:90]} (by {due:%d %b})", org_id, cid)
         return jsonify({"id": cid}), 201
 
     def receiving(cur, ctx, org_id, cid):
@@ -114,7 +116,7 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
         deps.evaluate(cur, row["supports_id"], push, ctx.user_id)
         conn.commit()
         msg = f"Accepted, due {due:%d %b}" + (f" ({(due - row['requested_due']).days} days after you asked)" if later else "")
-        tell([row["requested_by"]], f"{ctx.units[row['unit_id']]['name']} accepted your request", f"{row['text'][:80]}: {msg}")
+        tell([row["requested_by"]], f"{ctx.units[row['unit_id']]['name']} accepted your request", f"{row['text'][:80]}: {msg}", org_id, cid)
         return jsonify({"ok": True, "later_than_asked": bool(later)})
 
     @bp.route(P + "/requests/<int:cid>/decline", methods=["POST"])
@@ -129,7 +131,7 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
         ledger.event(cur, cid, ctx.user_id, "declined", reason=reason)
         deps.evaluate(cur, row["supports_id"], push, ctx.user_id)
         conn.commit()
-        tell([row["requested_by"]], f"{ctx.units[row['unit_id']]['name']} declined your request", f"{row['text'][:80]}: {reason[:100]}")
+        tell([row["requested_by"]], f"{ctx.units[row['unit_id']]['name']} declined your request", f"{row['text'][:80]}: {reason[:100]}", org_id, cid)
         return jsonify({"ok": True})
 
     @bp.route(P + "/requests/incoming", methods=["GET"])
@@ -199,5 +201,5 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
         deps.evaluate(cur, row["supports_id"], push, ctx.user_id)
         conn.commit()
         if kind == "blocker":
-            tell({row["owed_to_id"], row["requested_by"], row["owner_id"]} - {ctx.user_id}, "Blocked", f"{row['text'][:70]}: {text[:100]}")
+            tell({row["owed_to_id"], row["requested_by"], row["owner_id"]} - {ctx.user_id}, "Blocked", f"{row['text'][:70]}: {text[:100]}", org_id, cid)
         return jsonify(updates(org_id, cid).get_json()), 201

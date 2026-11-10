@@ -7004,8 +7004,12 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         "excerpts from several of the user's own past recorded conversations, each labeled with "
         "its own date/title/category. Use those dates to resolve relative time references "
         "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
-        "continuous conversation. Ground your answer only in what's in these excerpts; if the "
-        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble. "
+        "continuous conversation. For questions about the user's own life (what was said, by whom, "
+        "plans, promises, people, spending), ground your answer only in these excerpts; if it isn't "
+        "there, say so briefly rather than guessing. For general questions that don't depend on their "
+        "data (advice, recommendations such as books, explanations, how-to), answer helpfully from "
+        "general knowledge, and bring in anything relevant from the excerpts if there is some. "
+        "Be concise, no preamble. "
         + CHAT_FORMATTING_GUIDANCE + " " + CHAT_CLOSING_GUIDANCE + " " + CHAT_REMINDER_GUIDANCE
     )
     if speaker_name:

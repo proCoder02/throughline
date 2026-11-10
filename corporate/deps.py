@@ -56,7 +56,7 @@ def evaluate(cur, parent_id, push=None, actor_id=None) -> None:
     ledger.event(cur, parent_id, actor_id, "at_risk" if note else "risk_cleared", **({"why": note} if note else {}))
     if note and push:
         for uid in {parent["owner_id"], parent["owed_to_id"]} - {None, actor_id}:
-            push(uid, "Your promise may slip", f"“{parent['text'][:60]}”: {note[:140]}", {"type": "corp_risk"})
+            push(uid, "Your promise may slip", f"“{parent['text'][:60]}”: {note[:140]}", {"type": "corp_risk", "org_id": parent["org_id"], "commitment_id": parent["id"]})
 
 
 def evaluate_parent_of(cur, child_id, push=None, actor_id=None) -> None:

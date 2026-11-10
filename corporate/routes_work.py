@@ -13,6 +13,8 @@ All under /corp/orgs/<org>/ and all behind access.py.
   work note:    GET/PUT work-note {note, sharing}"""
 from __future__ import annotations
 
+import time
+
 from flask import jsonify, request
 
 from . import access, chat, deps, insights, ledger, meetings, orgs
@@ -133,10 +135,11 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
         cur.execute("SELECT user_id FROM corp.presence WHERE user_id = ANY(%s) AND active_until > now()", (others or [0],))
         on_web = {r["user_id"] for r in cur.fetchall()}
         notify([u for u in others if u not in on_web], where, (f"{me}: " if t["kind"] == "team" else "") + text[:120],
-               {"type": "corp_message", "org_id": str(org_id), "thread_id": str(tid)})
+               {"type": "corp_message", "org_id": str(org_id), "thread_id": str(tid), "title": where,
+                "team": "1" if t["kind"] == "team" else "0"})
         if live:  # open tabs get it instantly: badge, toast, desktop notification
             event = {"type": "corp_message", "org_id": org_id, "thread_id": tid, "message_id": mid, "team": t["kind"] == "team",
-                     "title": where, "sender": me, "preview": text[:140]}
+                     "title": where, "sender": me, "preview": text[:140], "at": int(time.time())}
             for uid in others:
                 (spawn or (lambda f: f()))(lambda uid=uid: live(uid, event))
         return jsonify({"messages": chat.messages(cur, tid, mid - 1)}), 201
