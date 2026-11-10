@@ -425,3 +425,37 @@
 .cu-sources { display: flex; flex-wrap: wrap; gap: 6px; }
 .cu-sources .corp-tag { text-decoration: none; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .stk-detail .cu { flex-basis: 100%; order: 3; }
+
+/* ---- Ask: the Personal "Ask Throughline" chat (assistant.css) inside Corporate ---- */
+.corp-main:has(> .corp-ask) { display: flex; flex-direction: column; }
+.corp-ask { height: 100%; }
+.corp .corp-ask .ac-composer textarea { border: 0; padding: 6px 4px; border-radius: 0; background: transparent; resize: none; box-shadow: none; }
+.corp .corp-ask .ac-composer textarea:focus-visible { outline: none; }
+.corp-ask .ac-header { gap: var(--space-3); padding: 14px 20px; }
+.corp-ask .ac-header-text { flex: 1; }
+.corp-ask .ac-title { font-size: var(--text-lg, 17px); }
+.corp-ask-head-actions { display: flex; align-items: center; gap: var(--space-2); flex-shrink: 0; }
+.corp-ask-scope { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-sm); color: var(--wa-text-soft); }
+.corp-ask-scope select {
+  font: inherit; color: var(--wa-text); background: var(--wa-hover); border: 1px solid var(--wa-border);
+  border-radius: var(--radius-md); padding: 7px 10px; max-width: 200px;
+}
+.corp-ask-scope-tag { display: block; margin-top: 2px; font-size: 11.5px; color: var(--wa-text-soft); text-align: right; }
+.corp-ask-sources { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.corp-ask-source {
+  display: flex; flex-direction: column; gap: 1px; max-width: 260px; padding: 7px 11px; border-radius: 10px;
+  border: 1px solid var(--wa-border); background: var(--wa-panel); text-decoration: none; color: var(--wa-text);
+}
+.corp-ask-source:hover { border-color: var(--wa-accent); }
+.corp-ask-source-kind { font-size: 11px; font-weight: 600; letter-spacing: .02em; color: var(--wa-text-soft); }
+.corp-ask-source-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 820px) {
+  /* main isn't a fixed-height scroller here: the thread scrolls with the page, composer sticks to the bottom */
+  .corp-ask { height: auto; min-height: calc(100dvh - 120px); }
+  .corp-ask .ac-header { flex-wrap: wrap; padding: 12px 14px; }
+  .corp-ask-head-actions { width: 100%; justify-content: space-between; }
+  .corp-ask .ac-scroll { overflow: visible; }
+  .corp-ask .ac-composer-wrap { position: sticky; bottom: 0; background: var(--ac-bg); }
+}
+.corp-ask .ac-assistant-body ul { list-style: disc; padding-left: 1.25em; }
+.corp-ask .ac-assistant-body ol { list-style: decimal; padding-left: 1.4em; }
