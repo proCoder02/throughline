@@ -36,6 +36,8 @@ _send_alert_email = notify.send_email  # module-level so tests can swap it
 
 _consecutive: dict = {}  # job_name -> consecutive failing checks, in-memory
 _last_level: dict = {}  # job_name -> "ok"/"failing" seen last check, for status events
+_healthy_since: dict = {}  # job_name -> when it last became healthy, in-memory
+ACK_CLEAR_AFTER_HEALTHY_SECONDS = 3600  # an acknowledgement survives blips shorter than this
 
 
 def _failing(job) -> bool:
@@ -106,16 +108,26 @@ def check_once(cur, conn) -> dict:
         inc = incidents.pop(name, None)
         if not failing:
             _consecutive[name] = 0
+            _healthy_since.setdefault(name, now)
             if inc:
                 cur.execute("DELETE FROM ops.incidents WHERE job_name = %s", (name,))
                 conn.commit()
                 mins = round((now - inc["opened_at"]).total_seconds() / 60)
                 msg = f"recovered after {mins} min"
-                if inc["last_notified_at"]:
+                # No "recovered" email while it's snoozed -- a flapping service (e.g. CostLens
+                # behind a tunnel) would otherwise email on every blip.
+                cur.execute("SELECT 1 FROM ops.acks WHERE item_key = %s AND kind = 'snooze' AND until_at > now()", (key,))
+                snoozed = cur.fetchone() is not None
+                if inc["last_notified_at"] and not snoozed:
                     checked[name]["recovery_sent"] = _send(f"[Throughline] {name} recovered", f"{name} is healthy again ({msg}).")
                 events.record("recovered", name, msg, cur=cur, conn=conn)
-            acks.clear_on_recovery(cur, conn, key)
+            # An acknowledgement ends only once it has stayed healthy for a while, so a brief
+            # recovery between failures doesn't re-arm alerts for the same flapping problem.
+            if (now - _healthy_since[name]).total_seconds() >= ACK_CLEAR_AFTER_HEALTHY_SECONDS:
+                acks.clear_on_recovery(cur, conn, key)
             continue
+
+        _healthy_since.pop(name, None)
 
         _consecutive[name] = _consecutive.get(name, 0) + 1
         checked[name]["consecutive"] = _consecutive[name]
