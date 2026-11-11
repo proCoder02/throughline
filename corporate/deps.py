@@ -39,7 +39,8 @@ def reasons_for(cur, parent) -> list:
         blocker = _open_blocker(cur, ch["id"])
         if blocker:
             out.append(f"{who} is blocked: {blocker[:140]}")
-    return out
+    from . import tickets  # tickets that support this promise count too
+    return out + tickets.risk_reasons(cur, parent)
 
 
 def evaluate(cur, parent_id, push=None, actor_id=None) -> None:

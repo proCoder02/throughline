@@ -13,6 +13,7 @@ All under /corp/orgs/<org>/ and all behind access.py.
   work note:    GET/PUT work-note {note, sharing}"""
 from __future__ import annotations
 
+import json
 import time
 
 from flask import jsonify, request
@@ -425,7 +426,7 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
     @bp.route(P + "/ask", methods=["POST"])
     @login_required
     def ask(org_id):
-        _, cur, ctx = ctx_for(org_id)
+        conn, cur, ctx = ctx_for(org_id)
         d = body()
         q = str(d.get("question") or "").strip()[:500]
         if not q:
@@ -433,7 +434,56 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
         unit = d.get("unit_id")
         if unit is not None and int(unit) not in ctx.my_units:
             raise CorpError(403, "You can only ask about teams you're in.")
-        return jsonify(insights.ask(cur, call_llm, org_id, ctx.user_id, q, int(unit) if unit is not None else None))
+        unit = int(unit) if unit is not None else None
+        # Each question and answer is kept in the asker's own thread (none given: a new one).
+        thread_id = int(d["thread_id"]) if d.get("thread_id") else None
+        history = []
+        if thread_id:
+            own_ask_thread(cur, ctx, org_id, thread_id)
+            cur.execute("SELECT role, content FROM corp.ask_messages WHERE thread_id = %s ORDER BY id DESC LIMIT 6", (thread_id,))
+            history = [dict(r) for r in cur.fetchall()][::-1]
+        out = insights.ask(cur, call_llm, org_id, ctx.user_id, q, unit, history=history)
+        if not thread_id:
+            cur.execute("INSERT INTO corp.ask_threads (org_id, user_id, title) VALUES (%s,%s,%s) RETURNING id",
+                        (org_id, ctx.user_id, q[:80]))
+            thread_id = cur.fetchone()["id"]
+        cur.execute("INSERT INTO corp.ask_messages (thread_id, role, content, unit_id) VALUES (%s,'user',%s,%s)", (thread_id, q, unit))
+        cur.execute("INSERT INTO corp.ask_messages (thread_id, role, content, sources) VALUES (%s,'assistant',%s,%s)",
+                    (thread_id, out["answer"], json.dumps(out["sources"])))
+        cur.execute("UPDATE corp.ask_threads SET updated_at = now() WHERE id = %s", (thread_id,))
+        conn.commit()
+        return jsonify(out | {"thread_id": thread_id})
+
+    def own_ask_thread(cur, ctx, org_id, thread_id):
+        cur.execute("SELECT * FROM corp.ask_threads WHERE id = %s AND org_id = %s AND user_id = %s", (thread_id, org_id, ctx.user_id))
+        row = cur.fetchone()
+        if not row:
+            raise CorpError(404, "Conversation not found.")
+        return row
+
+    @bp.route(P + "/ask-threads", methods=["GET"])
+    @login_required
+    def ask_threads(org_id):
+        """My earlier Ask conversations in this organisation, newest first."""
+        _, cur, ctx = ctx_for(org_id)
+        cur.execute("SELECT t.id, t.title, t.updated_at, (SELECT count(*) FROM corp.ask_messages m WHERE m.thread_id = t.id "
+                    "AND m.role = 'user') AS questions FROM corp.ask_threads t WHERE t.org_id = %s AND t.user_id = %s "
+                    "ORDER BY t.updated_at DESC LIMIT 100", (org_id, ctx.user_id))
+        return jsonify({"threads": [dict(r) | {"updated_at": r["updated_at"].isoformat()} for r in cur.fetchall()]})
+
+    @bp.route(P + "/ask-threads/<int:thread_id>", methods=["GET", "DELETE"])
+    @login_required
+    def ask_thread(org_id, thread_id):
+        conn, cur, ctx = ctx_for(org_id)
+        row = own_ask_thread(cur, ctx, org_id, thread_id)
+        if request.method == "DELETE":
+            cur.execute("DELETE FROM corp.ask_threads WHERE id = %s", (thread_id,))
+            conn.commit()
+            return jsonify({"ok": True})
+        cur.execute("SELECT m.role, m.content, m.sources, m.unit_id, un.name AS unit_name, m.created_at FROM corp.ask_messages m "
+                    "LEFT JOIN corp.units un ON un.id = m.unit_id WHERE m.thread_id = %s ORDER BY m.id", (thread_id,))
+        msgs = [dict(r) | {"created_at": r["created_at"].isoformat()} for r in cur.fetchall()]
+        return jsonify({"thread": {"id": row["id"], "title": row["title"]}, "messages": msgs})
 
     @bp.route(P + "/catch-up", methods=["POST"])
     @login_required
@@ -450,6 +500,14 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
                 raise CorpError(404, "Project not found.")
         contact_id = int(d["contact_id"]) if d.get("contact_id") else None
         return jsonify(insights.catch_up(cur, call_llm, org_id, ctx.user_id, days, project_id, contact_id))
+
+    @bp.route(P + "/client-digest", methods=["GET"])
+    @login_required
+    def client_digest(org_id):
+        """Client projects this week: for Sales / BU people and anyone on a project."""
+        _, cur, ctx = ctx_for(org_id)
+        days = min(max(int(request.args.get("days") or 7), 1), 31)
+        return jsonify(insights.client_digest(cur, org_id, ctx.user_id, days))
 
     @bp.route(P + "/brief", methods=["GET"])
     @login_required

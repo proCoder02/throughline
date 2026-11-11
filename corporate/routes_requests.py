@@ -180,7 +180,9 @@ def register(bp, *, db_cur, login_required, current_user_id, push=None, spawn=No
                   for r in cur.fetchall()]
         thread += [{"type": "note", "kind": u["kind"], "text": u["text"], "actor": u["author"], "at": u["created_at"]} for u in ups]
         thread.sort(key=lambda x: x["at"])
+        from . import tickets
         return jsonify({"updates": ups, "supporting": kids, "supports": parent, "thread": thread,
+                        "tickets": tickets.rollup(cur, [cid]).get(cid),
                         "closed": row["status"] in ("done", "dropped", "declined")})
 
     @bp.route(P + "/commitments/<int:cid>/updates", methods=["POST"])

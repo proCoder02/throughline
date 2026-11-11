@@ -87,7 +87,7 @@ def catch_up(cur, call_llm, org_id: int, me: int, days: int = 7, project_id=None
                      f"{', due ' + format(r['due_date'], '%d %b') if r['due_date'] else ''}{', ' + r['unit_name'] if r['unit_name'] else ''}"
                      f"{'; AT RISK: ' + r['risk_note'] if r['risk_note'] else ''}{'; BLOCKED: ' + r['blocker'] if r['blocker'] else ''}")
     if not contact_id:
-        t_where = "x.project_id = %(proj)s AND x.status IN ('todo','in_progress','in_review')" if project_id else f"x.updated_at > {since}"
+        t_where = "x.project_id = %(proj)s AND x.status IN ('todo','in_progress','in_review','blocked')" if project_id else f"x.updated_at > {since}"
         _ticket_sources(cur, org_id, me, t_where, p, srcs, parts, limit=15)
     if not parts:
         return {"brief": "Nothing new in what you can see for this period.", "sources": []}
@@ -107,12 +107,17 @@ def catch_up(cur, call_llm, org_id: int, me: int, days: int = 7, project_id=None
     return {"brief": text or "Couldn't write the brief just now.", "sources": used}
 
 
-def ask(cur, call_llm, org_id: int, me: int, question: str, unit_id=None) -> dict:
-    p = {"org": org_id, "me": me, "q": question, "unit": unit_id}
+def ask(cur, call_llm, org_id: int, me: int, question: str, unit_id=None, history=None) -> dict:
+    """history: earlier turns of this Ask thread [{role, content}], oldest first --
+    so "and who owns it?" is understood, and finds the same sources."""
+    history = [h for h in (history or []) if h.get("content")][-6:]
+    prev_q = next((h["content"] for h in reversed(history) if h["role"] == "user"), "")
+    about = f"{prev_q} {question}".strip()  # what to look for: this question plus the one before it
+    p = {"org": org_id, "me": me, "q": question, "about": about, "unit": unit_id}
     uf = " AND x.unit_id = %(unit)s" if unit_id else ""
     srcs, parts = [], []
     cur.execute("SELECT x.id, x.title, x.summary, x.transcript, ts_rank(to_tsvector('english', "
-                "x.title || ' ' || x.summary || ' ' || x.transcript), plainto_tsquery('english', %(q)s)) AS r "
+                "x.title || ' ' || x.summary || ' ' || x.transcript), plainto_tsquery('english', %(about)s)) AS r "
                 f"FROM corp.meetings x WHERE x.org_id = %(org)s AND x.status = 'ready' AND {access.meetings()}{uf} "
                 "ORDER BY r DESC, x.created_at DESC LIMIT 4", p)
     for r in cur.fetchall():
@@ -137,18 +142,18 @@ def ask(cur, call_llm, org_id: int, me: int, question: str, unit_id=None) -> dic
     for r in cur.fetchall():
         srcs.append({"ref": f"T{r['id']}", "type": "message", "id": r["thread_id"], "title": r["body"][:80]})
         parts.append(f"[T{r['id']}] {r['username']} ({r['created_at']:%d %b}): {r['body'][:300]}")
-    named = tickets.keys_in(question.upper())
+    named = tickets.keys_in(about.upper())
     if named:
         _ticket_sources(cur, org_id, me, "x.key = ANY(%(keys)s)", p | {"keys": named}, srcs, parts, limit=4, deep=True)
     else:
         # Any of the question's meaningful words (an all-words match almost never hits a short title).
-        words = [w for w in re.findall(r"[A-Za-z0-9]+", question) if len(w) > 3][:8]
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", about) if len(w) > 3][:8]
         if words:
             _ticket_sources(cur, org_id, me, "to_tsvector('english', x.title || ' ' || x.description) @@ to_tsquery('english', %(tq)s)",
                             p | {"tq": " | ".join(words)}, srcs, parts, limit=4, deep=True)
     if not parts:
         return {"answer": "I don't have anything about that yet in the teams you're in.", "sources": []}
-    text = ai.answer(call_llm, question, "\n".join(parts))
+    text = ai.answer(call_llm, question, "\n".join(parts), history)
     used = [s for s in srcs if f"[{s['ref']}]" in text]
     return {"answer": text or "I couldn't answer that just now. Please try again.", "sources": used}
 
@@ -215,3 +220,50 @@ def _ticket_sources(cur, org_id, me, where, params, srcs, parts, limit=10, deep=
             for c in cur.fetchall():
                 line += f" | {c['username']}: {c['body'][:200]}"
         parts.append(line)
+
+
+def client_digest(cur, org_id: int, me: int, days: int = 7) -> dict:
+    """Client projects I'm on (any role, stakeholders too) or have promises in:
+    each client deliverable's progress, what got done, what's at risk and why,
+    what's due in the next two weeks, and ticket movement this week."""
+    p = {"org": org_id, "me": me, "days": days}
+    cur.execute("SELECT p.id, p.name, p.client FROM corp.projects p WHERE p.org_id = %(org)s AND p.status = 'active' AND ("
+                "p.id IN (SELECT project_id FROM corp.project_members WHERE user_id = %(me)s) OR EXISTS ("
+                "SELECT 1 FROM corp.commitments c WHERE c.project_id = p.id AND c.supports_id IS NULL "
+                "AND (c.owner_id = %(me)s OR c.owed_to_id = %(me)s))) ORDER BY p.name", p)
+    projects = cur.fetchall()
+    today = date.today()
+    soon = today + timedelta(days=14)
+    out, totals = [], {"at_risk": 0, "due_soon": 0, "done": 0, "tickets_done": 0, "blocked": 0}
+    for pr in projects:
+        cur.execute("SELECT x.id, x.text, x.status, x.due_date, x.risk_note, x.updated_at, ct.name AS contact FROM corp.commitments x "
+                    "LEFT JOIN corp.contacts ct ON ct.id = x.contact_id WHERE x.org_id = %(org)s AND x.project_id = %(pid)s "
+                    f"AND x.supports_id IS NULL AND x.status NOT IN ('dropped','declined') AND {access.commitments()} "
+                    "ORDER BY x.due_date NULLS LAST", p | {"pid": pr["id"]})
+        promises = cur.fetchall()
+        roll = tickets.rollup(cur, [c["id"] for c in promises])
+        live = [c for c in promises if c["status"] != "done"]
+        def item(c):
+            r = roll.get(c["id"])
+            return {"id": c["id"], "text": c["text"], "status": c["status"], "contact": c["contact"],
+                    "due_date": c["due_date"].isoformat() if c["due_date"] else None, "why": c["risk_note"],
+                    "progress": {"done": r["done"], "total": r["total"], "blocked": r["blocked"]} if r else None}
+        at_risk = [item(c) for c in live if c["risk_note"] or c["status"] == "overdue"]
+        due_soon = [item(c) for c in live if c["due_date"] and c["due_date"] <= soon and not (c["risk_note"] or c["status"] == "overdue")]
+        done = [item(c) for c in promises if c["status"] == "done" and c["updated_at"].date() > today - timedelta(days=days)]
+        flagged = {x["id"] for x in at_risk + due_soon}
+        on_track = [item(c) for c in live if c["id"] not in flagged]
+        cur.execute("SELECT count(*) AS n FROM corp.ticket_events e JOIN corp.tickets t ON t.id = e.ticket_id WHERE t.project_id = %s "
+                    "AND e.kind = 'status' AND e.detail->>'to' = 'done' AND e.at > now() - (%s || ' days')::interval", (pr["id"], days))
+        tickets_done = cur.fetchone()["n"]
+        cur.execute("SELECT id, key, title FROM corp.tickets WHERE project_id = %s AND status = 'blocked' ORDER BY number", (pr["id"],))
+        blocked = [dict(r) for r in cur.fetchall()]
+        if not (promises or tickets_done or blocked):
+            continue
+        health = "late" if any(c["status"] == "overdue" for c in live) else "at_risk" if at_risk else "on_track"
+        out.append({"id": pr["id"], "name": pr["name"], "client": pr["client"], "health": health, "at_risk": at_risk,
+                    "due_soon": due_soon, "on_track": on_track, "done": done, "tickets_done": tickets_done, "blocked_tickets": blocked,
+                    "open": len(live)})
+        totals["at_risk"] += len(at_risk); totals["due_soon"] += len(due_soon); totals["done"] += len(done)
+        totals["tickets_done"] += tickets_done; totals["blocked"] += len(blocked)
+    return {"projects": out, "totals": totals, "days": days}

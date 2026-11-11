@@ -29,8 +29,8 @@ from .errors import CorpError
 
 KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(\d{1,6})\b")
 PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
-STATUSES = ("todo", "in_progress", "in_review", "done", "cancelled")
-OPEN = ("todo", "in_progress", "in_review")
+STATUSES = ("todo", "in_progress", "in_review", "blocked", "done", "cancelled")
+OPEN = ("todo", "in_progress", "in_review", "blocked")
 PRIORITIES = ("low", "medium", "high", "urgent")
 SOURCES = ("message", "email", "meeting", "commitment")
 SUGGEST_BATCH = 10      # meetings checked per run
@@ -87,13 +87,16 @@ def _is_member(cur, org_id: int, user_id: int) -> bool:
 
 
 def create(cur, ctx, org_id: int, project_id: int, title: str, *, description="", priority="medium", due=None,
-           assignees=(), watchers=()) -> int:
+           assignees=(), watchers=(), supports=None) -> int:
     cur.execute("SELECT p.id, p.ticket_key, pm.role FROM corp.projects p LEFT JOIN corp.project_members pm "
                 "ON pm.project_id = p.id AND pm.user_id = %s WHERE p.id = %s AND p.org_id = %s",
                 (ctx.user_id, project_id, org_id))
     p = cur.fetchone()
     if not p or not (p["role"] or ctx.is_admin):
         raise CorpError(404, "Project not found.")
+    if p["role"] == "stakeholder" and not ctx.is_admin:
+        raise CorpError(403, "Stakeholders follow a project; people on its team create tickets.")
+    supports = check_supports(cur, org_id, project_id, supports)
     if not p["ticket_key"]:
         raise CorpError(400, "This project has no ticket key yet. A project lead or admin sets it on the website.")
     title = (title or "").strip()[:TITLE_MAX]
@@ -104,9 +107,10 @@ def create(cur, ctx, org_id: int, project_id: int, title: str, *, description=""
     cur.execute("UPDATE corp.projects SET ticket_seq = ticket_seq + 1 WHERE id = %s RETURNING ticket_seq", (project_id,))
     number = cur.fetchone()["ticket_seq"]
     key = f"{p['ticket_key']}-{number}"
-    cur.execute("INSERT INTO corp.tickets (org_id, project_id, number, key, title, description, priority, due_date, created_by) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (org_id, project_id, number, key, title, (description or "").strip()[:TEXT_MAX], priority, _date(due), ctx.user_id))
+    cur.execute("INSERT INTO corp.tickets (org_id, project_id, number, key, title, description, priority, due_date, created_by, supports_id) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (org_id, project_id, number, key, title, (description or "").strip()[:TEXT_MAX], priority, _date(due), ctx.user_id,
+                 supports))
     tid = cur.fetchone()["id"]
     event(cur, tid, ctx.user_id, "created")
     for uid in assignees:
@@ -129,7 +133,7 @@ def can_edit(cur, ctx, row) -> bool:
     """Project members, admins and assignees work on a ticket; watchers only follow it."""
     if ctx.is_admin:
         return True
-    cur.execute("SELECT 1 FROM corp.project_members WHERE project_id = %s AND user_id = %s "
+    cur.execute("SELECT 1 FROM corp.project_members WHERE project_id = %s AND user_id = %s AND role <> 'stakeholder' "
                 "UNION SELECT 1 FROM corp.ticket_people WHERE ticket_id = %s AND user_id = %s AND role = 'assignee'",
                 (row["project_id"], ctx.user_id, row["id"], ctx.user_id))
     return cur.fetchone() is not None
@@ -161,7 +165,7 @@ def update(cur, row, data: dict, actor_id) -> list:
     if "status" in data:
         s = data["status"]
         if s not in STATUSES:
-            raise CorpError(400, "Status is todo, in_progress, in_review, done or cancelled.")
+            raise CorpError(400, "Status is todo, in_progress, in_review, blocked, done or cancelled.")
         if s != row["status"]:
             closed = "now()" if s in ("done", "cancelled") else "NULL"
             cur.execute(f"UPDATE corp.tickets SET status = %s, closed_at = {closed} WHERE id = %s", (s, row["id"]))
@@ -179,6 +183,12 @@ def update(cur, row, data: dict, actor_id) -> list:
             cur.execute("UPDATE corp.tickets SET due_date = %s WHERE id = %s", (due, row["id"]))
             event(cur, row["id"], actor_id, "due", to=due)
             changed.append("due_date")
+    if "supports_id" in data:
+        sup = check_supports(cur, row["org_id"], row["project_id"], data["supports_id"])
+        if sup != row["supports_id"]:
+            cur.execute("UPDATE corp.tickets SET supports_id = %s WHERE id = %s", (sup, row["id"]))
+            event(cur, row["id"], actor_id, "supports", to=sup)
+            changed.append("supports_id")
     if "title" in data:
         t = str(data["title"] or "").strip()[:TITLE_MAX]
         if not t:
@@ -240,7 +250,7 @@ def list_for(cur, ctx, org_id, *, project_id=None, scope="all", status="open", q
     elif scope == "watching":
         where.append("EXISTS (SELECT 1 FROM corp.ticket_people t WHERE t.ticket_id = x.id AND t.user_id = %(me)s)")
     if status == "open":
-        where.append("x.status IN ('todo','in_progress','in_review')")
+        where.append("x.status IN ('todo','in_progress','in_review','blocked')")
     elif status in STATUSES:
         where.append("x.status = %(st)s")
         p["st"] = status
@@ -256,6 +266,57 @@ def list_for(cur, ctx, org_id, *, project_id=None, scope="all", status="open", q
         "ORDER BY (x.status IN ('done','cancelled')), "
         "array_position(ARRAY['urgent','high','medium','low'], x.priority), x.due_date NULLS LAST, x.id DESC LIMIT %(limit)s", p)
     return [row_view(r) for r in cur.fetchall()]
+
+
+# --------------------------------------------------- client deliverables
+def check_supports(cur, org_id, project_id, cid):
+    """A ticket can support a deliverable (a commitment) in the same project."""
+    if not cid:
+        return None
+    cur.execute("SELECT id FROM corp.commitments WHERE id = %s AND org_id = %s AND project_id = %s AND status <> 'dropped'",
+                (int(cid), org_id, project_id))
+    if not cur.fetchone():
+        raise CorpError(400, "Pick a deliverable from this ticket's project.")
+    return int(cid)
+
+
+def rollup(cur, commitment_ids) -> dict:
+    """Ticket progress per deliverable: {id: {total, done, blocked, late, open, tickets: [...]}} (cancelled not counted)."""
+    ids = [i for i in commitment_ids if i]
+    if not ids:
+        return {}
+    cur.execute("SELECT id, key, title, status, due_date, supports_id FROM corp.tickets WHERE supports_id = ANY(%s) "
+                "AND status <> 'cancelled' ORDER BY number", (ids,))
+    today = date.today()
+    out = {}
+    for t in cur.fetchall():
+        r = out.setdefault(t["supports_id"], {"total": 0, "done": 0, "blocked": 0, "late": 0, "tickets": []})
+        r["total"] += 1
+        late = t["status"] != "done" and t["due_date"] is not None and t["due_date"] < today
+        r["done"] += t["status"] == "done"
+        r["blocked"] += t["status"] == "blocked"
+        r["late"] += late
+        r["tickets"].append({"id": t["id"], "key": t["key"], "title": t["title"], "status": t["status"],
+                             "due_date": t["due_date"].isoformat() if t["due_date"] else None, "late": late})
+    for r in out.values():
+        r["open"] = r["total"] - r["done"]
+    return out
+
+
+def risk_reasons(cur, parent) -> list:
+    """Why tickets put a deliverable at risk (used by deps.reasons_for)."""
+    cur.execute("SELECT key, status, due_date FROM corp.tickets WHERE supports_id = %s AND status NOT IN ('done','cancelled') "
+                "ORDER BY number", (parent["id"],))
+    today, out = date.today(), []
+    for t in cur.fetchall():
+        if t["status"] == "blocked":
+            out.append(f"{t['key']} is blocked")
+        elif t["due_date"] and t["due_date"] < today:
+            out.append(f"{t['key']} is overdue")
+        if parent["due_date"] and t["due_date"] and t["due_date"] > parent["due_date"]:
+            days = (t["due_date"] - parent["due_date"]).days
+            out.append(f"{t['key']} expects {t['due_date']:%d %b}, {days} day{'s' if days != 1 else ''} after your date")
+    return out
 
 
 # --------------------------------------------------------------------- links
@@ -392,7 +453,19 @@ def detail(cur, ctx, org_id, row) -> dict:
                   "at": r["created_at"].isoformat()} for r in cur.fetchall()]
     timeline += [{**lk, "type": "link", "source_type": lk["type"]} for lk in links]
     timeline.sort(key=lambda x: x["at"])
+    supports = None
+    if row["supports_id"]:
+        cur.execute("SELECT id, text, due_date, status FROM corp.commitments WHERE id = %s", (row["supports_id"],))
+        s = cur.fetchone()
+        if s:
+            supports = {"id": s["id"], "text": s["text"], "status": s["status"],
+                        "due_date": s["due_date"].isoformat() if s["due_date"] else None}
+    cur.execute("SELECT x.id, x.text, x.due_date FROM corp.commitments x WHERE x.project_id = %s AND x.supports_id IS NULL "
+                "AND x.status NOT IN ('dropped','declined','done') ORDER BY x.due_date NULLS LAST", (row["project_id"],))
+    deliverables = [{"id": r["id"], "text": r["text"], "due_date": r["due_date"].isoformat() if r["due_date"] else None}
+                    for r in cur.fetchall()]
     return {"ticket": row_view(row) | {"project_name": proj["name"], "project_key": proj["ticket_key"]},
+            "supports": supports, "deliverables": deliverables,
             "people": people_of(cur, tid), "links": links, "suggestions": suggestions, "timeline": timeline,
             "can_edit": can_edit(cur, ctx, row)}
 
@@ -432,7 +505,7 @@ def suggest_for_meetings(cur, call_llm, push=None) -> int:
             continue
         cur.execute("SELECT DISTINCT x.id, x.key, x.title, x.description FROM corp.tickets x "
                     "JOIN corp.project_members pm ON pm.project_id = x.project_id "
-                    "WHERE x.org_id = %s AND x.status IN ('todo','in_progress','in_review') AND pm.user_id = ANY(%s) "
+                    "WHERE x.org_id = %s AND x.status IN ('todo','in_progress','in_review','blocked') AND pm.user_id = ANY(%s) "
                     "ORDER BY x.id DESC LIMIT 200", (m["org_id"], list(people)))
         tickets = cur.fetchall()
         if not tickets:

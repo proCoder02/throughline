@@ -29,8 +29,14 @@ function NewTicket({ corp, projects, onCreated, onCancel }) {
   const keyed = projects.filter((p) => p.ticket_key);
   const [f, setF] = useState({ project_id: keyed[0]?.id ?? '', title: '', description: '', priority: 'medium', due_date: '', assignees: [] });
   const [people, setPeople] = useState([]);
+  const [deliverables, setDeliverables] = useState([]);
   const [busy, setBusy] = useState(false);
   useEffect(() => { corpApi.members(orgId).then((d) => setPeople(d.members)).catch(() => {}); }, [orgId]);
+  useEffect(() => {
+    if (!f.project_id) return;
+    corpApi.project(orgId, f.project_id).then((d) => setDeliverables(d.deliverables.filter((x) => !x.supports_id
+      && !['done', 'dropped', 'declined'].includes(x.status)))).catch(() => setDeliverables([]));
+  }, [orgId, f.project_id]);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   if (!keyed.length) {
     return (
@@ -44,7 +50,8 @@ function NewTicket({ corp, projects, onCreated, onCancel }) {
     e.preventDefault();
     setBusy(true);
     try {
-      const d = await corpApi.createTicket(orgId, { ...f, project_id: Number(f.project_id), due_date: f.due_date || null });
+      const d = await corpApi.createTicket(orgId, { ...f, project_id: Number(f.project_id), due_date: f.due_date || null,
+        supports_id: f.supports_id ? Number(f.supports_id) : null });
       onCreated(d.ticket);
     } catch (err) { showToast(err.message, 'error'); } finally { setBusy(false); }
   };
@@ -64,6 +71,12 @@ function NewTicket({ corp, projects, onCreated, onCancel }) {
         <input value={f.title} onChange={set('title')} maxLength={200} placeholder="e.g. Refund webhook times out" autoFocus /></label>
       <label className="corp-field"><span>Description</span>
         <textarea rows={3} value={f.description} onChange={set('description')} maxLength={5000} placeholder="What’s wrong, where, and what done looks like" /></label>
+      {deliverables.length > 0 && (
+        <label className="corp-field"><span>Supports a client deliverable (optional)</span>
+          <select value={f.supports_id || ''} onChange={set('supports_id')}>
+            <option value="">None</option>
+            {deliverables.map((x) => <option key={x.id} value={x.id}>{x.text}{x.due_date ? ` (due ${fmtDate(x.due_date)})` : ''}</option>)}
+          </select></label>)}
       <PeoplePicker people={people} value={f.assignees} onChange={(v) => setF({ ...f, assignees: v })} />
       <div className="corp-inline">
         <button className="corp-btn primary" disabled={busy || !f.title.trim()}>{busy ? 'Creating…' : 'Create ticket'}</button>

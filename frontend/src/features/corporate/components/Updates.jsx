@@ -1,6 +1,7 @@
 // A commitment's activity thread (Jira / Linear / GitHub-issue style): what it
 // depends on, then everything that happened -- events in plain sentences and
 // people's notes as messages, oldest first -- and the composer at the bottom.
+import { TicketProgress } from './tickets.jsx';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
@@ -55,6 +56,7 @@ export default function Updates({ corp, c, onChanged }) {
       {d.supports && !d.supports.hidden && (
         <p className="corp-small corp-muted">Supports <strong>{d.supports.text}</strong>{d.supports.due_date ? ` · due ${fmtDate(d.supports.due_date)}` : ''}</p>
       )}
+      {d.tickets && <div className="upd-deps"><h4>Tickets</h4><TicketProgress t={d.tickets} /></div>}
       {d.supporting.length > 0 && (
         <div className="upd-deps">
           <h4>Depends on</h4>

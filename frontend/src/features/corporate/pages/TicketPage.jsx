@@ -200,6 +200,13 @@ export default function TicketPage({ corp, user }) {
                   {people.filter((p) => !d.people.assignees.some((a) => a.user_id === p.user_id)).map((p) => <option key={p.user_id} value={p.user_id}>{p.username}</option>)}
                 </select>)}
             </div>
+            <label className="corp-field"><span>Supports</span>
+              <select value={d.supports?.id || ''} disabled={!edit || busy} onChange={(e) => patch({ supports_id: e.target.value ? Number(e.target.value) : null })}>
+                <option value="">No client deliverable</option>
+                {d.supports && !d.deliverables.some((x) => x.id === d.supports.id) && <option value={d.supports.id}>{d.supports.text}</option>}
+                {d.deliverables.map((x) => <option key={x.id} value={x.id}>{x.text}{x.due_date ? ` (due ${fmtDate(x.due_date)})` : ''}</option>)}
+              </select></label>
+            {d.supports && <p className="corp-muted corp-small">Progress and delays on this ticket show on that client promise.</p>}
             {d.people.watchers.length > 0 && <div className="corp-field"><span>Following</span>
               <span className="corp-small">{d.people.watchers.map((p) => p.username).join(', ')}</span></div>}
             <p className="corp-muted corp-small">Tag chat, email or calls from where they happen, or type <b>{t.key}</b> in a message or email subject.</p>

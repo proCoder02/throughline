@@ -15,7 +15,7 @@ from datetime import date
 
 from flask import jsonify, request
 
-from . import access, deps, ledger, orgs
+from . import access, ai, deps, ledger, orgs, tickets
 from .errors import CorpError
 
 FIELDS = ("side", "organisation", "department", "name", "position", "reports_to", "email", "notes")
@@ -28,7 +28,7 @@ def _date(v):
         raise CorpError(400, "Dates look like 2026-11-30.")
 
 
-def register(bp, *, db_cur, login_required, current_user_id):
+def register(bp, *, db_cur, login_required, current_user_id, call_llm=None):
     P = "/corp/orgs/<int:org_id>/projects"
 
     def ctx_for(org_id):
@@ -53,7 +53,7 @@ def register(bp, *, db_cur, login_required, current_user_id):
     def list_projects(org_id):
         _, cur, ctx = ctx_for(org_id)
         cur.execute("SELECT p.id, p.name, p.client, p.status, p.end_date, p.ticket_key, pm.role AS my_role, "
-                    "(SELECT count(*) FROM corp.tickets t WHERE t.project_id = p.id AND t.status IN ('todo','in_progress','in_review')) AS open_tickets, "
+                    "(SELECT count(*) FROM corp.tickets t WHERE t.project_id = p.id AND t.status IN ('todo','in_progress','in_review','blocked')) AS open_tickets, "
                     "(SELECT count(*) FROM corp.project_members x WHERE x.project_id = p.id) AS members, "
                     "(SELECT count(*) FROM corp.commitments c WHERE c.project_id = p.id AND c.status IN ('open','overdue','requested','detected')) AS open_items, "
                     "(SELECT count(*) FROM corp.commitments c WHERE c.project_id = p.id AND (c.status = 'overdue' OR c.risk_note IS NOT NULL) "
@@ -102,6 +102,9 @@ def register(bp, *, db_cur, login_required, current_user_id):
             v["blocker"] = deps._open_blocker(cur, r["id"])
             v["can_change"] = ledger.can_change(ctx, r)
             items.append(v)
+        roll = tickets.rollup(cur, [i["id"] for i in items])
+        for i in items:
+            i["tickets"] = roll.get(i["id"])
         live = [i for i in items if i["status"] not in ("done", "dropped", "declined")]
         late = [i for i in live if i["status"] == "overdue"]
         risky = [i for i in live if i.get("risk_note") or i.get("blocker")]
@@ -111,7 +114,7 @@ def register(bp, *, db_cur, login_required, current_user_id):
             out[f] = out[f].isoformat() if out[f] else None
         out["created_at"] = out["created_at"].isoformat()
         out["can_edit"] = p["my_role"] == "lead" or ctx.is_admin
-        cur.execute("SELECT count(*) FILTER (WHERE status IN ('todo','in_progress','in_review')) AS open, "
+        cur.execute("SELECT count(*) FILTER (WHERE status IN ('todo','in_progress','in_review','blocked')) AS open, "
                     "count(*) FILTER (WHERE status = 'done') AS done FROM corp.tickets WHERE project_id = %s", (pid,))
         tk = cur.fetchone()
         return jsonify({"project": out, "members": members, "contacts": contacts, "deliverables": items, "health": health,
@@ -159,8 +162,8 @@ def register(bp, *, db_cur, login_required, current_user_id):
             if not orgs.member_role(cur, org_id, user_id):
                 raise CorpError(400, "Add people from your organisation.")
             role = body().get("role", "member")
-            if role not in ("lead", "member"):
-                raise CorpError(400, "role must be lead or member.")
+            if role not in ("lead", "member", "stakeholder"):
+                raise CorpError(400, "role must be lead, member or stakeholder (follows the project, changes nothing).")
             cur.execute("INSERT INTO corp.project_members VALUES (%s,%s,%s) ON CONFLICT (project_id, user_id) "
                         "DO UPDATE SET role = EXCLUDED.role", (pid, user_id, role))
         cur.execute("SELECT count(*) AS n FROM corp.project_members WHERE project_id = %s AND role = 'lead'", (pid,))
@@ -169,6 +172,55 @@ def register(bp, *, db_cur, login_required, current_user_id):
             raise CorpError(400, "A project needs at least one lead.")
         conn.commit()
         return dashboard(org_id, pid)
+
+    @bp.route(P + "/<int:pid>/client-update", methods=["POST"])
+    @login_required
+    def client_update(org_id, pid):
+        """A draft status update for the client (all of it, or what was promised to one
+        contact), in client-safe words. Only ever a draft: the person sends it."""
+        _, cur, ctx = ctx_for(org_id)
+        p = project(cur, ctx, org_id, pid)
+        if not call_llm:
+            raise CorpError(503, "Drafting isn't available right now.")
+        contact_id = int(body().get("contact_id") or 0) or None
+        contact = None
+        if contact_id:
+            cur.execute("SELECT * FROM corp.contacts WHERE id = %s AND project_id = %s", (contact_id, pid))
+            contact = cur.fetchone()
+            if not contact:
+                raise CorpError(404, "Contact not found.")
+        cur.execute("SELECT x.* FROM corp.commitments x WHERE x.org_id = %(org)s AND x.project_id = %(p)s AND x.supports_id IS NULL "
+                    "AND x.status NOT IN ('dropped','declined') " + ("AND x.contact_id = %(c)s " if contact_id else "")
+                    + f"AND {access.commitments()} ORDER BY x.due_date NULLS LAST", {"org": org_id, "p": pid, "c": contact_id, "me": ctx.user_id})
+        promises = cur.fetchall()
+        if not promises:
+            raise CorpError(400, "There are no deliverables to report on yet" + (" for this person." if contact_id else "."))
+        roll = tickets.rollup(cur, [c["id"] for c in promises])
+        lines = []
+        for c in promises:
+            r = roll.get(c["id"])
+            cur.execute("SELECT status, due_date FROM corp.commitments WHERE supports_id = %s AND status NOT IN ('dropped')", (c["id"],))
+            kids = cur.fetchall()
+            parts = [f"- {c['text']}: {c['status']}"]
+            if c["due_date"]:
+                parts.append(f"promised for {c['due_date']:%d %b %Y}")
+            if r:
+                parts.append(f"{r['done']} of {r['total']} work items done" + (f", {r['blocked']} blocked" if r["blocked"] else ""))
+            if kids:
+                parts.append(f"{sum(k['status'] == 'done' for k in kids)} of {len(kids)} supporting tasks done")
+                later = [k["due_date"] for k in kids if k["due_date"] and k["status"] != "done"]
+                if later:
+                    parts.append(f"latest supporting date {max(later):%d %b %Y}")
+            if c["risk_note"]:
+                parts.append(f"internal risk: {c['risk_note']}")
+            lines.append("; ".join(parts))
+        cur.execute("SELECT username FROM users WHERE id = %s", (ctx.user_id,))
+        me = cur.fetchone()["username"]
+        who = f"{contact['name']}" + (f", {contact['position']}" if contact and contact["position"] else "") if contact else ""
+        draft = ai.client_update(call_llm, p["name"], p["client"], who, me, "\n".join(lines))
+        if not draft["body"]:
+            raise CorpError(503, "Couldn't write the draft just now. Please try again.")
+        return jsonify(draft | {"to": contact["email"] if contact else "", "deliverables": len(promises)})
 
     def clean_contact(cur, pid, d, partial=False):
         out = {}

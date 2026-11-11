@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from flask import jsonify, request
 
-from . import orgs, tickets
+from . import deps, orgs, tickets
 from .errors import CorpError
 
 
@@ -57,6 +57,18 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, push=None
                 release_raw_connection(conn)
         run_later(work)
 
+    def progress_note(cur, ticket, actor_id, org_id):
+        """A ticket for a client promise is done: tell the promise's owner how far along it is."""
+        cur.execute("SELECT id, text, owner_id, owed_to_id, requested_by FROM corp.commitments WHERE id = %s", (ticket["supports_id"],))
+        c = cur.fetchone()
+        if not c or not push:
+            return
+        r = tickets.rollup(cur, [c["id"]]).get(c["id"], {"done": 0, "total": 0})
+        text = f"{ticket['key']} done: {r['done']} of {r['total']} tickets for “{c['text'][:60]}” complete"
+        for uid in {c["owner_id"], c["owed_to_id"], c["requested_by"]} - {None, actor_id}:
+            run_later(lambda uid=uid: push(uid, "Progress on your promise", text,
+                                           {"type": "corp_commitment", "org_id": org_id, "commitment_id": c["id"]}))
+
     def ticket_for(cur, ctx, org_id, tid, edit=False):
         row = tickets.get(cur, ctx, org_id, tid)
         if edit and not tickets.can_edit(cur, ctx, row):
@@ -82,7 +94,10 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, push=None
         d = body()
         tid = tickets.create(cur, ctx, org_id, int(d.get("project_id") or 0), d.get("title"),
                              description=d.get("description") or "", priority=d.get("priority") or "medium",
-                             due=d.get("due_date"), assignees=d.get("assignees") or [], watchers=d.get("watchers") or [])
+                             due=d.get("due_date"), assignees=d.get("assignees") or [], watchers=d.get("watchers") or [],
+                             supports=d.get("supports_id"))
+        row = tickets.get(cur, ctx, org_id, tid)
+        deps.evaluate(cur, row["supports_id"], push, ctx.user_id)  # a new ticket due after the promise date counts
         conn.commit()
         row = tickets.get(cur, ctx, org_id, tid)
         tell(set(d.get("assignees") or []) - {ctx.user_id}, f"{row['key']} assigned to you", row["title"][:120], org_id, tid)
@@ -100,7 +115,13 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, push=None
         conn, cur, ctx = ctx_for(org_id)
         row = ticket_for(cur, ctx, org_id, tid, edit=True)
         changed = tickets.update(cur, row, body(), ctx.user_id)
+        new = tickets.get(cur, ctx, org_id, tid)
+        # The client promise it supports: re-check its risk (blocked, late, after the promise date).
+        for cid in {row["supports_id"], new["supports_id"]} - {None}:
+            deps.evaluate(cur, cid, push, ctx.user_id)
         conn.commit()
+        if "status" in changed and new["status"] == "done" and new["supports_id"]:
+            progress_note(cur, new, ctx.user_id, org_id)
         if "status" in changed:
             new = tickets.get(cur, ctx, org_id, tid)
             tell(tickets.notify_ids(cur, tid, ctx.user_id), f"{row['key']}: {new['status'].replace('_', ' ')}",

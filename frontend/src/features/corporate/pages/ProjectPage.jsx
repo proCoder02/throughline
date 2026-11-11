@@ -10,6 +10,42 @@ import { CommitmentRow, StatusChip, fmtDate } from '../components/work.jsx';
 import { AskTeam } from '../components/Requests.jsx';
 import { HEALTH } from './ProjectsPage.jsx';
 import CatchUp from '../components/CatchUp.jsx';
+import { TicketProgress } from '../components/tickets.jsx';
+
+// A status update for the client, drafted from the deliverables; the person edits and sends it.
+function ClientUpdate({ orgId, p, contacts }) {
+  const clientSide = contacts.filter((c) => c.side === 'client');
+  const [contactId, setContactId] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [d, setD] = useState(null);
+  const draft = async () => {
+    setBusy(true);
+    try { setD(await corpApi.clientUpdate(orgId, p.id, contactId ? Number(contactId) : null)); }
+    catch (e) { showToast(e.message, 'error'); } finally { setBusy(false); }
+  };
+  const copy = async () => { try { await navigator.clipboard.writeText(`${d.subject}\n\n${d.body}`); showToast('Copied', 'success'); } catch { showToast('Your browser blocked copying.', 'error'); } };
+  const mailto = d && `mailto:${encodeURIComponent(d.to || '')}?subject=${encodeURIComponent(d.subject)}&body=${encodeURIComponent(d.body)}`;
+  return (
+    <section className="corp-card corp-form">
+      <div className="proj-sec-head"><h2>Client update</h2></div>
+      <p className="corp-muted corp-small">A status note for {p.client || 'the client'} in client-safe words, drafted from the deliverables and the tickets behind them. You edit and send it; nothing goes out by itself.</p>
+      <div className="corp-inline wrap">
+        <select aria-label="For whom" value={contactId} onChange={(e) => { setContactId(e.target.value); setD(null); }}>
+          <option value="">Everything for {p.client || 'the client'}</option>
+          {clientSide.map((c) => <option key={c.id} value={c.id}>What was promised to {c.name}</option>)}
+        </select>
+        <button className="corp-btn primary" onClick={draft} disabled={busy}>{busy ? 'Drafting…' : d ? 'Draft again' : 'Draft update'}</button>
+      </div>
+      {d && (<>
+        {d.internal.length > 0 && <div className="corp-warn tk-internal"><b>Before you send (internal):</b><ul>{d.internal.map((x, i) => <li key={i}>{x}</li>)}</ul></div>}
+        <label className="corp-field"><span>Subject</span><input value={d.subject} onChange={(e) => setD({ ...d, subject: e.target.value })} /></label>
+        <label className="corp-field"><span>Message</span><textarea rows={9} value={d.body} onChange={(e) => setD({ ...d, body: e.target.value })} /></label>
+        <div className="corp-inline"><button className="corp-btn" onClick={copy}>Copy</button>
+          <a className="corp-btn primary" href={mailto}>Open in email{d.to ? ` to ${d.to}` : ''}</a></div>
+      </>)}
+    </section>
+  );
+}
 
 // Ticket key (e.g. PAY): set once by a lead or admin; fixed once tickets exist.
 function TicketKey({ orgId, p, open, onSaved }) {
@@ -148,6 +184,7 @@ export default function ProjectPage({ corp }) {
       <section className="corp-card"><CatchUp corp={corp} label="Project brief" periods={false} params={{ project_id: Number(id) }} /></section>
 
       <TicketKey orgId={orgId} p={p} open={n.tickets_open ?? 0} onSaved={load} />
+      <ClientUpdate orgId={orgId} p={p} contacts={contacts} />
 
       <div className="proj-kpis">
         <div><b>{n.open}</b><span>open</span></div>
@@ -211,6 +248,7 @@ export default function ProjectPage({ corp }) {
           <ul className="corp-list">{shown.map((x) => (
             <li key={x.id} className="proj-deliv">
               <ul className="corp-list"><CommitmentRow corp={corp} c={x} onChanged={load} /></ul>
+              {x.tickets && <TicketProgress t={x.tickets} />}
               {childrenOf(x.id).length > 0 && (
                 <ul className="proj-deps">{childrenOf(x.id).map((k) => (
                   <li key={k.id}>
@@ -238,9 +276,10 @@ export default function ProjectPage({ corp }) {
             {p.can_edit ? (
               <span className="corp-inline">
                 <select aria-label={`Role of ${m.username}`} value={m.role} onChange={(e) => setMember(m.user_id, e.target.value)}>
-                  <option value="lead">Lead</option><option value="member">Member</option></select>
+                  <option value="lead">Lead</option><option value="member">Member</option>
+                  <option value="stakeholder">Stakeholder (view only)</option></select>
                 <button className="corp-btn small" onClick={() => setMember(m.user_id, null)}>Remove</button></span>
-            ) : <span className="corp-role">{m.role === 'lead' ? 'Lead' : 'Member'}</span>}
+            ) : <span className="corp-role">{{ lead: 'Lead', member: 'Member', stakeholder: 'Stakeholder' }[m.role] || m.role}</span>}
           </li>))}</ul>
       </section>
     </div>

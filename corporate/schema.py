@@ -399,6 +399,46 @@ CREATE INDEX IF NOT EXISTS idx_corp_ticket_comments_ticket ON corp.ticket_commen
 -- Meetings and calls already checked for ticket suggestions.
 ALTER TABLE corp.meetings ADD COLUMN IF NOT EXISTS tickets_scanned_at TIMESTAMPTZ;
 
+-- Client view: tickets roll up into the client deliverable they support; a
+-- 'blocked' status; read-only project stakeholders (Sales, BU heads); the
+-- weekly client-projects digest is sent once per person per week.
+ALTER TABLE corp.tickets ADD COLUMN IF NOT EXISTS supports_id INTEGER REFERENCES corp.commitments (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_corp_tickets_supports ON corp.tickets (supports_id);
+ALTER TABLE corp.tickets DROP CONSTRAINT IF EXISTS tickets_status_check;
+ALTER TABLE corp.tickets ADD CONSTRAINT tickets_status_check
+    CHECK (status IN ('todo', 'in_progress', 'in_review', 'blocked', 'done', 'cancelled'));
+ALTER TABLE corp.project_members DROP CONSTRAINT IF EXISTS project_members_role_check;
+ALTER TABLE corp.project_members ADD CONSTRAINT project_members_role_check CHECK (role IN ('lead', 'member', 'stakeholder'));
+CREATE TABLE IF NOT EXISTS corp.digest_sent (
+    org_id INTEGER NOT NULL REFERENCES corp.orgs (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    week TEXT NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, user_id, week)
+);
+
+-- Ask conversations (one person's own, per organisation), kept so earlier chats
+-- stay listed and follow-up questions know what came before.
+CREATE TABLE IF NOT EXISTS corp.ask_threads (
+    id SERIAL PRIMARY KEY,
+    org_id INTEGER NOT NULL REFERENCES corp.orgs (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_corp_ask_threads_user ON corp.ask_threads (org_id, user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS corp.ask_messages (
+    id SERIAL PRIMARY KEY,
+    thread_id INTEGER NOT NULL REFERENCES corp.ask_threads (id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    sources JSONB NOT NULL DEFAULT '[]',
+    unit_id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_corp_ask_messages_thread ON corp.ask_messages (thread_id, id);
+
 -- Suspended members keep their place and history but can't open the organisation.
 ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'suspended'));

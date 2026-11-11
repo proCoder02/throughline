@@ -155,6 +155,39 @@ def daily_brief(cur, push) -> int:
     return sent
 
 
+def weekly_digest(cur, push) -> int:
+    """Mondays after 09:00 IST: each person on a client project (stakeholders too)
+    gets one notification pointing to this week's client-projects digest."""
+    now = datetime.now(IST)
+    if now.weekday() != 0 or now.hour < 9 or not push:
+        return 0
+    week = now.strftime("%G-W%V")
+    cur.execute("SELECT DISTINCT p.org_id, pm.user_id FROM corp.project_members pm JOIN corp.projects p ON p.id = pm.project_id "
+                "WHERE p.status = 'active' UNION SELECT DISTINCT c.org_id, c.owner_id FROM corp.commitments c "
+                "WHERE c.project_id IS NOT NULL AND c.supports_id IS NULL AND c.owner_id IS NOT NULL")
+    sent = 0
+    for m in cur.fetchall():
+        cur.execute("SELECT 1 FROM corp.digest_sent WHERE org_id = %s AND user_id = %s AND week = %s", (m["org_id"], m["user_id"], week))
+        if cur.fetchone():
+            continue
+        d = insights.client_digest(cur, m["org_id"], m["user_id"])
+        cur.execute("INSERT INTO corp.digest_sent (org_id, user_id, week) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (m["org_id"], m["user_id"], week))
+        if not d["projects"]:
+            continue
+        t = d["totals"]
+        bits = [f"{len(d['projects'])} client project{'s' if len(d['projects']) != 1 else ''}"]
+        if t["at_risk"]:
+            bits.append(f"{t['at_risk']} at risk")
+        if t["due_soon"]:
+            bits.append(f"{t['due_soon']} due in 2 weeks")
+        if t["tickets_done"]:
+            bits.append(f"{t['tickets_done']} tickets done")
+        push(m["user_id"], "Your client projects this week", " · ".join(bits), {"type": "corp_digest", "org_id": str(m["org_id"])})
+        sent += 1
+    return sent
+
+
 # Each step is its own job on the ops dashboard (ops/jobs.py lists them under "Corporate").
 STEPS = {
     "corp_overdue": lambda cur, llm, push: mark_overdue(cur),
@@ -164,6 +197,7 @@ STEPS = {
     "corp_daily_brief": lambda cur, llm, push: daily_brief(cur, push),
     "corp_mail": lambda cur, llm, push: _mail_scan(cur, llm),
     "corp_tickets": lambda cur, llm, push: _tickets(cur, llm, push),
+    "corp_weekly_digest": lambda cur, llm, push: weekly_digest(cur, push),
 }
 _mail_handler = None  # set by start(): the host's mail tool lookup
 

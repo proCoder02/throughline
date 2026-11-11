@@ -139,11 +139,13 @@ def catch_up(call_llm, who: str, focus: str, sources: str) -> str:
     return re.sub(r"[\u3010\uff3b]([MDCK]\d+)[\u3011\uff3d]", r"[\1]", text).replace("**", "")
 
 
-def answer(call_llm, question: str, sources: str):
+def answer(call_llm, question: str, sources: str, history=None):
+    earlier = "\n".join(f"{'Q' if h['role'] == 'user' else 'A'}: {h['content'][:600]}" for h in (history or []))
+    context = f"Earlier in this conversation (to understand the question; facts still come from the sources):\n{earlier}\n\n" if earlier else ""
     text = _call(call_llm, [
         {"role": "system", "content": "Answer a work question only from the sources. Cite like [M3], [D2], [C5], [T7], [K4]. "
                                       "If the sources don't say, reply that you don't have that yet. Be brief, plain text."},
-        {"role": "user", "content": f"Sources:\n{clip(sources, ASK_CAP)}\n\nQuestion: {question}"},
+        {"role": "user", "content": f"Sources:\n{clip(sources, ASK_CAP)}\n\n{context}Question: {question}"},
     ]).strip()
     # Models sometimes cite with full-width brackets or add markdown bold.
     return re.sub(r"[【［]([MDCTK]\d+)[】］]", r"[\1]", text).replace("**", "")
@@ -184,3 +186,22 @@ def ticket_brief(call_llm, ticket: str, material: str) -> str:
         {"role": "user", "content": f"Ticket: {ticket}\n\nMaterial:\n{clip(material, TICKET_CAP)}"},
     ]).strip()
     return text.replace("**", "")
+
+
+def client_update(call_llm, project: str, client: str, recipient: str, sender: str, lines: str) -> dict:
+    """A status update a salesperson can send to the client, in client-safe words,
+    plus internal notes they should know first. Never sent automatically."""
+    out = _ask(call_llm,
+               "Draft a short status update from a vendor to its client, using ONLY the facts given. Client-safe: no internal "
+               "team or employee names, no ticket keys, no blame, no internal jargon. For each deliverable say: done; or in "
+               "progress, with its date. Never invent a date, a cause, a step being taken, or anyone's involvement that the "
+               "facts don't state. If something is blocked or late and the facts give no new date, say plainly that it is "
+               "delayed and that a revised date will follow shortly. Warm and professional, under 160 words, plain text, "
+               "greeting and sign-off. In 'internal', list what the sender must confirm before sending (e.g. a revised date). "
+               'JSON only: {"subject":"...","body":"...","internal":["things the sender should know or check before sending"]}',
+               f"Project: {project}\nClient: {client or '-'}\nTo: {recipient or 'the client'}\nFrom: {sender}\n\nFacts:\n{clip(lines, 6000)}",
+               task="client_update")
+    if not isinstance(out, dict) or not out.get("body"):
+        return {"subject": "", "body": "", "internal": []}
+    return {"subject": str(out.get("subject") or "")[:200], "body": str(out["body"]).replace("**", "")[:4000],
+            "internal": [str(x)[:300] for x in (out.get("internal") or []) if x][:8]}

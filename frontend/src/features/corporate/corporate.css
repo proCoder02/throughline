@@ -427,8 +427,30 @@
 .stk-detail .cu { flex-basis: 100%; order: 3; }
 
 /* ---- Ask: the Personal "Ask Throughline" chat (assistant.css) inside Corporate ---- */
-.corp-main:has(> .corp-ask) { display: flex; flex-direction: column; }
-.corp-ask { height: 100%; }
+.corp-main:has(> .corp-ask-layout) { display: flex; flex-direction: column; }
+.corp-ask-layout { display: flex; height: 100%; min-height: 0; }
+.corp-ask { height: 100%; flex: 1; min-width: 0; }
+/* Chats: the list of saved Ask conversations */
+.corp-ask-side { width: 270px; flex-shrink: 0; border-right: 1px solid var(--wa-border); background: var(--wa-panel); display: flex; }
+.corp-ask-history { display: flex; flex-direction: column; width: 100%; min-height: 0; padding: 14px 10px; gap: 4px; }
+.corp-ask-history-head { display: flex; gap: 6px; align-items: center; }
+.corp-ask-new { flex: 1; justify-content: center; }
+.corp-ask-new svg { width: 16px; height: 16px; }
+.corp-ask-history-label { font-size: var(--text-xs); font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--wa-text-soft); padding: 14px 8px 6px; }
+.corp-ask-history ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
+.corp-ask-history li { display: flex; align-items: center; border-radius: var(--radius-md); }
+.corp-ask-history li:hover, .corp-ask-history li.active { background: var(--wa-hover); }
+.corp-ask-history li.active .corp-ask-history-title { font-weight: 700; }
+.corp-ask-history-item { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; text-align: left; font: inherit;
+  background: transparent; border: 0; color: var(--wa-text); padding: 9px 8px; cursor: pointer; min-height: 44px; }
+.corp-ask-history-title { font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.corp-ask-history-meta { font-size: var(--text-xs); color: var(--wa-text-soft); }
+.corp-ask-history-del { opacity: 0; }
+.corp-ask-history li:hover .corp-ask-history-del, .corp-ask-history-del:focus-visible { opacity: 1; }
+.corp-ask-history-empty { padding: 0 8px; }
+.corp-ask-menu, .corp-ask-drawer { display: none; }
+.corp-ask-new-inline { display: none; }
 .corp .corp-ask .ac-composer textarea { border: 0; padding: 6px 4px; border-radius: 0; background: transparent; resize: none; box-shadow: none; }
 .corp .corp-ask .ac-composer textarea:focus-visible { outline: none; }
 .corp-ask .ac-header { gap: var(--space-3); padding: 14px 20px; }
@@ -451,6 +473,13 @@
 .corp-ask-source-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 820px) {
   /* main isn't a fixed-height scroller here: the thread scrolls with the page, composer sticks to the bottom */
+  .corp-ask-layout { height: auto; }
+  .corp-ask-side { display: none; }
+  .corp-ask-menu { display: grid; }
+  .corp-ask-new-inline { display: inline-flex; }
+  .corp-ask-drawer { display: flex; position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.35); }
+  .corp-ask-drawer .corp-ask-history { width: min(320px, 86vw); background: var(--wa-panel); box-shadow: 4px 0 24px rgba(0,0,0,.2); }
+  .corp-ask-history-del { opacity: 0.7; }
   .corp-ask { height: auto; min-height: calc(100dvh - 120px); }
   .corp-ask .ac-header { flex-wrap: wrap; padding: 12px 14px; }
   .corp-ask-head-actions { width: 100%; justify-content: space-between; }
@@ -536,3 +565,25 @@
   .tk-side { position: static; order: -1; }
   .corp-msg-tag { position: static; opacity: 0.7; margin-left: auto; display: inline-grid; }
 }
+
+/* ---- Client view: ticket progress, client updates, client-projects digest ---- */
+.tk-status.blocked { background: color-mix(in srgb, var(--wa-danger) 16%, transparent); color: var(--wa-danger); }
+.tk-progress { margin: 6px 0 4px; display: flex; flex-direction: column; gap: 6px; }
+.tk-progress-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tk-progress-label { font-size: var(--text-xs); font-weight: 600; color: var(--wa-text-soft); }
+.tk-progress-bar { flex: 1; min-width: 80px; max-width: 220px; height: 6px; border-radius: 3px; background: var(--wa-hover); overflow: hidden; }
+.tk-progress-bar > span { display: block; height: 100%; background: var(--wa-online); border-radius: 3px; }
+.tk-progress-bar > span.warn { background: var(--wa-danger); }
+.tk-chip.blocked, .tk-chip.late { border-color: var(--wa-danger); color: var(--wa-danger); }
+.tk-chip.done { opacity: .75; }
+.tk-internal ul { margin: 4px 0 0; padding-left: 1.2em; }
+.cd-projects { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-3); margin-top: var(--space-3); }
+.cd-project { border: 1px solid var(--wa-border); border-radius: var(--radius-md); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.cd-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+.cd-head .proj-health { margin-left: auto; }
+.cd-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.cd-item { display: flex; flex-direction: column; gap: 2px; padding-left: 10px; border-left: 3px solid var(--wa-border); }
+.cd-item.risk { border-left-color: var(--wa-danger); }
+.cd-item.soon { border-left-color: var(--wa-accent); }
+.cd-text { font-size: var(--text-sm); font-weight: 600; }
+.cd-done { color: var(--wa-online); margin: 0; }

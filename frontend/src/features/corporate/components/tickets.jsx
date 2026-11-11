@@ -6,7 +6,7 @@ import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
 import { CloseIcon, TagIcon } from '../../../icons.jsx';
 
-export const TICKET_STATUS = { todo: 'To do', in_progress: 'In progress', in_review: 'In review', done: 'Done', cancelled: 'Cancelled' };
+export const TICKET_STATUS = { todo: 'To do', in_progress: 'In progress', in_review: 'In review', blocked: 'Blocked', done: 'Done', cancelled: 'Cancelled' };
 export const PRIORITY = { urgent: 'Urgent', high: 'High', medium: 'Medium', low: 'Low' };
 export const ticketPath = (ref) => `/app/corp/tickets/${encodeURIComponent(ref)}`;
 
@@ -125,5 +125,25 @@ export function TicketsOnItem({ corp, sourceType, sourceId, title = 'Tickets' })
       ) : suggested.length === 0 && <p className="corp-muted corp-small">Not tagged to any ticket.</p>}
       {tagging && <TagToTicket corp={corp} sourceType={sourceType} sourceId={sourceId} onClose={() => setTagging(false)} onTagged={load} />}
     </section>
+  );
+}
+
+/** The tickets behind a client deliverable: "3 of 5 done · 1 blocked", a bar, and each ticket. */
+export function TicketProgress({ t, compact = false }) {
+  if (!t || !t.total) return null;
+  const pct = Math.round((t.done / t.total) * 100);
+  return (
+    <div className="tk-progress">
+      <div className="tk-progress-line">
+        <span className="tk-progress-label">{t.done} of {t.total} ticket{t.total === 1 ? '' : 's'} done{t.blocked ? ` · ${t.blocked} blocked` : ''}{t.late ? ` · ${t.late} late` : ''}</span>
+        <span className="tk-progress-bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label="Tickets done">
+          <span style={{ width: `${pct}%` }} className={t.blocked ? 'warn' : ''} /></span>
+      </div>
+      {!compact && (
+        <div className="corp-chips">{t.tickets.map((k) => (
+          <Link key={k.id} className={'corp-tag tk-chip ' + k.status + (k.late ? ' late' : '')} to={ticketPath(k.key)} title={k.title}>
+            <b>{k.key}</b>&nbsp;{TICKET_STATUS[k.status]}{k.late ? ' · late' : ''}</Link>))}</div>
+      )}
+    </div>
   );
 }
