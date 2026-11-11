@@ -417,6 +417,30 @@ CREATE TABLE IF NOT EXISTS corp.digest_sent (
     PRIMARY KEY (org_id, user_id, week)
 );
 
+-- Work identity: a person's confirmed work email for each organisation, and
+-- leaving kept as a status (history stays with the company; access ends).
+ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS work_email TEXT;
+ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ;
+ALTER TABLE corp.members DROP CONSTRAINT IF EXISTS members_status_check;
+ALTER TABLE corp.members ADD CONSTRAINT members_status_check CHECK (status IN ('active', 'suspended', 'left'));
+-- Emails a person has proved they receive (one-time code). An address belongs to
+-- whoever confirmed it last, so a company reusing it for a new hire moves it.
+CREATE TABLE IF NOT EXISTS corp.verified_emails (
+    email TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    verified_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_corp_verified_emails_user ON corp.verified_emails (user_id);
+CREATE TABLE IF NOT EXISTS corp.email_codes (
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (user_id, email)
+);
+
 -- Ask conversations (one person's own, per organisation), kept so earlier chats
 -- stay listed and follow-up questions know what came before.
 CREATE TABLE IF NOT EXISTS corp.ask_threads (

@@ -62,7 +62,8 @@ def get_thread(cur, org_id: int, thread_id: int, me: int):
 
 
 def messages(cur, thread_id: int, after: int = 0, limit: int = 200) -> list:
-    cur.execute("SELECT m.id, m.sender_id, us.username AS sender, m.kind, m.body, m.meta, m.created_at FROM corp.messages m "
+    cur.execute("SELECT m.id, m.sender_id, COALESCE(us.username, CASE WHEN m.kind = 'text' THEN 'Former member' END) AS sender, "
+                "m.kind, m.body, m.meta, m.created_at FROM corp.messages m "
                 "LEFT JOIN users us ON us.id = m.sender_id WHERE m.thread_id = %s AND m.id > %s ORDER BY m.id DESC LIMIT %s",
                 (thread_id, after, limit))
     rows = [dict(r) | {"created_at": r["created_at"].isoformat()} for r in cur.fetchall()]

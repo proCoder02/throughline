@@ -3,6 +3,7 @@
 // "Join"; without one they're told to ask their admin. Creating a new
 // organisation is a deliberate, secondary choice (and can be switched off:
 // CORPORATE_ORG_CREATION=closed).
+import WorkEmailConfirm from '../components/WorkEmailConfirm.jsx';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { corpApi, managerLabel } from '../corpApi.js';
@@ -70,9 +71,10 @@ export default function WelcomePage({ corp }) {
         <section className="corp-card corp-ask-admin">
           <MailIcon className="corp-empty-icon" aria-hidden="true" />
           <h2>Joining your company?</h2>
-          <p>Ask your Throughline admin to invite this email address:</p>
-          <p className="corp-email">{mine.email || 'your account email'}</p>
-          <p className="corp-muted corp-small">The invitation will appear here and in your inbox. Not the right address? Change it in Settings, or sign in with your work account.</p>
+          <p>Invitations sent to these addresses appear here:</p>
+          <p className="corp-email">{(mine.emails && mine.emails.length ? mine.emails : [mine.email || 'your account email']).join(' · ')}</p>
+          <p className="corp-muted corp-small">Invited at your work email? Confirm it, and keep using this account. Each company you join gets its own work identity.</p>
+          <WorkEmailConfirm onConfirmed={() => corpApi.myInvites().then(setMine).catch(() => {})} />
           <button className="corp-btn" onClick={() => corpApi.myInvites().then(setMine).catch(() => {})}>Check again</button>
         </section>
       )}

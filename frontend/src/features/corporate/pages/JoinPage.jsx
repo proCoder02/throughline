@@ -1,6 +1,7 @@
 // Opened from an invitation link (/app/corp/join/<token>). The person is
 // already signed in here (App shows the sign-in screen first, and keeps
 // this URL). Only the account with the invited email can accept.
+import WorkEmailConfirm from '../components/WorkEmailConfirm.jsx';
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { corpApi, managerLabel } from '../corpApi.js';
@@ -67,10 +68,13 @@ export default function JoinPage({ user, onJoined }) {
             <button className="corp-btn primary" onClick={accept} disabled={busy}>{busy ? 'Joining…' : `Join ${invite.org_name}`}</button>
           </>
         ) : (
-          <p className="corp-warn">
-            This invitation was sent to {invite.email_masked}, but you’re signed in as {user.username} with a different
-            email address. Sign in with the invited account to accept it.
-          </p>
+          <>
+            <p className="corp-warn">
+              This invitation was sent to {invite.email_masked}, which isn’t on your account yet. If it’s your work email,
+              confirm it below and you can join with the account you’re signed in to.
+            </p>
+            <WorkEmailConfirm hint={invite.email_masked} onConfirmed={() => corpApi.previewInvite(token).then(setInvite).catch((e) => setError(e.message))} />
+          </>
         )}
       </>
     );

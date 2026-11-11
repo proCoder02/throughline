@@ -178,7 +178,7 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         if ctx.is_owner:
             raise CorpError(400, "The owner can't leave. Delete the organisation instead.")
         orgs.hand_over_commitments(cur, org_id, ctx.user_id, None, ctx.user_id)
-        orgs.remove_member(cur, org_id, ctx.user_id)
+        orgs.remove_member(cur, org_id, ctx.user_id, ctx.user_id)
         conn.commit()
         return jsonify({"ok": True})
 
@@ -331,7 +331,7 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
             if to == user_id or not orgs.member_role(cur, org_id, to):
                 raise CorpError(400, "Hand their commitments to someone staying in the organisation.")
         moved = orgs.hand_over_commitments(cur, org_id, user_id, to, ctx.user_id)
-        orgs.remove_member(cur, org_id, user_id)
+        orgs.remove_member(cur, org_id, user_id, ctx.user_id)
         conn.commit()
         return jsonify({"members": orgs.list_members(cur, org_id, show_email=True), "handed_over": moved})
 
@@ -404,12 +404,13 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
             raise CorpError(400, "Add at least one valid email address.")
         if len(entries) > MAX_INVITES_PER_REQUEST:
             raise CorpError(400, f"At most {MAX_INVITES_PER_REQUEST} invitations at once.")
+        wanted = [e[0] for e in entries] or [""]
         cur.execute(
-            "SELECT lower(u.email) AS email FROM corp.members m JOIN users u ON u.id = m.user_id "
-            "WHERE m.org_id = %s AND lower(u.email) = ANY(%s)",
-            (org_id, [e[0] for e in entries] or [""]),
+            "SELECT lower(u.email) AS email, lower(m.work_email) AS work_email FROM corp.members m JOIN users u ON u.id = m.user_id "
+            "WHERE m.org_id = %s AND m.status <> 'left' AND (lower(u.email) = ANY(%s) OR lower(m.work_email) = ANY(%s))",
+            (org_id, wanted, wanted),
         )
-        already = {r["email"] for r in cur.fetchall()}
+        already = {e for r in cur.fetchall() for e in (r["email"], r["work_email"]) if e in wanted}
         base = (public_base_url() if public_base_url else request.host_url).rstrip("/")
         created, seen = [], set()
         for email, role, unit_id, unit_role in entries:
@@ -463,6 +464,87 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         row = cur.fetchone()
         return (row["email"] or "").strip().lower() if row else ""
 
+    def my_emails(cur, user_id) -> list:
+        """The account email plus work emails this person has confirmed with a code."""
+        account = my_email(cur, user_id)  # (its own query: run it before reading the next one)
+        cur.execute("SELECT email FROM corp.verified_emails WHERE user_id = %s ORDER BY verified_at", (user_id,))
+        return [e for e in [account] + [r["email"] for r in cur.fetchall()] if e]
+
+    # ----------------------------------------------------- work email (identity)
+    CODE_MINUTES, CODE_TRIES, RESEND_SECONDS = 15, 5, 60
+
+    def _code_hash(email, code):
+        import hashlib
+        return hashlib.sha256(f"{email}|{code}".encode()).hexdigest()
+
+    @bp.route("/corp/work-email", methods=["GET"])
+    @login_required
+    def work_emails():
+        _, cur = db_cur()
+        user_id = current_user_id()
+        account = my_email(cur, user_id)
+        cur.execute("SELECT email, verified_at FROM corp.verified_emails WHERE user_id = %s ORDER BY verified_at", (user_id,))
+        return jsonify({"account_email": account,
+                        "work_emails": [{"email": r["email"], "verified_at": r["verified_at"].isoformat()} for r in cur.fetchall()]})
+
+    @bp.route("/corp/work-email", methods=["POST"])
+    @login_required
+    def work_email_start():
+        """Sends a 6-digit code to a work address, to prove this person receives its mail."""
+        import secrets
+        conn, cur = db_cur()
+        user_id = current_user_id()
+        email = invites.normalize_email(body().get("email"))
+        if not email:
+            raise CorpError(400, "Enter a valid email address.")
+        if email == my_email(cur, user_id):
+            return jsonify({"verified": True, "email": email})
+        if not send_plain_email:
+            raise CorpError(503, "Email isn't set up on this server, so the code can't be sent.")
+        cur.execute("SELECT created_at > now() - make_interval(secs => %s) AS recent FROM corp.email_codes "
+                    "WHERE user_id = %s AND email = %s", (RESEND_SECONDS, user_id, email))
+        row = cur.fetchone()
+        if row and row["recent"]:
+            raise CorpError(429, "A code was just sent. Wait a minute before asking for another.")
+        code = f"{secrets.randbelow(1000000):06d}"
+        cur.execute("INSERT INTO corp.email_codes (user_id, email, code_hash, expires_at) VALUES (%s,%s,%s, now() + make_interval(mins => %s)) "
+                    "ON CONFLICT (user_id, email) DO UPDATE SET code_hash = EXCLUDED.code_hash, attempts = 0, "
+                    "created_at = now(), expires_at = EXCLUDED.expires_at", (user_id, email, _code_hash(email, code), CODE_MINUTES))
+        conn.commit()
+        try:
+            send_plain_email(email, f"Your Throughline code: {code}",
+                             f"Your code to confirm {email} on Throughline is {code}.\n\n"
+                             f"It works for {CODE_MINUTES} minutes. If you didn't ask for it, ignore this email.")
+        except Exception as e:  # noqa: BLE001
+            print(f"[corporate] work email code to {email} failed: {e!r}")
+            raise CorpError(502, "Couldn't send the code. Check the address and try again.")
+        return jsonify({"sent": True, "email": email, "masked": invites.mask_email(email)})
+
+    @bp.route("/corp/work-email/verify", methods=["POST"])
+    @login_required
+    def work_email_verify():
+        conn, cur = db_cur()
+        user_id = current_user_id()
+        d = body()
+        email = invites.normalize_email(d.get("email"))
+        code = "".join(ch for ch in str(d.get("code") or "") if ch.isdigit())
+        cur.execute("SELECT * FROM corp.email_codes WHERE user_id = %s AND email = %s", (user_id, email or ""))
+        row = cur.fetchone()
+        if not row or row["expires_at"] < __import__("datetime").datetime.now(row["expires_at"].tzinfo):
+            raise CorpError(400, "That code has expired. Ask for a new one.")
+        if row["attempts"] >= CODE_TRIES:
+            raise CorpError(429, "Too many wrong codes. Ask for a new one.")
+        if row["code_hash"] != _code_hash(email, code):
+            cur.execute("UPDATE corp.email_codes SET attempts = attempts + 1 WHERE user_id = %s AND email = %s", (user_id, email))
+            conn.commit()
+            raise CorpError(400, "That code isn't right. Check the email and try again.")
+        # The address now belongs to this person (a company may have reused it).
+        cur.execute("INSERT INTO corp.verified_emails (email, user_id) VALUES (%s, %s) "
+                    "ON CONFLICT (email) DO UPDATE SET user_id = EXCLUDED.user_id, verified_at = now()", (email, user_id))
+        cur.execute("DELETE FROM corp.email_codes WHERE user_id = %s AND email = %s", (user_id, email))
+        conn.commit()
+        return jsonify({"verified": True, "email": email})
+
     @bp.route("/corp/invites/<token>", methods=["GET"])
     @login_required
     def preview_invite(token):
@@ -475,7 +557,7 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
             "org_id": row["org_id"], "org_name": row["org_name"], "role": row["role"],
             "unit_name": row["unit_name"], "unit_kind": row["unit_kind"], "unit_role": row["unit_role"],
             "status": invites.status_of(row), "email_masked": invites.mask_email(row["email"]),
-            "email_matches": my_email(cur, user_id) == row["email"],
+            "email_matches": row["email"] in my_emails(cur, user_id),
             "already_member": orgs.member_role(cur, row["org_id"], user_id) is not None,
         })
 
@@ -496,10 +578,11 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
                                   "expired": "This invitation has expired. Ask for a new one.",
                                   "revoked": "This invitation was withdrawn."}[status])
         user_id = current_user_id()
-        if my_email(cur, user_id) != row["email"]:
+        if row["email"] not in my_emails(cur, user_id):
             raise CorpError(403, f"This invitation was sent to {invites.mask_email(row['email'])}. "
-                                 "Sign in with the account that uses that email address.")
-        orgs.add_member(cur, row["org_id"], user_id, row["role"])
+                                 "Confirm that work email on your account (we'll send it a code), then accept.")
+        account = my_email(cur, user_id)
+        orgs.add_member(cur, row["org_id"], user_id, row["role"], work_email=row["email"] if row["email"] != account else None)
         if row["unit_id"]:
             current = units.unit_role(cur, row["unit_id"], user_id)
             if current != "manager":  # never downgrade an existing manager
@@ -516,15 +599,16 @@ def create_corporate_blueprint(*, get_db, dict_cursor, login_required, current_u
         _, cur = db_cur()
         user_id = current_user_id()
         email = my_email(cur, user_id)
+        emails = my_emails(cur, user_id)
         cur.execute(
             "SELECT i.id, o.name AS org_name, un.name AS unit_name, un.kind AS unit_kind, i.unit_role, i.role, "
             "inv.username AS invited_by, i.expires_at FROM corp.invites i JOIN corp.orgs o ON o.id = i.org_id "
             "LEFT JOIN corp.units un ON un.id = i.unit_id LEFT JOIN users inv ON inv.id = i.invited_by "
-            "WHERE lower(i.email) = %s AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() "
-            "AND NOT EXISTS (SELECT 1 FROM corp.members m WHERE m.org_id = i.org_id AND m.user_id = %s) "
-            "ORDER BY i.created_at DESC", (email, user_id))
+            "WHERE lower(i.email) = ANY(%s) AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() "
+            "AND NOT EXISTS (SELECT 1 FROM corp.members m WHERE m.org_id = i.org_id AND m.user_id = %s AND m.status <> 'left') "
+            "ORDER BY i.created_at DESC", (emails, user_id))
         rows = [dict(r) | {"expires_at": r["expires_at"].isoformat()} for r in cur.fetchall()]
-        return jsonify({"email": email, "invites": rows})
+        return jsonify({"email": email, "emails": emails, "invites": rows})
 
     @bp.route("/corp/invites/mine/<int:invite_id>/accept", methods=["POST"])
     @login_required

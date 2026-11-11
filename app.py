@@ -1251,6 +1251,12 @@ def current_user_id():
     return authenticated_user_id()
 
 
+# Per-person daily AI limit (llm/quota.py): one check before every AI request
+# made on someone's behalf; LLM_DAILY_LIMIT in .env (0 = off).
+from llm import quota as _llm_quota  # noqa: E402
+_llm_quota.register(app, redis_client, authenticated_user_id)
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}

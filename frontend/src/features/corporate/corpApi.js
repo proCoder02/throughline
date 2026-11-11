@@ -40,6 +40,9 @@ export const corpApi = {
   setAccess: (id, userId, status) => apiJson(`${org(id)}/members/${userId}`, { method: 'PATCH', ...json({ status }) }),
   inviteRows: (id, rows) => post(`${org(id)}/invites`, { rows }),
   myInvites: () => apiJson('/corp/invites/mine'),
+  workEmails: () => apiJson('/corp/work-email'),
+  startWorkEmail: (email) => post('/corp/work-email', { email }),
+  verifyWorkEmail: (email, code) => post('/corp/work-email/verify', { email, code }),
   acceptMine: (inviteId) => post(`/corp/invites/mine/${inviteId}/accept`, {}),
 
   invites: (id) => apiJson(`${org(id)}/invites`),

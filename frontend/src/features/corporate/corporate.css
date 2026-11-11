@@ -598,3 +598,7 @@
   background: var(--wa-accent-solid, var(--wa-accent)); color: #fff; flex-shrink: 0; }
 .home-ask-send:disabled { opacity: .45; cursor: default; }
 .home-ask-send svg { width: 18px; height: 18px; }
+
+/* Work email confirmation (components/WorkEmailConfirm.jsx) */
+.wec { text-align: left; width: 100%; max-width: 460px; margin: var(--space-3) auto 0; }
+.wec input { width: 100%; }

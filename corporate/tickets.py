@@ -447,7 +447,7 @@ def detail(cur, ctx, org_id, row) -> dict:
                 "WHERE e.ticket_id = %s AND e.kind <> 'linked' ORDER BY e.id", (tid,))  # links show as their own entries
     timeline = [{"type": "event", "kind": r["kind"], "detail": r["detail"], "actor": r["actor"], "person": r["person"],
                  "at": r["at"].isoformat()} for r in cur.fetchall()]
-    cur.execute("SELECT c.id, c.body, c.created_at, c.author_id, u.username AS author FROM corp.ticket_comments c "
+    cur.execute("SELECT c.id, c.body, c.created_at, c.author_id, COALESCE(u.username, 'Former member') AS author FROM corp.ticket_comments c "
                 "LEFT JOIN users u ON u.id = c.author_id WHERE c.ticket_id = %s ORDER BY c.id", (tid,))
     timeline += [{"type": "comment", "id": r["id"], "body": r["body"], "actor": r["author"], "actor_id": r["author_id"],
                   "at": r["created_at"].isoformat()} for r in cur.fetchall()]

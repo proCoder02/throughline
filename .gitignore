@@ -43,3 +43,6 @@ node_modules/
 
 # ml/ pipeline: generated training data stays local (never committed)
 ml/data/
+
+# test screenshots
+tests/browser/_shots/
