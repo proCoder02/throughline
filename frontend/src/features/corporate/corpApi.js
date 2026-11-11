@@ -93,6 +93,22 @@ export const corpApi = {
   postUpdate: (id, c, kind, text) => post(`${org(id)}/commitments/${c}/updates`, { kind, text }),
 
   catchUp: (id, data) => post(`${org(id)}/catch-up`, data),
+
+  // ---- tickets (PAY-12) and what's been said about them
+  tickets: (id, params = {}) => apiJson(`${org(id)}/tickets?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== null && v !== undefined && v !== ''))}`),
+  createTicket: (id, data) => post(`${org(id)}/tickets`, data),
+  ticket: (id, t) => apiJson(`${org(id)}/tickets/${t}`),
+  editTicket: (id, t, data) => apiJson(`${org(id)}/tickets/${t}`, { method: 'PATCH', ...json(data) }),
+  ticketPerson: (id, t, userId, role, add) => apiJson(`${org(id)}/tickets/${t}/people/${userId}${add ? '' : `?role=${role}`}`,
+    add ? { method: 'PUT', ...json({ role }) } : { method: 'DELETE' }),
+  ticketComment: (id, t, body) => post(`${org(id)}/tickets/${t}/comments`, { body }),
+  tagTicket: (id, t, sourceType, sourceId, shared) => post(`${org(id)}/tickets/${t}/links`, { source_type: sourceType, source_id: sourceId, shared }),
+  ticketSuggestion: (id, t, linkId, action) => post(`${org(id)}/tickets/${t}/links/${linkId}/${action}`, {}),
+  untag: (id, t, linkId) => apiJson(`${org(id)}/tickets/${t}/links/${linkId}`, { method: 'DELETE' }),
+  ticketBrief: (id, t) => post(`${org(id)}/tickets/${t}/brief`, {}),
+  ticketsOn: (id, sourceType, sourceId) => apiJson(`${org(id)}/ticket-links?source_type=${sourceType}&source_id=${sourceId}`),
+  setTicketKey: (id, p, key) => apiJson(`${org(id)}/projects/${p}/ticket-key`, { method: 'PUT', ...json({ key }) }),
+  myEmails: (id) => apiJson(`${org(id)}/mail-items`),
   mailLink: (id) => apiJson(`${org(id)}/mail-link`),
   setMailLink: (id, enabled) => apiJson(`${org(id)}/mail-link`, { method: 'PUT', ...json({ enabled }) }),
 

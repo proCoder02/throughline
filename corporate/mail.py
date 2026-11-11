@@ -59,6 +59,9 @@ def _scan_person(cur, conn, call_llm, mail_handler, org_id, user_id) -> int:
                             "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id",
                             (org_id, user_id, key, folder, (full.get("subject") or "")[:300], (full.get("from") or "")[:200], body[:800]))
                 row = cur.fetchone()
+                if row:  # "PAY-12" in the subject or body tags the email to that ticket
+                    from . import tickets
+                    tickets.link_by_keys(cur, org_id, user_id, "email", row["id"], f"{full.get('subject') or ''}\n{body}")
                 conn.commit()
                 budget -= 1
                 if not row:

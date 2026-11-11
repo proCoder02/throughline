@@ -3,9 +3,10 @@ behind access.py, so the AI only sees what the asker may see."""
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, timedelta
 
-from . import access, ai, ledger
+from . import access, ai, ledger, tickets
 
 
 def brief(cur, org_id: int, me: int) -> dict:
@@ -85,6 +86,9 @@ def catch_up(cur, call_llm, org_id: int, me: int, days: int = 7, project_id=None
         parts.append(f"[C{r['id']}] {r['status']}{mine}: {r['text']} -- {r['owner'] or '?'} -> {r['owed_to'] or '-'}"
                      f"{', due ' + format(r['due_date'], '%d %b') if r['due_date'] else ''}{', ' + r['unit_name'] if r['unit_name'] else ''}"
                      f"{'; AT RISK: ' + r['risk_note'] if r['risk_note'] else ''}{'; BLOCKED: ' + r['blocker'] if r['blocker'] else ''}")
+    if not contact_id:
+        t_where = "x.project_id = %(proj)s AND x.status IN ('todo','in_progress','in_review')" if project_id else f"x.updated_at > {since}"
+        _ticket_sources(cur, org_id, me, t_where, p, srcs, parts, limit=15)
     if not parts:
         return {"brief": "Nothing new in what you can see for this period.", "sources": []}
     cur.execute("SELECT username FROM users WHERE id = %s", (me,))
@@ -133,6 +137,15 @@ def ask(cur, call_llm, org_id: int, me: int, question: str, unit_id=None) -> dic
     for r in cur.fetchall():
         srcs.append({"ref": f"T{r['id']}", "type": "message", "id": r["thread_id"], "title": r["body"][:80]})
         parts.append(f"[T{r['id']}] {r['username']} ({r['created_at']:%d %b}): {r['body'][:300]}")
+    named = tickets.keys_in(question.upper())
+    if named:
+        _ticket_sources(cur, org_id, me, "x.key = ANY(%(keys)s)", p | {"keys": named}, srcs, parts, limit=4, deep=True)
+    else:
+        # Any of the question's meaningful words (an all-words match almost never hits a short title).
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", question) if len(w) > 3][:8]
+        if words:
+            _ticket_sources(cur, org_id, me, "to_tsvector('english', x.title || ' ' || x.description) @@ to_tsquery('english', %(tq)s)",
+                            p | {"tq": " | ".join(words)}, srcs, parts, limit=4, deep=True)
     if not parts:
         return {"answer": "I don't have anything about that yet in the teams you're in.", "sources": []}
     text = ai.answer(call_llm, question, "\n".join(parts))
@@ -170,3 +183,35 @@ def common_ground(cur, call_llm, org_id: int, me: int, *, thread=None, meeting=N
                 "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
                 (org_id, thread["id"] if thread else None, meeting["id"] if meeting else None, json.dumps(result), used, me))
     return {"id": cur.fetchone()["id"], "result": result, "used_notes": used}
+
+
+def _ticket_sources(cur, org_id, me, where, params, srcs, parts, limit=10, deep=False) -> None:
+    """Tickets the viewer may see, as [K<id>] sources. deep=True adds what's
+    been said about each (link summaries, recent comments) -- for Ask."""
+    cur.execute("SELECT role FROM corp.members WHERE org_id = %s AND user_id = %s", (org_id, me))
+    m = cur.fetchone()
+    q = params | {"org": org_id, "me": me, "admin": bool(m and m["role"] in ("owner", "admin")), "tlimit": limit}
+    cur.execute("SELECT x.id, x.key, x.title, x.description, x.status, x.priority, x.due_date, x.summary, "
+                "(SELECT string_agg(u.username, ', ') FROM corp.ticket_people tp JOIN users u ON u.id = tp.user_id "
+                " WHERE tp.ticket_id = x.id AND tp.role = 'assignee') AS assignees "
+                f"FROM corp.tickets x WHERE x.org_id = %(org)s AND {tickets.visible()} AND {where} "
+                "ORDER BY x.updated_at DESC LIMIT %(tlimit)s", q)
+    for r in cur.fetchall():
+        srcs.append({"ref": f"K{r['id']}", "type": "ticket", "id": r["id"], "title": f"{r['key']} {r['title'][:70]}"})
+        line = (f"[K{r['id']}] Ticket {r['key']} ({r['status'].replace('_', ' ')}, {r['priority']}"
+                f"{', due ' + format(r['due_date'], '%d %b') if r['due_date'] else ''}, assigned {r['assignees'] or 'nobody'}): "
+                f"{r['title']}. {r['description'][:300]}")
+        if deep:
+            if r["summary"]:
+                line += f" Brief: {r['summary'][:500]}"
+            cur.execute("SELECT label, summary, shared, shared_text, created_at FROM corp.ticket_links WHERE ticket_id = %s "
+                        "AND status = 'linked' ORDER BY id DESC LIMIT 6", (r["id"],))
+            for l in cur.fetchall():
+                said = (l["shared_text"] if l["shared"] and l["shared_text"] else l["summary"]) or ""
+                if said:
+                    line += f" | {l['label']} {l['created_at']:%d %b}: {said[:300]}"
+            cur.execute("SELECT c.body, u.username FROM corp.ticket_comments c LEFT JOIN users u ON u.id = c.author_id "
+                        "WHERE c.ticket_id = %s ORDER BY c.id DESC LIMIT 4", (r["id"],))
+            for c in cur.fetchall():
+                line += f" | {c['username']}: {c['body'][:200]}"
+        parts.append(line)

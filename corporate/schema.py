@@ -324,6 +324,81 @@ ALTER TABLE corp.commitments DROP CONSTRAINT IF EXISTS commitments_source_type_c
 ALTER TABLE corp.commitments ADD CONSTRAINT commitments_source_type_check
     CHECK (source_type IN ('meeting', 'thread', 'manual', 'request', 'email'));
 
+-- Tickets (corporate/tickets.py): small issues inside a project, keyed like PAY-12,
+-- and everything said about them in chat, email and calls (ticket_links).
+ALTER TABLE corp.projects ADD COLUMN IF NOT EXISTS ticket_key TEXT;
+ALTER TABLE corp.projects ADD COLUMN IF NOT EXISTS ticket_seq INTEGER NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_corp_projects_ticket_key ON corp.projects (org_id, upper(ticket_key))
+    WHERE ticket_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS corp.tickets (
+    id SERIAL PRIMARY KEY,
+    org_id INTEGER NOT NULL REFERENCES corp.orgs (id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES corp.projects (id) ON DELETE CASCADE,
+    number INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo', 'in_progress', 'in_review', 'done', 'cancelled')),
+    priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('low', 'medium', 'high', 'urgent')),
+    due_date DATE,
+    -- Where the ticket lives: here, or (phase 2) an outside tracker such as Jira.
+    source TEXT NOT NULL DEFAULT 'throughline' CHECK (source IN ('throughline', 'jira')),
+    external_key TEXT,
+    external_url TEXT,
+    summary TEXT,
+    summary_at TIMESTAMPTZ,
+    created_by INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at TIMESTAMPTZ,
+    UNIQUE (org_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_corp_tickets_project ON corp.tickets (project_id, status);
+CREATE TABLE IF NOT EXISTS corp.ticket_people (
+    ticket_id INTEGER NOT NULL REFERENCES corp.tickets (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('assignee', 'watcher')),
+    PRIMARY KEY (ticket_id, user_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_corp_ticket_people_user ON corp.ticket_people (user_id);
+-- A conversation tagged to a ticket. Private content (a direct message, an email, a
+-- private call) is shown to others only as its summary unless the tagger shared it.
+CREATE TABLE IF NOT EXISTS corp.ticket_links (
+    id SERIAL PRIMARY KEY,
+    ticket_id INTEGER NOT NULL REFERENCES corp.tickets (id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL CHECK (source_type IN ('message', 'email', 'meeting', 'commitment')),
+    source_id INTEGER NOT NULL,
+    how TEXT NOT NULL CHECK (how IN ('key', 'manual', 'ai')),
+    status TEXT NOT NULL DEFAULT 'linked' CHECK (status IN ('linked', 'suggested', 'rejected')),
+    tagged_by INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    label TEXT NOT NULL DEFAULT '',
+    summary TEXT,
+    shared BOOLEAN NOT NULL DEFAULT false,
+    shared_text TEXT,  -- the content, kept only when the tagger chose to share it
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (ticket_id, source_type, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_corp_ticket_links_source ON corp.ticket_links (source_type, source_id);
+CREATE TABLE IF NOT EXISTS corp.ticket_events (
+    id SERIAL PRIMARY KEY,
+    ticket_id INTEGER NOT NULL REFERENCES corp.tickets (id) ON DELETE CASCADE,
+    actor_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    detail JSONB NOT NULL DEFAULT '{}',
+    at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_corp_ticket_events_ticket ON corp.ticket_events (ticket_id);
+CREATE TABLE IF NOT EXISTS corp.ticket_comments (
+    id SERIAL PRIMARY KEY,
+    ticket_id INTEGER NOT NULL REFERENCES corp.tickets (id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+    body TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_corp_ticket_comments_ticket ON corp.ticket_comments (ticket_id);
+-- Meetings and calls already checked for ticket suggestions.
+ALTER TABLE corp.meetings ADD COLUMN IF NOT EXISTS tickets_scanned_at TIMESTAMPTZ;
+
 -- Suspended members keep their place and history but can't open the organisation.
 ALTER TABLE corp.members ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'suspended'));

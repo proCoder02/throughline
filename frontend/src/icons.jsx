@@ -75,6 +75,8 @@ export const MeetIcon = (props) => <svg {...base} {...props}><rect x="3" y="4" w
 export const EyeIcon = (props) => <svg {...base} {...props}><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>;
 export const EyeOffIcon = (props) => <svg {...base} {...props}><path d="M3 3l18 18M10.6 5.1A10.7 10.7 0 0112 5c6.4 0 10 7 10 7a17.6 17.6 0 01-3.2 4.2M6.6 6.6A17.4 17.4 0 002 12s3.6 7 10 7a10 10 0 005.4-1.6M9.9 9.9a3 3 0 004.2 4.2"/></svg>;
 export const ShareIcon = (props) => <svg {...base} {...props}><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="M8.2 10.8l7.6-4.4M8.2 13.2l7.6 4.4"/></svg>;
+export const TicketIcon = (props) => <svg {...base} {...props}><path d="M3 8a2 2 0 002-2h14a2 2 0 002 2v2a2 2 0 000 4v2a2 2 0 00-2 2H5a2 2 0 00-2-2v-2a2 2 0 000-4V8z"/><path d="M14 6v12" strokeDasharray="2 2"/></svg>;
+export const TagIcon = (props) => <svg {...base} {...props}><path d="M20.6 13.4l-7.2 7.2a2 2 0 01-2.8 0L3 13V3h10l7.6 7.6a2 2 0 010 2.8z"/><circle cx="7.5" cy="7.5" r="1.5" fill="currentColor" stroke="none"/></svg>;
 export const ChartIcon = (props) => <svg {...base} {...props}><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>;
 export const RetryIcon =(props) => <svg {...base} {...props}><path d="M3 12a9 9 0 0115.5-6.2L21 8M21 3v5h-5M21 12a9 9 0 01-15.5 6.2L3 16M3 21v-5h5"/></svg>;
 export const BuildingIcon = (props) => <svg {...base} {...props}><path d="M4 21V5a2 2 0 012-2h8a2 2 0 012 2v16M16 9h2a2 2 0 012 2v10M2 21h20"/><path d="M8 7h4M8 11h4M8 15h4"/></svg>;

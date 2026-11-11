@@ -17,7 +17,7 @@ import time
 
 from flask import jsonify, request
 
-from . import access, chat, deps, insights, ledger, meetings, orgs
+from . import access, chat, deps, insights, ledger, meetings, orgs, tickets
 from .errors import CorpError
 from .roles import can_manage_people
 
@@ -126,6 +126,7 @@ def register(bp, *, db_cur, login_required, current_user_id, call_llm, transcrib
         t = chat.get_thread(cur, org_id, tid, ctx.user_id)
         text = str(body().get("body") or "")
         mid = chat.post(cur, tid, ctx.user_id, text)
+        tickets.link_by_keys(cur, org_id, ctx.user_id, "message", mid, text)  # "PAY-12" in a message tags it
         conn.commit()
         cur.execute("SELECT username FROM users WHERE id = %s", (ctx.user_id,))
         me = cur.fetchone()["username"]

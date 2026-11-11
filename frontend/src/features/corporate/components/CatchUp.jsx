@@ -5,7 +5,8 @@ import { Link } from 'react-router-dom';
 import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
 
-const LINK = { meeting: (s) => `/app/corp/meetings/${s.id}`, decision: (s) => `/app/corp/decisions?d=${s.id}`, commitment: () => '/app/corp/commitments' };
+const LINK = { meeting: (s) => `/app/corp/meetings/${s.id}`, decision: (s) => `/app/corp/decisions?d=${s.id}`, commitment: () => '/app/corp/commitments',
+  ticket: (s) => `/app/corp/tickets/${s.id}` };
 
 export default function CatchUp({ corp, label = 'Catch me up', params = {}, periods = true }) {
   const [days, setDays] = useState(7);

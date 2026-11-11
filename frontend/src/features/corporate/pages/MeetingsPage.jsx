@@ -1,6 +1,7 @@
 // Meetings -> team memory. Add one by recording in the browser, pasting
 // notes, or importing a
 // conversation already recorded with Listen or a call.
+import { TicketsOnItem } from '../components/tickets.jsx';
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { corpApi } from '../corpApi.js';
@@ -136,6 +137,7 @@ export function MeetingDetail({ corp }) {
         <section className="corp-card"><h2>Commitments ({m.commitments.length})</h2>
           {m.commitments.length ? <ul className="corp-list">{m.commitments.map((c) => <CommitmentRow key={c.id} corp={corp} c={c} onChanged={load} />)}</ul>
             : <p className="corp-muted">None found.</p>}</section>
+        <TicketsOnItem corp={corp} sourceType="meeting" sourceId={m.id} />
         {m.blockers.length > 0 && <section className="corp-card"><h2>Blockers</h2><ul>{m.blockers.map((b) => <li key={b.id}>{b.text}</li>)}</ul></section>}
         <section className="corp-card"><button className="corp-link" onClick={() => setShowT((v) => !v)}>{showT ? 'Hide transcript' : 'Show transcript'}</button>
           {showT && <pre className="corp-transcript">{m.transcript}</pre>}</section>

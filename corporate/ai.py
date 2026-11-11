@@ -133,17 +133,54 @@ def catch_up(call_llm, who: str, focus: str, sources: str) -> str:
     text = _call(call_llm, [
         {"role": "system", "content": "Write a short work catch-up from the sources only. Plain text, no markdown bold. "
                                       "Sections, each 1-4 lines starting with '- ': What changed, Decided, At risk, Needs you. "
-                                      "Skip a section with nothing in it. Cite sources like [M3], [D2], [C5]. Be specific: names, dates."},
+                                      "Skip a section with nothing in it. Cite sources like [M3], [D2], [C5], [K4]. Be specific: names, dates."},
         {"role": "user", "content": f"For: {who}. Focus: {focus}.\n\nSources:\n{clip(sources, ASK_CAP)}"},
     ]).strip()
-    return re.sub(r"[\u3010\uff3b]([MDC]\d+)[\u3011\uff3d]", r"[\1]", text).replace("**", "")
+    return re.sub(r"[\u3010\uff3b]([MDCK]\d+)[\u3011\uff3d]", r"[\1]", text).replace("**", "")
 
 
 def answer(call_llm, question: str, sources: str):
     text = _call(call_llm, [
-        {"role": "system", "content": "Answer a work question only from the sources. Cite like [M3], [D2], [C5], [T7]. "
+        {"role": "system", "content": "Answer a work question only from the sources. Cite like [M3], [D2], [C5], [T7], [K4]. "
                                       "If the sources don't say, reply that you don't have that yet. Be brief, plain text."},
         {"role": "user", "content": f"Sources:\n{clip(sources, ASK_CAP)}\n\nQuestion: {question}"},
     ]).strip()
     # Models sometimes cite with full-width brackets or add markdown bold.
-    return re.sub(r"[【［]([MDCT]\d+)[】］]", r"[\1]", text).replace("**", "")
+    return re.sub(r"[【［]([MDCTK]\d+)[】］]", r"[\1]", text).replace("**", "")
+
+
+# ---------------------------------------------------------------- tickets
+TICKET_CAP = 9000
+
+
+def link_summary(call_llm, kind: str, text: str) -> str:
+    """One neutral sentence about a tagged message, email or call -- what
+    others on the ticket see when the content itself is private."""
+    out = _call(call_llm, [
+        {"role": "system", "content": "Summarise this work item in one neutral sentence (max 30 words) for teammates on a ticket: "
+                                      "what it says about the issue -- facts, decisions, next steps. No greetings, no personal "
+                                      "details unrelated to the work. Plain text."},
+        {"role": "user", "content": f"{kind}:\n{clip(text, 4000)}"},
+    ])
+    return out.strip().replace("**", "")[:300]
+
+
+def ticket_match(call_llm, discussion: str, candidates: list) -> list:
+    """Which open tickets a call or meeting was about (ids), for people to confirm."""
+    lines = "\n".join(f"[{c['id']}] {c['key']}: {c['title'][:160]}" for c in candidates[:30])
+    out = _ask(call_llm,
+               'Which of these tickets did the discussion work on? JSON only: {"ids":[ids]}. '
+               "Only clear matches: the same specific issue, not just the same project.",
+               f"Tickets:\n{lines}\n\nDiscussion:\n{clip(discussion, EVIDENCE_CAP)}", task="ticket_match")
+    return [i for i in (out or {}).get("ids") or [] if isinstance(i, int)]
+
+
+def ticket_brief(call_llm, ticket: str, material: str) -> str:
+    """What we know about a ticket so far, from what all its viewers may see."""
+    text = _call(call_llm, [
+        {"role": "system", "content": "Write a short brief on a work ticket from the material only. Plain text, no markdown bold. "
+                                      "Sections, each 1-4 lines starting with '- ': What we know, Decided, Still open, Next step. "
+                                      "Skip a section with nothing in it. Be specific: names, dates."},
+        {"role": "user", "content": f"Ticket: {ticket}\n\nMaterial:\n{clip(material, TICKET_CAP)}"},
+    ]).strip()
+    return text.replace("**", "")

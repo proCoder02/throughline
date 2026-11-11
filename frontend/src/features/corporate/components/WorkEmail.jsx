@@ -2,6 +2,30 @@
 import { useEffect, useState } from 'react';
 import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
+import { TagIcon } from '../../../icons.jsx';
+import { TagToTicket } from './tickets.jsx';
+
+// Recent work emails Throughline has read for me, each taggable to a ticket.
+function RecentEmails({ corp }) {
+  const orgId = corp.data.org.id;
+  const [list, setList] = useState(null);
+  const [tagging, setTagging] = useState(null);
+  useEffect(() => { corpApi.myEmails(orgId).then((d) => setList(d.emails)).catch(() => setList([])); }, [orgId]);
+  if (!list || list.length === 0) return null;
+  return (
+    <details className="tk-emails">
+      <summary>Recent work emails ({list.length}) · tag one to a ticket</summary>
+      <ul className="corp-list">{list.map((e) => (
+        <li key={e.id} className="corp-person">
+          <span className="corp-row-main"><span className="corp-row-title">{e.subject || '(no subject)'}</span>
+            <span className="corp-row-sub">{e.folder === 'sent' ? 'Sent' : `From ${e.sender}`} · {new Date(e.created_at).toLocaleDateString()}</span></span>
+          <button className="corp-btn small" onClick={() => setTagging(e.id)}><TagIcon aria-hidden="true" /> Tag</button>
+        </li>))}</ul>
+      {tagging && <TagToTicket corp={corp} sourceType="email" sourceId={tagging} onClose={() => setTagging(null)} />}
+      <p className="corp-muted corp-small">Emails with a ticket key like PAY-12 in the subject or text are linked automatically.</p>
+    </details>
+  );
+}
 
 export default function WorkEmail({ corp }) {
   const [s, setS] = useState(null);
@@ -23,6 +47,7 @@ export default function WorkEmail({ corp }) {
           {' '}Find promises in my {s.connected.map((p) => (p === 'gmail' ? 'Gmail' : 'Outlook')).join(' and ')}</label>
       )}
       {s.enabled && <p className="corp-muted corp-small">{s.read} emails read so far.</p>}
+      {s.enabled && <RecentEmails corp={corp} />}
     </section>
   );
 }

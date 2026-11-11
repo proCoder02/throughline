@@ -4,7 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
-import { SendIcon, SparkleIcon } from '../../../icons.jsx';
+import { SendIcon, SparkleIcon, TagIcon } from '../../../icons.jsx';
+import { TagToTicket, WithTicketLinks } from '../components/tickets.jsx';
 import { CommonGroundCard, fmtDate } from '../components/work.jsx';
 import { refreshUnread } from '../../../lib/corpLive.js';
 
@@ -13,6 +14,7 @@ function Thread({ corp, threadId, user, onRead }) {
   const [msgs, setMsgs] = useState(null);
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [tagging, setTagging] = useState(null); // message id being tagged to a ticket
   const last = useRef(0);
   const end = useRef(null);
 
@@ -61,14 +63,16 @@ function Thread({ corp, threadId, user, onRead }) {
             : (
               <div key={m.id} className={'corp-msg' + (m.sender_id === user.id ? ' mine' : '')}>
                 {m.sender_id !== user.id && <div className="corp-msg-who">{m.sender}</div>}
-                <div className="corp-msg-body">{m.body}</div>
+                <div className="corp-msg-body"><WithTicketLinks text={m.body} /></div>
+                <button className="corp-msg-tag" onClick={() => setTagging(m.id)} aria-label="Tag this message to a ticket" title="Tag to ticket"><TagIcon /></button>
                 <div className="corp-msg-time">{fmtDate(m.created_at)} {new Date(m.created_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</div>
               </div>
             )))}
         <div ref={end} />
       </div>
+      {tagging && <TagToTicket corp={corp} sourceType="message" sourceId={tagging} onClose={() => setTagging(null)} />}
       <form className="corp-composer" onSubmit={send}>
-        <input aria-label="Message" placeholder="Write a message" value={text} onChange={(e) => setText(e.target.value)} maxLength={4000} />
+        <input aria-label="Message" placeholder="Write a message (type a ticket key like PAY-12 to link it)" value={text} onChange={(e) => setText(e.target.value)} maxLength={4000} />
         <button className="corp-btn primary" disabled={busy || !text.trim()} aria-label="Send"><SendIcon /></button>
       </form>
     </section>

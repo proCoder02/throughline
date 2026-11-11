@@ -11,6 +11,33 @@ import { AskTeam } from '../components/Requests.jsx';
 import { HEALTH } from './ProjectsPage.jsx';
 import CatchUp from '../components/CatchUp.jsx';
 
+// Ticket key (e.g. PAY): set once by a lead or admin; fixed once tickets exist.
+function TicketKey({ orgId, p, open, onSaved }) {
+  const [key, setKey] = useState(p.ticket_key || '');
+  const [editing, setEditing] = useState(false);
+  const save = async (e) => {
+    e.preventDefault();
+    try { await corpApi.setTicketKey(orgId, p.id, key); setEditing(false); onSaved(); } catch (err) { showToast(err.message, 'error'); }
+  };
+  return (
+    <section className="corp-card">
+      <div className="proj-sec-head"><h2>Tickets</h2>
+        {p.ticket_key && <Link className="corp-btn small" to={`/app/corp/tickets?project=${p.id}&scope=all`}>{open} open · view all</Link>}</div>
+      {p.ticket_key && !editing ? (
+        <p className="corp-muted">Tickets in this project are numbered <b>{p.ticket_key}-1</b>, <b>{p.ticket_key}-2</b>… Type a key in chat or an email subject to link it.
+          {p.can_edit && open === 0 && <> <button className="corp-link" onClick={() => setEditing(true)}>Change key</button></>}</p>
+      ) : p.can_edit ? (
+        <form className="corp-inline wrap" onSubmit={save}>
+          <label className="corp-field compact"><span>Ticket key</span>
+            <input value={key} onChange={(e) => setKey(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10))} placeholder="e.g. PAY" aria-describedby="key-help" /></label>
+          <button className="corp-btn primary small" disabled={key.length < 2}>Save</button>
+          <span id="key-help" className="corp-muted corp-small">2–10 capital letters or digits. Can’t change once tickets exist.</span>
+        </form>
+      ) : <p className="corp-muted">A project lead or admin sets a ticket key (e.g. PAY) to start using tickets here.</p>}
+    </section>
+  );
+}
+
 // Reporting tree from flat contacts; a broken or circular chain becomes a root.
 function trees(contacts) {
   const byId = new Map(contacts.map((c) => [c.id, c]));
@@ -119,6 +146,8 @@ export default function ProjectPage({ corp }) {
       </div><span className={'proj-health big ' + hTone}>{hLabel}</span></header>
 
       <section className="corp-card"><CatchUp corp={corp} label="Project brief" periods={false} params={{ project_id: Number(id) }} /></section>
+
+      <TicketKey orgId={orgId} p={p} open={n.tickets_open ?? 0} onSaved={load} />
 
       <div className="proj-kpis">
         <div><b>{n.open}</b><span>open</span></div>

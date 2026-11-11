@@ -163,8 +163,14 @@ STEPS = {
     "corp_radar": lambda cur, llm, push: radar(cur, llm, push),
     "corp_daily_brief": lambda cur, llm, push: daily_brief(cur, push),
     "corp_mail": lambda cur, llm, push: _mail_scan(cur, llm),
+    "corp_tickets": lambda cur, llm, push: _tickets(cur, llm, push),
 }
 _mail_handler = None  # set by start(): the host's mail tool lookup
+
+
+def _tickets(cur, llm, push):
+    from . import tickets
+    return tickets.run_job(cur, llm, push)
 
 
 def _mail_scan(cur, llm):

@@ -52,7 +52,8 @@ def register(bp, *, db_cur, login_required, current_user_id):
     @login_required
     def list_projects(org_id):
         _, cur, ctx = ctx_for(org_id)
-        cur.execute("SELECT p.id, p.name, p.client, p.status, p.end_date, pm.role AS my_role, "
+        cur.execute("SELECT p.id, p.name, p.client, p.status, p.end_date, p.ticket_key, pm.role AS my_role, "
+                    "(SELECT count(*) FROM corp.tickets t WHERE t.project_id = p.id AND t.status IN ('todo','in_progress','in_review')) AS open_tickets, "
                     "(SELECT count(*) FROM corp.project_members x WHERE x.project_id = p.id) AS members, "
                     "(SELECT count(*) FROM corp.commitments c WHERE c.project_id = p.id AND c.status IN ('open','overdue','requested','detected')) AS open_items, "
                     "(SELECT count(*) FROM corp.commitments c WHERE c.project_id = p.id AND (c.status = 'overdue' OR c.risk_note IS NOT NULL) "
@@ -110,9 +111,13 @@ def register(bp, *, db_cur, login_required, current_user_id):
             out[f] = out[f].isoformat() if out[f] else None
         out["created_at"] = out["created_at"].isoformat()
         out["can_edit"] = p["my_role"] == "lead" or ctx.is_admin
+        cur.execute("SELECT count(*) FILTER (WHERE status IN ('todo','in_progress','in_review')) AS open, "
+                    "count(*) FILTER (WHERE status = 'done') AS done FROM corp.tickets WHERE project_id = %s", (pid,))
+        tk = cur.fetchone()
         return jsonify({"project": out, "members": members, "contacts": contacts, "deliverables": items, "health": health,
                         "counts": {"open": len(live), "late": len(late), "at_risk": len(risky),
-                                   "done": sum(i["status"] == "done" for i in items)}})
+                                   "done": sum(i["status"] == "done" for i in items),
+                                   "tickets_open": tk["open"], "tickets_done": tk["done"]}})
 
     @bp.route(P + "/<int:pid>", methods=["PATCH"])
     @login_required

@@ -14,9 +14,9 @@ import FormattedText from '../../../components/FormattedText.jsx';
 import { ArrowUpIcon, ArrowDownIcon, CheckIcon, CopyIcon, RetryIcon, SparkleIcon } from '../../../icons.jsx';
 import '../../../components/assistant/assistant.css';
 
-const LINK = { meeting: (s) => `/app/corp/meetings/${s.id}`, decision: (s) => `/app/corp/decisions?d=${s.id}`,
+const LINK = { meeting: (s) => `/app/corp/meetings/${s.id}`, decision: (s) => `/app/corp/decisions?d=${s.id}`, ticket: (s) => `/app/corp/tickets/${s.id}`,
   commitment: () => '/app/corp/commitments', message: (s) => `/app/corp/messages?t=${s.id}` };
-const KIND = { meeting: 'Meeting', decision: 'Decision', commitment: 'Commitment', message: 'Chat' };
+const KIND = { meeting: 'Meeting', decision: 'Decision', commitment: 'Commitment', message: 'Chat', ticket: 'Ticket' };
 const STARTERS = [
   { title: 'Decisions', prompt: 'What did we decide about the database migration?' },
   { title: 'Pending', prompt: 'What is still pending from our last meetings?' },
