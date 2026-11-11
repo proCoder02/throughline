@@ -7,7 +7,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { corpApi } from '../corpApi.js';
 import { showToast } from '../../../lib/notify.js';
 import { fmtDate } from '../components/work.jsx';
-import { ChatIcon, CheckIcon, MicIcon, PlusIcon, SearchIcon } from '../../../icons.jsx';
+import { ArrowUpIcon, ChatIcon, CheckIcon, MicIcon, PlusIcon, SparkleIcon, TicketIcon } from '../../../icons.jsx';
 import CatchUp from '../components/CatchUp.jsx';
 import ClientDigest from '../components/ClientDigest.jsx';
 
@@ -68,6 +68,26 @@ function Setup({ corp }) {
   );
 }
 
+// Ask starts on Home: the question opens the Ask page in a new chat (its
+// history of chats lives there).
+function HomeAsk() {
+  const navigate = useNavigate();
+  const [q, setQ] = useState('');
+  const go = (e) => {
+    e.preventDefault();
+    const text = q.trim();
+    if (text) navigate(`/app/corp/ask?q=${encodeURIComponent(text.slice(0, 500))}`);
+  };
+  return (
+    <form className="home-ask" onSubmit={go} role="search">
+      <SparkleIcon aria-hidden="true" />
+      <input aria-label="Ask about your work" placeholder="Ask about your teams’ meetings, decisions, tickets and promises…"
+        value={q} onChange={(e) => setQ(e.target.value)} maxLength={500} />
+      <button className="home-ask-send" disabled={!q.trim()} aria-label="Ask"><ArrowUpIcon /></button>
+    </form>
+  );
+}
+
 export default function OverviewPage({ corp, user }) {
   const navigate = useNavigate();
   const { org, me, units } = corp.data;
@@ -82,7 +102,7 @@ export default function OverviewPage({ corp, user }) {
   const mine = units.filter((u) => u.my_role);
   const actions = [
     { label: 'Record a meeting', Icon: MicIcon, to: '/app/corp/meetings' },
-    { label: 'Ask', Icon: SearchIcon, to: '/app/corp/ask' },
+    { label: 'Tickets', Icon: TicketIcon, to: '/app/corp/tickets' },
     { label: 'Message', Icon: ChatIcon, to: '/app/corp/messages' },
     { label: 'Add commitment', Icon: PlusIcon, to: '/app/corp/commitments' },
   ];
@@ -123,6 +143,8 @@ export default function OverviewPage({ corp, user }) {
           <button key={label} className="home-action" onClick={() => navigate(to)}><Icon aria-hidden="true" /><span>{label}</span></button>
         ))}
       </nav>
+
+      <HomeAsk />
 
       {me.org_admin && <Setup corp={corp} />}
 

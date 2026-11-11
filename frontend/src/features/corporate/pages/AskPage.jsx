@@ -8,7 +8,7 @@
 // reopened or deleted, and a follow-up ("and who owns it?") knows what came
 // before in its thread.
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { corpApi } from '../corpApi.js';
 import { confirmDialog, showToast } from '../../../lib/notify.js';
 import { myUnits } from '../components/work.jsx';
@@ -147,8 +147,17 @@ export default function AskPage({ corp }) {
     } finally { setLoadingThread(false); }
   }, [orgId]);
 
+  const [params, setParams] = useSearchParams();
   useEffect(() => {
     loadThreads();
+    // From Home's ask box (?q=...): a new chat with that question.
+    const asked = params.get('q');
+    if (asked) {
+      setParams({}, { replace: true });
+      remember(orgId, null);
+      submit(asked);
+      return;
+    }
     const last = recalled(orgId);
     if (last) openThread(last);
   }, [orgId]); // eslint-disable-line react-hooks/exhaustive-deps
