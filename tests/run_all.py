@@ -19,7 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER = [
     "test_corporate.py", "test_corp_work.py", "test_corp_onboarding.py", "test_corp_projects.py",
     "test_corp_tickets.py", "test_corp_ask_threads.py", "test_corp_client_view.py", "test_corp_identity.py",
-    "test_ai_quota.py", "test_legal.py",
+    "test_ai_quota.py", "test_legal.py", "test_mail_timeouts.py",
 ]
 AI = ["roleplay_corporate.py"]  # real model calls
 BROWSER = [

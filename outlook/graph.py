@@ -124,12 +124,19 @@ def refresh_access_token(refresh_token: str) -> dict:
 
 
 def get(path: str, access_token: str, params: dict | None = None, headers: dict | None = None) -> dict:
-    resp = requests.get(
-        f"{GRAPH_BASE}{path}",
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}", **(headers or {})},
-        timeout=20,
-    )
+    try:
+        resp = requests.get(
+            f"{GRAPH_BASE}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}", **(headers or {})},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        # A slow or unreachable Outlook is an ordinary API failure (callers
+        # turn it into an {"error": ...} result), never a crash.
+        timed_out = isinstance(e, requests.Timeout)
+        raise GraphError("Outlook didn't answer in time -- try again in a minute." if timed_out
+                         else "Couldn't reach Outlook -- try again in a minute.", status=504 if timed_out else 503) from e
     if resp.status_code != 200:
         try:
             message = resp.json().get("error", {}).get("message") or resp.text

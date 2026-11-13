@@ -24,9 +24,17 @@ def scan(cur, conn, call_llm, mail_handler) -> int:
         return 0
     cur.execute("SELECT l.org_id, l.user_id FROM corp.mail_links l JOIN corp.members m ON m.org_id = l.org_id "
                 "AND m.user_id = l.user_id AND m.status = 'active' WHERE l.enabled")
-    found = 0
-    for link in cur.fetchall():
-        found += _scan_person(cur, conn, call_llm, mail_handler, link["org_id"], link["user_id"])
+    found, failed, links = 0, [], cur.fetchall()
+    for link in links:
+        # One person's mailbox misbehaving must not stop everyone else's scan.
+        try:
+            found += _scan_person(cur, conn, call_llm, mail_handler, link["org_id"], link["user_id"])
+        except Exception as e:
+            conn.rollback()
+            failed.append(f"user {link['user_id']}: {e!r}"[:200])
+            print(f"[corp_mail] scan failed for org {link['org_id']} user {link['user_id']}: {e!r}")
+    if links and len(failed) == len(links):
+        raise RuntimeError(f"email scan failed for everyone: {failed[0]}")  # a real outage: let ops alert
     return found
 
 

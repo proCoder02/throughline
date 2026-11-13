@@ -130,12 +130,19 @@ def revoke(token: str) -> None:
 
 
 def get(path: str, access_token: str, params: dict | list | None = None) -> dict:
-    resp = requests.get(
-        f"{GMAIL_BASE}{path}",
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=20,
-    )
+    try:
+        resp = requests.get(
+            f"{GMAIL_BASE}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        # A slow or unreachable Gmail is an ordinary API failure (callers
+        # turn it into an {"error": ...} result), never a crash.
+        timed_out = isinstance(e, requests.Timeout)
+        raise GoogleError("Gmail didn't answer in time -- try again in a minute." if timed_out
+                          else "Couldn't reach Gmail -- try again in a minute.", status=504 if timed_out else 503) from e
     if resp.status_code != 200:
         try:
             message = resp.json().get("error", {}).get("message") or resp.text
