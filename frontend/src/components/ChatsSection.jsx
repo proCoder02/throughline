@@ -1,43 +1,24 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useState } from 'react';
 import UseAnimations from 'react-useanimations';
 import mail from 'react-useanimations/lib/mail';
 import ListPane from './ListPane.jsx';
 import ChatThread from './ChatThread.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import ContextMenu from './ContextMenu.jsx';
+import AssistantChat from './assistant/AssistantChat.jsx';
 import { useConversations } from '../hooks/useConversations.js';
 import { useLiveSession } from '../hooks/useLiveSession.js';
 import { useLongPress } from '../hooks/useLongPress.js';
-import { apiJson, post, postForm } from '../api.js';
+import { post } from '../api.js';
 import { backfillConversationContent } from '../db.js';
 import { showToast, confirmDialog } from '../lib/notify.js';
 import { onEnterOrSpace } from '../lib/a11y.js';
 import { MicIcon, ChatIcon, TrashIcon } from '../icons.jsx';
 
-// Best-effort, silent, and fast on purpose -- must never turn a normal text
-// message into a permission-prompt interruption or a multi-second stall.
-// Only actually asks the browser for location when the message looks like
-// it wants one at all; every other message skips this with zero delay or
-// prompt. A denied/unavailable/slow fix just means the backend gets no
-// lat/lon and asks the user to share location or name a place instead --
-// mirrors the Flutter client's _maybeGetLocation exactly.
-const LOCATION_KEYWORD_RE = /\bnear(?:by)?\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\btrek\b|\bhik(?:e|ing)\b|\btrail\b|\bshop(?:ping)?\b|\brestaurant\b|\bcafe\b|\bcoffee\b|\bpark\b/i;
-
-function maybeGetLocation(text) {
-  return new Promise((resolve) => {
-    if (!LOCATION_KEYWORD_RE.test(text) || !navigator.geolocation) {
-      resolve(null);
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-      () => resolve(null), // denied, unavailable, or timed out -- send proceeds without location
-      { enableHighAccuracy: false, timeout: 4000, maximumAge: 60000 },
-    );
-  });
-}
-
-export default function ChatsSection({ notify, openConversationId, onConsumeOpenConversationId }) {
+export default function ChatsSection({
+  notify, openConversationId, onConsumeOpenConversationId,
+  autoOpenGlobalChat, onConsumeAutoOpenGlobalChat,
+}) {
   const conv = useConversations();
   const [selectedId, setSelectedId] = useState(null);
   const [selectedTranscript, setSelectedTranscript] = useState('');
@@ -47,20 +28,10 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   const [rowMenu, setRowMenu] = useState(null); // {x, y, chat} for the long-press quick-action menu
   const bindLongPress = useLongPress();
   // Cross-session Q&A ("What did I discuss with Rahul last week?") -- not
-  // tied to one conversation_id, so it's kept entirely separate from the
-  // per-conversation selectedId/messages state above.
+  // tied to one conversation_id. Its whole thread (history, sending,
+  // attachments, confirm sheets) lives in AssistantChat; this only tracks
+  // whether it's the open pane.
   const [globalChatOpen, setGlobalChatOpen] = useState(false);
-  const [globalMessages, setGlobalMessages] = useState([]);
-  const [globalSending, setGlobalSending] = useState(false);
-
-  // Persisted server-side (chat_messages, conversation_id NULL) -- loads
-  // once per visit to this tab so the thread survives closing the panel,
-  // reloading the page, or logging out entirely.
-  useEffect(() => {
-    apiJson('/chat/global')
-      .then((rows) => setGlobalMessages(rows.map((r) => ({ role: r.role, content: r.content }))))
-      .catch(() => {});
-  }, []);
 
   const visibleChats = categoryFilter === 'all'
     ? conv.list
@@ -94,6 +65,17 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Home's Ask bar/Quick Actions (see HomeSection.jsx) -- opens the global
+  // Ask thread immediately on arrival, same open-once-then-clear shape as
+  // openConversationId above, matching the Flutter Home screen's _openChat()
+  // opening the chat in place rather than requiring a second tap here.
+  useEffect(() => {
+    if (autoOpenGlobalChat) {
+      openGlobalChat();
+      onConsumeAutoOpenGlobalChat?.();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Below the mobile breakpoint, the list and the open chat can't share the
   // screen -- body.has-active swaps from the list to the full-screen thread
   // (see theme.css's @media block). No-op above that width, where the CSS
@@ -106,42 +88,6 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
   const openGlobalChat = () => {
     setSelectedId(null);
     setGlobalChatOpen(true);
-  };
-
-  const sendGlobalMessage = async (prompt) => {
-    setGlobalMessages((m) => [...m, { role: 'user', content: prompt }]);
-    setGlobalSending(true);
-    try {
-      const location = await maybeGetLocation(prompt);
-      const data = await post('/chat/global', { prompt, ...(location || {}) });
-      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      // Cognitive Commerce (Swiggy MCP) -- present only when the backend
-      // actually found real, orderable results; absent (undefined/null) for
-      // every other message, which MessageRow already treats as "no card".
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply, actionCard: data.action_card || null }]);
-    } catch (e) {
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
-    } finally {
-      setGlobalSending(false);
-    }
-  };
-
-  const sendGlobalImageMessage = async (file, description) => {
-    const previewUrl = URL.createObjectURL(file);
-    setGlobalMessages((m) => [...m, { role: 'user', content: description, imageUrl: previewUrl }]);
-    setGlobalSending(true);
-    try {
-      const form = new FormData();
-      form.append('image', file);
-      form.append('description', description);
-      const data = await postForm('/chat/global/image', form);
-      const reply = data.reply || (data.error && (data.error.error || data.error)) || 'No response.';
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: reply }]);
-    } catch (e) {
-      setGlobalMessages((m) => [...m, { role: 'assistant', content: 'Request failed.' }]);
-    } finally {
-      setGlobalSending(false);
-    }
   };
 
   // Global "Listen" button: always visible, starts a brand-new conversation.
@@ -275,21 +221,20 @@ export default function ChatsSection({ notify, openConversationId, onConsumeOpen
           onBack={() => setSelectedId(null)}
         />
       ) : globalChatOpen ? (
-        <ChatThread
-          title="Ask about your people & conversations"
-          subtitle="Ask across everything you've recorded"
-          placeholder='e.g. "What did I discuss with Rahul last week?"'
-          emptyHint="Ask about a person or a past topic -- I'll pull in whichever conversations are relevant."
-          messages={globalMessages}
-          onSend={sendGlobalMessage}
-          onSendImage={sendGlobalImageMessage}
-          sending={globalSending}
-          onBack={() => setGlobalChatOpen(false)}
-        />
+        // Shared ChatGPT-style assistant (same component as the desktop
+        // OS screen's Ask tab) -- owns its own history/send/attach/confirm
+        // state; this section only decides when it's open.
+        <div className="chat-panel">
+          <AssistantChat
+            title="Ask Throughline"
+            subtitle="Across your conversations, people, tasks and email"
+            onBack={() => setGlobalChatOpen(false)}
+          />
+        </div>
       ) : (
         <div className="chat-panel empty">
           <div className="empty-state">
-            <UseAnimations animation={mail} size={110} autoplay loop strokeColor="#1FC8B4" />
+            <UseAnimations animation={mail} size={110} autoplay loop strokeColor="#D98E4A" />
             <div className="empty-state-text">Select a conversation, or click Listen to start one.</div>
           </div>
         </div>

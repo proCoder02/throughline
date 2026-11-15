@@ -17,3 +17,14 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     </QueryClientProvider>
   </React.StrictMode>
 );
+
+// static/sw.js already existed (shell-cache-only, see its own comment) but
+// was never actually registered anywhere -- registering it here is what
+// makes the app satisfy PWA installability criteria for real, and gives a
+// standalone install a shell to fall back to instead of a blank error page
+// on a brief network hiccup.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}

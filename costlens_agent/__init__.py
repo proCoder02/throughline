@@ -36,6 +36,13 @@ from urllib.parse import urlparse
 logger = logging.getLogger("costlens-agent")
 
 _installed = False
+_tracker = None
+
+
+def get_stats():
+    """The tracker's health numbers (for the ops dashboard), or None when
+    tracking isn't installed in this process."""
+    return _tracker.stats() if _tracker is not None else None
 
 # Host -> CostLens provider name. Only these hosts are intercepted; anything
 # else (Firebase, SMTP, LiveKit signaling, etc.) passes through untouched.
@@ -177,7 +184,7 @@ def _infer_feature_tag(source_route: str) -> str:
 
 
 def install():
-    global _installed
+    global _installed, _tracker
     if _installed:
         return
     if os.getenv("COSTLENS_SDK", "false").lower() != "true":
@@ -194,6 +201,7 @@ def install():
     from .tracker import CostLensTracker
 
     tracker = CostLensTracker(api_key=api_key, costlens_url=costlens_url)
+    _tracker = tracker
 
     _patch_requests(tracker)
     _patch_psycopg2(tracker)

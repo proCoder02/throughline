@@ -39,6 +39,17 @@ function Tick({ message, onRetry }) {
   return <span className="dm-tick"><CheckIcon /></span>;
 }
 
+// One bubble per message id, first occurrence wins (history order).
+function dedupeById(list) {
+  const seen = new Set();
+  return list.filter((m) => {
+    if (m.id == null) return true;
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+}
+
 /// Real-time 1:1 text chat with a friend -- distinct from ChatThread (a solo
 /// Listen conversation's LLM Q&A). Delivery/read acks ride the same
 /// persistent /ws/notify connection as everything else (see
@@ -46,6 +57,7 @@ function Tick({ message, onRetry }) {
 /// call per tick -- mirrors the Flutter client's DirectMessageScreen exactly.
 export default function DirectMessageThread({ friend, myUserId, notify, onBack, onViewProfile }) {
   const [messages, setMessages] = useState(null);
+  const inFlightRef = useRef(new Set()); // outbox localIds whose POST hasn't returned yet
   const [infoOpen, setInfoOpen] = useState(false);
   // WhatsApp-style full-screen profile-picture viewer -- opened by clicking
   // the friend's avatar (header or Friend info panel); no-op when they have
@@ -99,14 +111,15 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack, 
       // retries them right away rather than waiting for a manual tap.
       const queued = await getOutboxForFriend(friend.id);
       if (cancelled) return;
-      setMessages([
+      setMessages(dedupeById([
         ...items,
         ...queued.map((q) => ({
           id: q.localId, _localId: q.localId, sender_id: myUserId,
-          content: q.content, created_at: q.createdAt, _status: 'failed',
+          // Still being sent right now (sent before history finished loading) -- not failed.
+          content: q.content, created_at: q.createdAt, _status: inFlightRef.current.has(q.localId) ? 'sending' : 'failed',
           attachment_url: q.attachmentUrl, attachment_type: q.attachmentType, thumbnail_data_url: q.thumbnailDataUrl,
         })),
-      ]);
+      ]));
       // Safety-net backfill -- registerDmListener below already acks
       // delivery for every live event while this thread is mounted; this
       // only matters for messages that arrived before that (e.g. the
@@ -127,7 +140,9 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack, 
 
     const unregister = notify.registerDmListener(friend.id, (msg) => {
       if (msg.type === 'direct_message') {
-        setMessages((prev) => [...(prev || []), msg.message]);
+        // A replayed/repeated event for a message already on screen (e.g. it
+        // came in with the history load too) must not add a second bubble.
+        setMessages((prev) => dedupeById([...(prev || []), msg.message]));
         // Arrived while this thread was already open -- read immediately.
         notify.sendDmAck({ type: 'ack_read', friend_id: friend.id });
         notify.clearDmUnread(friend.id);
@@ -214,19 +229,30 @@ export default function DirectMessageThread({ friend, myUserId, notify, onBack, 
   // already uploaded to R2 by the time this runs (see sendAttachment below).
   // The outbox/retry machinery only ever re-attempts this small JSON POST,
   // never the upload itself.
+  //
+  // Confirmed live: messages arrived twice. flushOutbox (on thread load and
+  // on every 'online' event) used to re-POST an outbox entry whose first send
+  // was still in flight. Now an in-flight entry is never sent again, and
+  // client_id (the outbox localId) makes the server ignore any repeat that
+  // still gets through (e.g. a retry after a response that never arrived).
   const attemptSend = async (localId, content, attachment) => {
+    if (inFlightRef.current.has(localId)) return;
+    inFlightRef.current.add(localId);
     try {
       const message = await post(`/friends/${friend.id}/messages`, {
         content,
+        client_id: localId,
         attachment_url: attachment?.attachmentUrl,
         attachment_type: attachment?.attachmentType,
         thumbnail_data_url: attachment?.thumbnailDataUrl,
       });
       await removeOutboxMessage(localId);
-      setMessages((prev) => (prev || []).map((m) => (m._localId === localId ? message : m)));
+      setMessages((prev) => dedupeById((prev || []).map((m) => (m._localId === localId ? message : m))));
       bumpMessageActivity(1);
     } catch (e) {
       setMessages((prev) => (prev || []).map((m) => (m._localId === localId ? { ...m, _status: 'failed' } : m)));
+    } finally {
+      inFlightRef.current.delete(localId);
     }
   };
 

@@ -1,0 +1,2 @@
+{# A value from .env (LEGAL_*), or a visible marker when it hasn't been set yet -- never an invented value. #}
+{% macro val(v, label) %}{% if v %}{{ v }}{% else %}<span class="todo">[{{ label }} — to be added]</span>{% endif %}{% endmacro %}

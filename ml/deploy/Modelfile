@@ -1,0 +1,8 @@
+# Replaced with the real path by setup_ollama.sh.
+FROM ./throughline-3b-Q4_K_M.gguf
+# Low temperature: these tasks want the same JSON every time.
+PARAMETER temperature 0.1
+# Room for a capped transcript (corporate/ai.py caps inputs) plus the answer.
+PARAMETER num_ctx 6144
+# If answers look garbled, the chat template didn't carry over from the GGUF:
+# copy the TEMPLATE block from `ollama show qwen2.5:3b --modelfile` into this file.

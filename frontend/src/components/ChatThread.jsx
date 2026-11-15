@@ -10,7 +10,10 @@ export default function ChatThread({
   pendingSpeakerIndex = null, knownSpeakers, onNameSpeaker, onSkipSpeaker, onReopenPrompt,
   tags, onTagClick, onDismissTag,
   messages, onSend, sending, onDelete, onListen, onStopListen, onBack,
-  subtitle, placeholder, emptyHint, onSendImage, onActionResolved,
+  subtitle, placeholder, emptyHint, onSendImage, onSendPdf, onActionResolved,
+  // Global chat only: a waiting bubble while `sending` (e.g. "Checking your
+  // inbox…"), and an optional row rendered just above the composer.
+  pendingLabel, aboveComposer,
 }) {
   const scrollRef = useRef(null);
   // Only relevant when onSendImage is provided (global chat today) -- a
@@ -22,7 +25,7 @@ export default function ChatThread({
   const [infoOpen, setInfoOpen] = useState(false);
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages.length]);
+  }, [messages.length, sending]);
 
   return (
     <div className="chat-panel">
@@ -32,7 +35,7 @@ export default function ChatThread({
         <div className="chat-header-info">
           <div className="chat-header-name">{title}</div>
           <div className="chat-header-sub">
-            {isLive ? <span className="live-badge"><span className="dot" />{liveStatus || 'Listening'}</span> : (subtitle || 'Ask about this conversation')}
+            {isLive ? <span className="live-badge" title="Recording -- make sure everyone here knows"><span className="dot" />{liveStatus || 'Listening'} · make sure everyone here knows</span> : (subtitle || 'Ask about this conversation')}
           </div>
         </div>
         <div className="chat-header-actions">
@@ -74,14 +77,18 @@ export default function ChatThread({
             content={m.content}
             formatted={m.role !== 'user'}
             imageUrl={m.imageUrl}
-            actionCard={m.actionCard}
+            actionCards={m.actionCards}
+            replyMeta={m.replyMeta}
             onActionResolved={onActionResolved}
           />
         ))}
-        {!messages.length && (
+        {sending && pendingLabel && <MessageRow mine={false} content={pendingLabel} />}
+        {!messages.length && !sending && (
           <div className="list-empty">{emptyHint || 'Ask a question about this conversation to get started.'}</div>
         )}
       </div>
+
+      {aboveComposer && !pendingImage && <div style={{ padding: '6px 12px 0' }}>{aboveComposer}</div>}
 
       {tags?.length > 0 && (
         <div className="topic-tags">
@@ -114,6 +121,9 @@ export default function ChatThread({
           disabled={sending}
           placeholder={placeholder || 'Ask about this conversation...'}
           onImageSelected={onSendImage ? setPendingImage : undefined}
+          onPdfSelected={onSendPdf}
+          attachAccept={onSendPdf ? 'image/*,application/pdf' : undefined}
+          attachLabel={onSendPdf ? 'Attach a photo or PDF' : undefined}
           extraButton={onListen && (
             <button
               className="send-btn"

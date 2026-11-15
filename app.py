@@ -1,4 +1,4 @@
-
+﻿
 import os
 import re
 import io
@@ -6,9 +6,8 @@ import math
 import json
 import base64
 import hashlib
-import hmac
+import html
 import secrets
-import shutil
 import tempfile
 import threading
 import jwt as pyjwt
@@ -19,7 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from email.utils import formataddr
+from email.utils import formataddr, formatdate, make_msgid
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -38,6 +37,29 @@ from rq import Queue
 import livekit.api as livekit_api
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, messaging as firebase_messaging
+
+# Admin ops dashboard, job tracking, stale-job alerting -- a fully separate
+# package (ops/) with its own DB pool, templates, and auth, specifically so
+# future ops changes never require touching this file. See ops/__init__.py.
+from ops import db as ops_db
+from ops import job_control as ops_job_control
+from ops.actions import register_nudge_runner
+from ops.alerts import ops_alert_worker
+import chat_followup
+import chat_summary
+import mail_sent_box
+import legal
+import llm
+import storage as storage_module
+from ops.dashboard import admin_bp
+from ops.scheduler import custom_job_scheduler
+from ops.tracking import record_fcm_send, record_heartbeat, record_completed_run as _ops_record_completed_run
+from ops.actions import register_runner as _ops_register_runner
+from ops import checks as ops_checks
+from ops import tasks as ops_tasks
+from ops import notify as ops_notify
+from ops import remediations as ops_remediations
+from ops.probe import ops_probe_worker
 
 load_dotenv()
 
@@ -103,6 +125,7 @@ sock = Sock(app)
 # Set a real, stable secret in your .env for anything beyond local POC use:
 # FLASK_SECRET_KEY=<a long random string>
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
+app.register_blueprint(admin_bp)
 
 # Only needed for the Vite dev server (a different origin/port than Flask);
 # the production build is served by Flask itself below, so it's same-origin
@@ -213,7 +236,9 @@ redis_pubsub_client = redis.from_url(
 # TimeoutErrors. RQ has no equivalent graceful-degradation path, so this
 # client gets a more forgiving timeout instead.
 rq_redis_client = redis.from_url(
-    REDIS_URL, decode_responses=True, protocol=2, socket_connect_timeout=5, socket_timeout=10
+    # decode_responses must stay off: RQ stores each job as pickled bytes, and a
+    # decoding client makes the worker fail on the first job it reads.
+    REDIS_URL, decode_responses=False, protocol=2, socket_connect_timeout=5, socket_timeout=10
 )
 
 # Call-recording processing queue (Deepgram transcription + conversation
@@ -504,6 +529,156 @@ def compute_compiled_mood(cur, user_id, bucket_start, bucket_end):
     return {"mood_label": label, "emoji": MOOD_EMOJI.get((label or "").lower(), DEFAULT_MOOD_EMOJI)}
 
 
+def _normalize_category(category):
+    """'food', 'Food', 'FOOD' all collapse to one bucket -- otherwise
+    compute_monthly_spending_summary's GROUP BY treats them as distinct
+    categories and silently fragments the spending totals. The LLM still
+    decides what the category IS (no fixed taxonomy); this only makes
+    repeated mentions of the same word aggregate together. Capitalize()
+    rather than title() so a multi-word category ('food delivery') reads
+    naturally ('Food delivery') instead of ('Food Delivery')."""
+    if not category:
+        return None
+    return category.strip().capitalize() or None
+
+
+# A small known set for UPI apps specifically -- there are only so many of
+# them, and their real names don't follow simple capitalize() rules
+# ("GPay", not "Gpay"; "PhonePe", not "Phonepe"). Keyed on a lowercased,
+# space-stripped form so "Google Pay", "GPay", and "google pay" all land on
+# the one canonical label. Also covers the generic (bank-less) rail names
+# for non-UPI payments -- "credit card"/"creditcard" both land on "Credit
+# Card" the same way. Unlike category, the fallback for anything NOT in
+# this map is the model's OWN capitalization, not .title() -- a credit
+# card receipt's payment_method is typically "<Bank> Credit Card" (e.g.
+# "HDFC Credit Card"), and .title() would mangle the bank's own acronym
+# (HDFC -> Hdfc), undoing a reading the model already got right.
+_PAYMENT_METHOD_CANONICAL = {
+    "googlepay": "Google Pay", "gpay": "Google Pay",
+    "phonepe": "PhonePe",
+    "paytm": "Paytm",
+    "amazonpay": "Amazon Pay",
+    "bhim": "BHIM",
+    "cred": "CRED",
+    "whatsapppay": "WhatsApp Pay",
+    "mobikwik": "MobiKwik",
+    "creditcard": "Credit Card",
+    "debitcard": "Debit Card",
+    "netbanking": "Net Banking",
+    "banktransfer": "Bank Transfer",
+    "upi": "UPI",
+}
+
+
+def _normalize_payment_method(payment_method):
+    if not payment_method:
+        return None
+    stripped = payment_method.strip()
+    if not stripped:
+        return None
+    key = re.sub(r"[^a-z0-9]", "", stripped.lower())
+    return _PAYMENT_METHOD_CANONICAL.get(key, stripped)
+
+
+def compute_monthly_spending_summary(cur, user_id, start, end):
+    """Category-level spending totals for user_id in [start, end), computed
+    on read same as compute_compiled_mood above (no cron needed for a
+    GROUP BY this cheap). Returns a list of {category, total, count} rows,
+    highest-spend first; empty list if nothing logged in that window."""
+    cur.execute(
+        "SELECT COALESCE(category, 'Uncategorized') AS category, SUM(amount) AS total, COUNT(*) AS n "
+        "FROM transactions WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "GROUP BY COALESCE(category, 'Uncategorized') ORDER BY total DESC",
+        (user_id, start, end),
+    )
+    return [{"category": r["category"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
+
+
+def compute_monthly_payment_method_summary(cur, user_id, start, end):
+    """Same shape as compute_monthly_spending_summary, grouped by
+    payment_method instead -- a separate dimension (which UPI app a payment
+    went through) from category (what it was for), see transactions table's
+    own comment in schema.sql."""
+    cur.execute(
+        "SELECT COALESCE(payment_method, 'Unknown') AS payment_method, SUM(amount) AS total, COUNT(*) AS n "
+        "FROM transactions WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "GROUP BY COALESCE(payment_method, 'Unknown') ORDER BY total DESC",
+        (user_id, start, end),
+    )
+    return [{"payment_method": r["payment_method"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
+
+
+def _payment_method_names(name):
+    """Every spelling a payment app is stored under: what was asked
+    ("GPay") plus the canonical label receipts are saved with ("Google
+    Pay", see _normalize_payment_method)."""
+    names = {name.strip().lower()}
+    canonical = _normalize_payment_method(name)
+    if canonical:
+        names.add(canonical.lower())
+    return sorted(n for n in names if n)
+
+
+def query_transactions(cur, user_id, start, end, keywords=None, category=None, limit=50, payment_method=None):
+    """Logged expenses in [start, end), optionally narrowed to ones whose
+    item/payee/category/payment app matches ANY keyword (case-insensitive
+    substring), an exact category, and/or a payment app ("GPay" also finds
+    "Google Pay"). Returns (rows newest-first capped at limit, total,
+    count, by_category) -- totals cover every match, not just the rows
+    returned."""
+    where, params = ["user_id = %s", "created_at >= %s", "created_at < %s"], [user_id, start, end]
+    words = [w.strip() for w in (keywords or []) if isinstance(w, str) and w.strip()][:15]
+    if words:
+        # Payment app too: confirmed live that "how much through GPay?" was
+        # answered Rs 0 -- the model searched keywords=['GPay'], which only
+        # ever looked at item/payee/category.
+        # A multi-word keyword ("Gopal Pan Shop") matches when every word
+        # appears somewhere in item/payee/category, not only as that exact
+        # phrase -- so "GOPAL PAN SHOP UPI" or payee "Gopal" + item "pan" count.
+        text = "(COALESCE(item,'') || ' ' || COALESCE(payee,'') || ' ' || COALESCE(category,''))"
+        clauses = []
+        for w in words:
+            parts = w.split()
+            clauses.append("(" + " AND ".join([f"{text} ILIKE %s"] * len(parts))
+                           + " OR lower(COALESCE(payment_method,'')) = ANY(%s))")
+            params += [f"%{p}%" for p in parts] + [_payment_method_names(w)]
+        where.append("(" + " OR ".join(clauses) + ")")
+    if category:
+        where.append("lower(category) = lower(%s)")
+        params.append(category.strip())
+    if isinstance(payment_method, str) and payment_method.strip():
+        where.append("lower(COALESCE(payment_method,'')) = ANY(%s)")
+        params.append(_payment_method_names(payment_method))
+    clause = " AND ".join(where)
+    cur.execute(f"SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n FROM transactions WHERE {clause}", params)
+    agg = cur.fetchone()
+    cur.execute(
+        f"SELECT COALESCE(category, 'Uncategorized') AS category, SUM(amount) AS total, COUNT(*) AS n "
+        f"FROM transactions WHERE {clause} GROUP BY 1 ORDER BY total DESC LIMIT 12", params)
+    by_category = [{"category": r["category"], "total": float(r["total"]), "count": r["n"]} for r in cur.fetchall()]
+    cur.execute(
+        f"SELECT item, payee, category, payment_method, amount, created_at FROM transactions WHERE {clause} "
+        f"ORDER BY created_at DESC LIMIT %s", params + [limit])
+    return [dict(r) for r in cur.fetchall()], float(agg["total"]), agg["n"], by_category
+
+
+def compute_recent_transactions(cur, user_id, start, end, limit=25):
+    """Individual transactions (not aggregated), newest first -- the
+    category/payment-method summaries above answer "where am I spending
+    the most", but have nothing to offer a request like "send today's
+    purchases to a friend", which needs to name WHAT was actually bought.
+    Confirmed missing live: composing that message from the category
+    summary alone produced "Blinkit purchase: Rs 1,317" instead of naming
+    the item, since a SUM-by-category row has no item field at all."""
+    cur.execute(
+        "SELECT item, payee, category, payment_method, amount, created_at FROM transactions "
+        "WHERE user_id = %s AND created_at >= %s AND created_at < %s "
+        "ORDER BY created_at DESC LIMIT %s",
+        (user_id, start, end, limit),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
 # Adaptive home-screen motion (see ADAPTIVE_HOME_ANIMATION_PLAN.md) --
 # collapses the 8 raw mood_label values into the 4 coarse buckets the
 # Flutter client's MotionProfile table actually branches on. A label this
@@ -714,7 +889,7 @@ def build_ics(summary, description, start_utc, duration_minutes=30):
     return "\r\n".join(lines)
 
 
-def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None):
+def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None, attachments=None):
     """Shared send for send_reminder_email/send_plain_email below, over a
     real hosted mailbox (throughline@zoomxcom.com, Hostinger) rather than a
     personal Gmail account -- Gmail SMTP hit a real account-level Google
@@ -737,19 +912,49 @@ def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, r
     name (e.g. "Amit via Throughline <throughline@zoomxcom.com>" -- still
     the same authenticated address, just a recognizable label) and
     reply_to points replies at the sending user's own registered email
-    instead of the shared mailbox, so a reply reaches them directly."""
+    instead of the shared mailbox, so a reply reaches them directly.
+
+    attachments: optional list of {"filename", "content_type", "data"}
+    dicts (e.g. a vehicle insurance claim's supporting photos/FIR -- see
+    confirm_email_draft) -- attached the same way the .ics branch below
+    already does, just generalized from one hardcoded file to a list.
+
+    Returns True/False for the reminder callers; _smtp_send_detailed below
+    is the full version (Message-ID, refused recipients, Sent-folder check)."""
+    return _smtp_send_detailed(
+        to_email, subject, text_body, ics_content=ics_content, from_name=from_name,
+        reply_to=reply_to, attachments=attachments,
+    )["sent"]
+
+
+def _smtp_send_detailed(to_email, subject, text_body, ics_content=None, from_name=None, reply_to=None,
+                        attachments=None, bcc=None, save_to_sent=False):
+    """Sends one email and reports exactly what happened:
+    {"sent", "message_id", "error", "sent_box"}.
+
+    sent is True only when the SMTP server accepted the message FOR to_email
+    (sendmail's refused-recipients dict is checked, not just "no exception").
+    bcc: extra envelope recipients, never shown in any header -- used to give
+    the sending user their own copy. save_to_sent: file the message in the
+    shared mailbox's Sent folder and confirm it there by Message-ID (see
+    mail_sent_box) -- SMTP on its own never keeps a copy anywhere."""
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_username = os.getenv("SMTP_USERNAME")
     smtp_password = os.getenv("SMTP_PASSWORD")
+    result = {"sent": False, "message_id": None, "error": None, "sent_box": None}
     if not all([smtp_host, smtp_username, smtp_password]):
         print("[email] SMTP not configured (SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD) -- skipping")
-        return False
+        result["error"] = "Email sending is not configured on the server"
+        return result
 
     msg = MIMEMultipart()
     msg["From"] = formataddr((f"{from_name} via Throughline", smtp_username)) if from_name else smtp_username
     msg["To"] = to_email
     msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=False)
+    msg["Message-ID"] = make_msgid(domain=smtp_username.partition("@")[2] or None)
+    result["message_id"] = msg["Message-ID"]
     if reply_to:
         msg["Reply-To"] = reply_to
     msg.attach(MIMEText(text_body, "plain"))
@@ -761,17 +966,34 @@ def _smtp_send(to_email, subject, text_body, ics_content=None, from_name=None, r
         ics_part.add_header("Content-Disposition", "attachment", filename="reminder.ics")
         msg.attach(ics_part)
 
+    for attachment in (attachments or []):
+        main_type, _, sub_type = (attachment.get("content_type") or "application/octet-stream").partition("/")
+        part = MIMEBase(main_type or "application", sub_type or "octet-stream")
+        part.set_payload(attachment["data"])
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=attachment["filename"])
+        msg.attach(part)
+
+    envelope = [to_email] + [b for b in (bcc or []) if b and b.lower() != to_email.lower()]
+    raw = msg.as_string()
     try:
         smtp_class = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
         with smtp_class(smtp_host, smtp_port, timeout=15) as server:
             if smtp_port != 465:
                 server.starttls()
             server.login(smtp_username, smtp_password)
-            server.sendmail(smtp_username, [to_email], msg.as_string())
-        return True
+            refused = server.sendmail(smtp_username, envelope, raw) or {}
     except Exception as e:
         print(f"[email] SMTP send to {to_email} failed: {e!r}")
-        return False
+        result["error"] = f"The mail server did not accept the email: {e}"[:300]
+        return result
+    if to_email in refused:
+        result["error"] = f"The mail server refused the recipient {to_email}: {refused[to_email]}"[:300]
+        return result
+    result["sent"] = True
+    if save_to_sent:
+        result["sent_box"] = mail_sent_box.save_and_verify(raw.encode("utf-8"), result["message_id"])
+    return result
 
 
 def send_reminder_email(to_email, description, owner, due_date, reminder_at):
@@ -801,11 +1023,30 @@ def send_reminder_email(to_email, description, owner, due_date, reminder_at):
     return _smtp_send(to_email, f"Reminder: {description}", body, ics_content=ics_content)
 
 
+def _ops_is_on_ice(job_name: str) -> bool:
+    """Checked at the top of each continuous-loop worker's own tick --
+    the dashboard's ice/unice actions set this; a failure here defaults to
+    "not iced" so a DB hiccup never silently pauses real work."""
+    try:
+        conn = ops_db.get_conn()
+        try:
+            cur = ops_db.dict_cursor(conn)
+            return ops_job_control.is_on_ice(cur, conn, job_name)
+        finally:
+            ops_db.release_conn(conn)
+    except Exception as e:
+        print(f"[ops] on-ice check for {job_name} failed (proceeding as not iced): {e!r}")
+        return False
+
+
 def email_reminder_worker():
     """Runs continuously in a background thread, independent of any browser
     tab -- this is what makes email reminders work even if the app isn't
     open anywhere, unlike the browser-notification poll."""
     while True:
+        if _ops_is_on_ice("email_reminder_worker"):
+            time.sleep(60)
+            continue
         conn = None
         try:
             conn = get_raw_connection()
@@ -847,10 +1088,11 @@ def email_reminder_worker():
                     push_notification(row["user_id"], {
                         "type": "reminder_email_sent", "task_id": row["id"], "description": row["description"],
                     })
-                    _spawn_background(send_fcm_to_user, 
+                    _spawn_background(send_fcm_to_user,
                         row["user_id"], title="Reminder sent", body=row["description"],
                         data={"type": "reminder_email_sent", "task_id": row["id"]},
                     )
+            record_heartbeat(cur, conn, "email_reminder_worker", {"reminders_sent_this_tick": len(rows)})
             cur.close()
         except Exception as e:
             print(f"[email_reminder_worker] error: {e!r}")
@@ -879,6 +1121,9 @@ def call_ring_timeout_worker():
     that they missed a call (a visible push, unlike call_ended's silent
     data-only one)."""
     while True:
+        if _ops_is_on_ice("call_ring_timeout_worker"):
+            time.sleep(10)
+            continue
         conn = None
         to_notify = []  # (call_id, initiator_id, caller_name, missed_user_ids)
         try:
@@ -908,6 +1153,7 @@ def call_ring_timeout_worker():
                 caller_name = caller_row["username"] if caller_row else "Someone"
                 to_notify.append((call_id, call["initiator_user_id"], caller_name, missed_user_ids))
             conn.commit()
+            record_heartbeat(cur, conn, "call_ring_timeout_worker", {"calls_timed_out_this_tick": len(timed_out)})
             cur.close()
         except Exception as e:
             print(f"[call_ring_timeout_worker] error: {e!r}")
@@ -1005,6 +1251,12 @@ def current_user_id():
     return authenticated_user_id()
 
 
+# Per-person daily AI limit (llm/quota.py): one check before every AI request
+# made on someone's behalf; LLM_DAILY_LIMIT in .env (0 = off).
+from llm import quota as _llm_quota  # noqa: E402
+_llm_quota.register(app, redis_client, authenticated_user_id)
+
+
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
@@ -1035,6 +1287,10 @@ def register():
     )
     user_id = cur.fetchone()["id"]
     db.commit()
+    # Ticked "I agree to the Terms and Privacy Policy" on the sign-up form.
+    # Optional so older app versions without the box can still register.
+    if data.get("accepted_terms") is True:
+        legal.record_consent(cur, db, user_id, "terms")
 
     session["user_id"] = user_id
     session["username"] = username
@@ -1572,9 +1828,20 @@ def call_llm(messages):
         "model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"),
         "messages": messages,
         "stream": False,
+        # Confirmed live: the SAME dense-table degenerate-repetition
+        # failure call_groq_vision hit (see its own comment) also hit this
+        # function, processing a PDF-extracted policy document's premium
+        # table as plain text -- repeat_penalty/num_predict are Ollama's
+        # own names for frequency_penalty/max_tokens there. num_predict
+        # was briefly 3000, but that truncated legitimate long multi-page
+        # documents mid-section (confirmed live on a real 4-page policy
+        # PDF) before ever reaching SUMMARY/POLICY -- _looks_degenerate is
+        # the real backstop against repetition regardless of the cap, so
+        # this just needs to be generous enough for genuine long content.
+        "options": {"repeat_penalty": 1.3, "num_predict": 6000},
     }
-    result = _post_ollama_chat(payload)
-    return result.get("message", {}).get("content", "")
+    # The llm/ package picks the provider (Ollama, then OpenRouter, then Groq -- skipping any that recently failed).
+    return llm.chat(messages, ollama_post=_post_ollama_chat, ollama_options=payload["options"])["content"]
 
 
 def call_llm_with_tools(messages, tools):
@@ -1583,14 +1850,7 @@ def call_llm_with_tools(messages, tools):
     tool_calls) instead of just the text, and passes the OpenAI-style
     `tools` array through. gpt-oss (the default OLLAMA_MODEL) was built
     with native function calling, so no model swap is needed for this."""
-    payload = {
-        "model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"),
-        "messages": messages,
-        "tools": tools,
-        "stream": False,
-    }
-    result = _post_ollama_chat(payload)
-    return result.get("message", {}) or {}
+    return llm.chat(messages, tools=tools, ollama_post=_post_ollama_chat)
 
 
 # ---------------------------------------------------------------------------
@@ -1618,6 +1878,14 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "ISO 8601 'YYYY-MM-DDTHH:MM:SS' if a specific reminder time was stated or clearly implied, else omit. Assume 09:00:00 if only a day is given.",
                     },
+                    "source_email_id": {
+                        "type": "string",
+                        "description": (
+                            "Only when the task comes from an email you looked up with a mail tool this turn "
+                            "(e.g. 'remind me to pay this bill'): that email's id, exactly as the tool returned it. "
+                            "The task then links back to the email. Omit otherwise."
+                        ),
+                    },
                 },
                 "required": ["description"],
             },
@@ -1627,7 +1895,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "message_friend",
-            "description": "Send a direct message to one of the user's friends inside the app. Use when the user asks to tell/message/let someone know something.",
+            "description": "Send a direct message to one of the user's friends inside the app. Use when the user asks to tell/message/let someone know something. Sends immediately -- tell them it's been sent.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1635,6 +1903,79 @@ AGENT_TOOLS = [
                     "content": {"type": "string", "description": "The message to send."},
                 },
                 "required": ["friend_name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_expense",
+            "description": (
+                "Record a payment/purchase the user just stated in conversation (e.g. 'I spent 270 on "
+                "chai today', 'paid 2000 for groceries'), or one from an email the user asked you to log "
+                "(an order confirmation, invoice, payment receipt -- read it first and pass source_email_id). "
+                "NOT when they share a receipt photo (that's extracted separately). Never invent amounts or "
+                "details not actually said or written in the email. This always comes back as a pending card "
+                "the user must still tap Save on -- tell them it's ready to review/save, don't say it's been "
+                "logged/saved yet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "description": "The amount spent, as stated."},
+                    "payee": {"type": "string", "description": "Who/what it was paid to, if mentioned."},
+                    "category": {
+                        "type": "string",
+                        "description": "One or two words, e.g. Food, Travel, Shopping, Bills -- infer from context if not stated.",
+                    },
+                    "payment_method": {
+                        "type": "string",
+                        "description": "How it was paid, only if the user actually said (e.g. 'UPI', 'credit card', 'cash') -- omit if not mentioned, never guess.",
+                    },
+                    "item": {"type": "string", "description": "What was bought, if mentioned, e.g. 'chai', 'groceries'."},
+                    "source_email_id": {
+                        "type": "string",
+                        "description": "When logging from an email you looked up this turn: its id, exactly as the mail tool returned it. Omit otherwise.",
+                    },
+                },
+                "required": ["amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_spending",
+            "description": (
+                "Look up the user's LOGGED expenses for any period, optionally narrowed to an item/merchant/"
+                "category. Use for every spending question beyond 'this month so far' -- e.g. 'how much did I "
+                "spend on flight tickets last year' (start_date/end_date for last year, keywords like flight, "
+                "airline names, travel sites). Work out exact dates from today's date. If the user names NO period "
+                "('how much have I paid to Gopal Pan Shop?'), leave start_date and end_date out: that searches "
+                "everything they've logged -- never assume 'this month' for them. Only covers what the user "
+                "logged in the app (receipts, stated expenses), dated by when it was logged. Call it fresh for every "
+                "spending question -- never reuse a total from earlier in the conversation, since new expenses or "
+                "receipt emails may have arrived since."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "description": "First day, YYYY-MM-DD. Omit (with end_date) for all time."},
+                    "end_date": {"type": "string", "description": "Last day (inclusive), YYYY-MM-DD. Omit for up to today."},
+                    "keywords": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": (
+                            "Optional: match ANY of these in the item, payee or category (case-insensitive), e.g. "
+                            "['flight', 'airline', 'indigo', 'air india', 'makemytrip']. Cast a wide net."
+                        ),
+                    },
+                    "category": {"type": "string", "description": "Optional exact category, e.g. 'Travel'."},
+                    "payment_method": {
+                        "type": "string",
+                        "description": "Optional: only payments made through this app/rail, e.g. 'GPay', 'PhonePe', 'Paytm', 'Credit Card'.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -1656,7 +1997,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. If the user wants it emailed to themself (e.g. 'email me a reminder') and names no one else, omit both friend_name and to_email -- it goes to their own registered address. A friend_name email or a self-email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent.",
+            "description": "Send an email. Use friend_name when emailing one of the user's friends (their registered email is looked up automatically), or to_email for any other address the user stated explicitly. If the user wants it emailed to themself (e.g. 'email me a reminder') and names no one else, omit both friend_name and to_email -- it goes to their own registered address. A friend_name email or a self-email sends right away. A to_email address instead comes back as a pending draft the user still has to approve -- tell them it's drafted and ask if they want it sent, don't say it's been sent. When it does send, the result's 'verdict' says whether it reached the Sent folder -- repeat that, never a stronger claim. Never call this again to 'resend' an existing draft; use send_email_draft for that.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1684,6 +2025,124 @@ AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_vehicle_insurance_claim",
+            "description": (
+                "File an insurance claim for a vehicle (bike/car) accident, theft, or damage the user "
+                "describes. Only two things actually gate this: WHEN it happened and WHAT happened -- "
+                "if either is missing or vague (e.g. 'my bike broke'), ask the user for the specific "
+                "date and a real description BEFORE calling this, don't call it with guessed or "
+                "placeholder details. Location, third-party details, FIR number, and estimated amount "
+                "are all optional extras -- call this as soon as you have the date and description even "
+                "if the user never mentioned them; don't hold up drafting the claim to ask for them, the "
+                "insurer's own claim form will ask again anyway. Drafts an email to the insurer; nothing "
+                "is sent until the user reviews and confirms it -- tell them it's drafted and ready to "
+                "review, don't say the claim has been filed. If the user has more than one vehicle on "
+                "file and vehicle_hint doesn't clearly pick one, this will come back with a question "
+                "listing the vehicles on file -- relay it to the user rather than guessing which vehicle "
+                "they meant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vehicle_hint": {
+                        "type": "string",
+                        "description": "Which vehicle/policy, as the user referred to it (e.g. 'bike', 'Activa', a registration number, or the insurer name).",
+                    },
+                    "incident_date": {
+                        "type": "string",
+                        "description": "ISO 8601 date the incident happened. Required -- never guess if not stated.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What actually happened, in the user's own words. Required -- never invent specifics.",
+                    },
+                    "claim_type": {
+                        "type": "string",
+                        "enum": ["own_damage", "third_party"],
+                        "description": (
+                            "Only matters when the vehicle has BOTH an own-damage and a third-party policy "
+                            "(common in India -- they're often different insurers). Infer it from the "
+                            "description when you can: the user's OWN vehicle got damaged/stolen/caught "
+                            "fire etc. -> 'own_damage'; the user damaged someone ELSE's vehicle/property or "
+                            "injured someone -> 'third_party'. Omit if you can't tell -- if it turns out to "
+                            "matter (the vehicle really does have both), this will come back asking you to "
+                            "clarify with the user and call again. Never ask the user about this up front "
+                            "if their description already makes it obvious, and never ask at all for a "
+                            "vehicle that only has one policy to begin with."
+                        ),
+                    },
+                    "location": {"type": "string", "description": "Where it happened. Optional -- omit if not mentioned, never ask just for this."},
+                    "third_party_involved": {
+                        "type": "string",
+                        "description": "Details of any other person/vehicle involved. Optional -- omit if not mentioned, never ask just for this.",
+                    },
+                    "fir_number": {"type": "string", "description": "Police FIR number. Optional -- omit if not mentioned, never ask just for this."},
+                    "estimated_amount": {
+                        "type": "number",
+                        "description": "Estimated repair/loss amount. Optional -- omit if not mentioned, never ask just for this.",
+                    },
+                },
+                "required": ["vehicle_hint", "incident_date", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_latest_draft",
+            "description": (
+                "Look up the exact, real text of the user's most recent pending email draft (from "
+                "send_email or file_vehicle_insurance_claim). Call this whenever the user asks to see, "
+                "confirm, re-read, or check the exact content of something you just drafted -- never "
+                "reconstruct or guess the content from your own earlier summary of it. You do not "
+                "actually remember the literal text of a draft after describing it, and guessing will "
+                "get real details wrong (recipient, policy numbers, dates) -- always call this instead."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email_draft",
+            "description": (
+                "Send an email draft that is already waiting for approval (from send_email or "
+                "file_vehicle_insurance_claim). Call this ONLY when the user's current message clearly "
+                "tells you to send it ('send it', 'yes send', 'go ahead and send the email'). Omit "
+                "draft_id to send the most recent pending draft. The result is the ground truth: "
+                "ok=false means NOTHING was sent -- say so and give the error. ok=true comes with a "
+                "'verdict' saying whether the email was confirmed in the Sent folder; repeat that verdict, "
+                "never claim more than it says."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"draft_id": {"type": "integer", "description": "A specific draft to send. Omit for the latest pending draft."}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_email_status",
+            "description": (
+                "Check whether an email the assistant drafted or sent actually went out, by looking at the "
+                "record AND the mailbox's Sent folder (and the inbox for bounce reports). Call this "
+                "whenever the user asks if an email was sent or delivered, and before you ever say an "
+                "earlier email 'was sent' or 'already sent'. You do NOT know this from memory -- answer "
+                "only from this tool's 'verdict'. Omit both arguments for the most recent email."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "draft_id": {"type": "integer", "description": "The email's id, if known."},
+                    "to_email": {"type": "string", "description": "Part of the recipient's address, e.g. 'oracle.com'."},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -1705,28 +2164,297 @@ def _resolve_friend_by_name(cur, user_id, name):
     return None
 
 
-def send_plain_email(to_email, subject, body, from_name=None, reply_to=None):
+def send_plain_email(to_email, subject, body, from_name=None, reply_to=None, attachments=None):
     """General-purpose counterpart to send_reminder_email, above -- no .ics
     attachment, arbitrary recipient instead of always the authenticated
-    user's own address."""
-    return _smtp_send(to_email, subject, body, from_name=from_name, reply_to=reply_to)
+    user's own address. attachments: see _smtp_send's own doc comment."""
+    return _smtp_send(to_email, subject, body, from_name=from_name, reply_to=reply_to, attachments=attachments)
+
+
+# ---- Email records: one email_drafts row per email the assistant sends ----
+# A draft (status pending) waits for the user; a friend/self email is a row
+# that goes straight to sending. Either way, send_email_record() below is the
+# ONLY place an assistant email goes out, so the card's Send button, the
+# chat's "send it", and a direct send all get the same guarantees:
+#   * sent at most once (the row is claimed atomically: pending -> sending);
+#   * "sent" only when the mail server accepted it for the recipient;
+#   * a copy filed in the Sent folder and found again there by Message-ID;
+#   * the sender gets a copy (hidden BCC to their registered address).
+_email_columns_ready = False
+_email_columns_lock = threading.Lock()
+
+
+def _ensure_email_draft_columns(cur, db):
+    """Lazy, idempotent: the sent-record columns on email_drafts (same
+    pattern as _ensure_dm_client_id_column). Also in schema.sql."""
+    global _email_columns_ready
+    if _email_columns_ready:
+        return
+    with _email_columns_lock:
+        if _email_columns_ready:
+            return
+        for ddl in (
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'draft'",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS message_id TEXT",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_verified BOOLEAN",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_folder TEXT",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS send_error TEXT",
+            "ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS copy_to TEXT",
+        ):
+            cur.execute(ddl)
+        db.commit()
+        _email_columns_ready = True
+
+
+def _bcc_sender_enabled():
+    return os.getenv("EMAIL_BCC_SENDER", "true").strip().lower() != "false"
+
+
+_EMAIL_STATUS_TEXT = {
+    "pending": "Not sent. It is still a draft waiting for the user to approve it.",
+    "sending": "Being sent right now.",
+    "dismissed": "Not sent. The user cancelled this draft.",
+}
+
+
+def _email_record_payload(row, sent_box_error=None):
+    """What the clients and the model are told about one email row. The
+    'verdict' is the single source of truth the chat must repeat."""
+    status = row["status"]
+    payload = {
+        "draft_id": row["id"], "status": status, "to_email": row["to_email"], "subject": row["subject"],
+        "sent_at": row["sent_at"].isoformat() if row.get("sent_at") else None,
+        "sent_box_verified": row.get("sent_box_verified"), "sent_box_folder": row.get("sent_box_folder"),
+        "copy_to": row.get("copy_to"), "send_error": row.get("send_error"),
+    }
+    copy_note = (f" A copy was sent to the user's own inbox ({row['copy_to']}); it will not appear in the "
+                 "user's own Sent folder, because it is sent from Throughline's mailbox."
+                 if row.get("copy_to") else "")
+    if status == "sent":
+        if row.get("sent_box_verified"):
+            payload["verdict"] = (f"Sent to {row['to_email']}. The mail server accepted it, and it is confirmed in "
+                                  f"the Sent folder of Throughline's sending mailbox." + copy_note)
+        elif row.get("message_id"):
+            payload["verdict"] = (f"Sent to {row['to_email']} (the mail server accepted it), but it could not be "
+                                  f"confirmed in the Sent folder of Throughline's sending mailbox"
+                                  + (f": {sent_box_error}." if sent_box_error else ".") + copy_note)
+        else:
+            payload["verdict"] = (f"Marked sent to {row['to_email']} before Sent-folder tracking existed, so it "
+                                  "cannot be checked in the Sent folder.")
+    else:
+        payload["verdict"] = _EMAIL_STATUS_TEXT.get(status, f"Status: {status}.")
+    return payload
+
+
+_EMAIL_ROW_COLUMNS = ("id, user_id, to_email, subject, body, from_name, reply_to, status, kind, message_id, "
+                      "sent_at, sent_box_verified, sent_box_folder, send_error, copy_to")
+
+
+def send_email_record(cur, db, user_id, draft_id):
+    """Send one pending email_drafts row. Returns (http_status, payload);
+    payload["ok"] is True only when the email really went out."""
+    _ensure_email_draft_columns(cur, db)
+    # Claim first and commit, so a double tap, a retry, or the chat and the
+    # card racing each other can never send the same email twice.
+    cur.execute(
+        f"UPDATE email_drafts SET status = 'sending', send_error = NULL "
+        f"WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING {_EMAIL_ROW_COLUMNS}",
+        (draft_id, user_id),
+    )
+    row = cur.fetchone()
+    db.commit()
+    if not row:
+        cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s AND user_id = %s",
+                    (draft_id, user_id))
+        current = cur.fetchone()
+        if not current:
+            return 404, {"ok": False, "error": "No email with that id"}
+        payload = _email_record_payload(current)
+        payload.update(ok=False, error=f"This email is not waiting to be sent. {payload['verdict']}")
+        return 409, payload
+
+    def back_to_pending(error):
+        cur.execute("UPDATE email_drafts SET status = 'pending', send_error = %s WHERE id = %s", (error, draft_id))
+        db.commit()
+        cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s", (draft_id,))
+        payload = _email_record_payload(cur.fetchone())
+        payload.update(ok=False, error=error)
+        return payload
+
+    import storage
+    cur.execute("SELECT object_key, filename, content_type FROM email_draft_attachments WHERE draft_id = %s",
+                (draft_id,))
+    attachments = []
+    for att in cur.fetchall():
+        data = storage.download_object(att["object_key"])
+        if data is None:
+            # Sending without a file the user attached would be a silent lie
+            # about what went out -- stop, keep the draft, and say which one.
+            return 502, back_to_pending(f"The attachment '{att['filename']}' could not be loaded, so nothing was "
+                                        "sent. Remove it and attach it again, then send.")
+        attachments.append({"filename": att["filename"], "content_type": att["content_type"], "data": data})
+
+    copy_to = row["reply_to"] if _bcc_sender_enabled() and row["reply_to"] else None
+    try:
+        res = _smtp_send_detailed(
+            row["to_email"], row["subject"], row["body"], from_name=row["from_name"], reply_to=row["reply_to"],
+            attachments=attachments, bcc=[copy_to] if copy_to else None, save_to_sent=True,
+        )
+    except Exception as e:  # never leave a row stuck in 'sending'
+        res = {"sent": False, "error": f"Sending failed: {e!r}"[:300], "message_id": None, "sent_box": None}
+    if not res["sent"]:
+        return 502, back_to_pending(res["error"] or "The email could not be sent.")
+
+    box = res["sent_box"] or {}
+    cur.execute(
+        f"UPDATE email_drafts SET status = 'sent', resolved_at = now(), sent_at = now(), message_id = %s, "
+        f"sent_box_verified = %s, sent_box_folder = %s, send_error = NULL, copy_to = %s "
+        f"WHERE id = %s RETURNING {_EMAIL_ROW_COLUMNS}",
+        (res["message_id"], bool(box.get("verified")), box.get("folder"), copy_to, draft_id),
+    )
+    sent_row = cur.fetchone()
+    # No-op unless this draft came from file_vehicle_insurance_claim.
+    cur.execute("UPDATE vehicle_insurance_claims SET status = 'filed', resolved_at = now() WHERE email_draft_id = %s",
+                (draft_id,))
+    db.commit()
+    payload = _email_record_payload(sent_row, sent_box_error=box.get("error"))
+    payload["ok"] = True
+    return 200, payload
+
+
+def check_email_record(cur, db, user_id, row):
+    """Live re-check of one email row against the mailbox: Sent folder by
+    Message-ID, plus any delivery-failure report in the inbox."""
+    if row["status"] != "sent" or not row.get("message_id"):
+        return _email_record_payload(row)
+    live = mail_sent_box.verify(row["message_id"])
+    if live["folder"]:  # the Sent folder was actually searched: found or not, that's the answer
+        # (unreachable mailbox = no folder: keep the last known result instead)
+        cur.execute("UPDATE email_drafts SET sent_box_verified = %s, sent_box_folder = COALESCE(%s, sent_box_folder) "
+                    "WHERE id = %s", (live["verified"], live["folder"], row["id"]))
+        db.commit()
+        row = {**row, "sent_box_verified": live["verified"], "sent_box_folder": live["folder"] or row.get("sent_box_folder")}
+    payload = _email_record_payload(row, sent_box_error=live["error"])
+    bounced = mail_sent_box.find_bounce(row["message_id"])
+    payload["bounced"] = bounced
+    if bounced:
+        payload["verdict"] = (f"The mail server accepted it, but a delivery-failure report came back for "
+                              f"{row['to_email']}, so it most likely did NOT reach them.")
+    return payload
+
+
+def _tool_send_email_draft(cur, db, user_id, args):
+    """The chat's "send it": sends a pending draft through the same path as
+    the card's Send button. Defaults to the most recent pending draft."""
+    _ensure_email_draft_columns(cur, db)
+    draft_id = args.get("draft_id")
+    if not draft_id:
+        cur.execute("SELECT id FROM email_drafts WHERE user_id = %s AND status = 'pending' "
+                    "ORDER BY created_at DESC LIMIT 1", (user_id,))
+        found = cur.fetchone()
+        if not found:
+            return {"ok": False, "error": "There is no email draft waiting to be sent."}
+        draft_id = found["id"]
+    try:
+        draft_id = int(draft_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "draft_id must be a number"}
+    _, payload = send_email_record(cur, db, user_id, draft_id)
+    if payload.get("ok"):
+        payload["_action_card"] = _email_status_card(cur, payload)
+    return payload
+
+def _email_status_card(cur, payload):
+    """Re-shows the email as a resolved card, so the chat displays the real
+    outcome next to the reply instead of only the model's words for it."""
+    cur.execute("SELECT body FROM email_drafts WHERE id = %s", (payload["draft_id"],))
+    body_row = cur.fetchone()
+    return {
+        "type": "email_draft", "draft_id": payload["draft_id"], "to_email": payload["to_email"],
+        "subject": payload["subject"], "body": body_row["body"] if body_row else "",
+        "status": payload["status"], "sent_box_verified": payload.get("sent_box_verified"),
+        "copy_to": payload.get("copy_to"),
+    }
+
+
+def _tool_check_email_status(cur, db, user_id, args):
+    """Ground truth for "was it sent?" -- the record plus a live look at the
+    mailbox. The model must answer from this, never from memory."""
+    _ensure_email_draft_columns(cur, db)
+    clauses, params = ["user_id = %s"], [user_id]
+    if args.get("draft_id"):
+        try:
+            clauses.append("id = %s")
+            params.append(int(args["draft_id"]))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "draft_id must be a number"}
+    elif (args.get("to_email") or "").strip():
+        clauses.append("to_email ILIKE %s")
+        params.append(f"%{args['to_email'].strip()}%")
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE {' AND '.join(clauses)} "
+                f"ORDER BY created_at DESC LIMIT 3", params)
+    rows = cur.fetchall()
+    if not rows:
+        return {"ok": True, "found": False, "verdict": "No email matching that was drafted or sent by the assistant."}
+    latest = check_email_record(cur, db, user_id, rows[0])
+    result = {"ok": True, "found": True, **latest}
+    if len(rows) > 1:
+        result["earlier"] = [_email_record_payload(r) for r in rows[1:]]
+    return result
 
 
 def _tool_create_task(cur, db, user_id, args):
     description = (args.get("description") or "").strip()
     if not description:
         return {"error": "description is required"}
-    cur.execute(
-        "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
-        "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
-        (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at"))),
-    )
+    # _source_email is filled in by run_agent_tool_loop (never by the model)
+    # from a mail result it already saw -- see _attach_source_email.
+    source = args.get("_source_email")
+    if source:
+        cur.execute(
+            "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status, source_email) "
+            "VALUES (%s, NULL, %s, NULL, %s, %s, 'open', %s) RETURNING id",
+            (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at")),
+             psycopg2.extras.Json(source)),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO tasks (user_id, conversation_id, description, owner, due_date, reminder_at, status) "
+            "VALUES (%s, NULL, %s, NULL, %s, %s, 'open') RETURNING id",
+            (user_id, description, args.get("due_date"), normalize_reminder_at(args.get("reminder_at"))),
+        )
     task_id = cur.fetchone()["id"]
     db.commit()
-    return {"ok": True, "task_id": task_id, "description": description}
+    result = {"ok": True, "task_id": task_id, "description": description}
+    if source:
+        result["linked_email"] = source.get("subject")
+    return result
+
+
+def _attach_source_email(args, mail_sources):
+    """create_task/log_expense may name the email they came from by the id a
+    mail tool returned this turn. Swap that id for the email's display
+    details from what the loop already collected -- never trusting the model
+    to copy a link -- and drop it silently if it doesn't match anything."""
+    wanted = args.pop("source_email_id", None)
+    args.pop("_source_email", None)  # only ever set here
+    if not wanted:
+        return args
+    match = next((s for s in reversed(mail_sources) if s.get("id") == wanted), None)
+    if match:
+        args["_source_email"] = {k: match.get(k) for k in ("provider", "account", "id", "from", "subject", "received", "web_link")}
+    return args
 
 
 def _tool_message_friend(cur, db, user_id, args):
+    """Sends immediately -- unlike send_email's arbitrary-address case,
+    there's no misjudgment-of-recipient risk here (friend_name always
+    resolves to someone already in the user's trust graph), so a draft
+    step only added friction without catching anything real. The
+    log_expense tool above is what actually prevents a stale/wrong detail
+    from going out, by making sure the data it's reporting is accurate in
+    the first place."""
     friend = _resolve_friend_by_name(cur, user_id, args.get("friend_name"))
     content = (args.get("content") or "").strip()
     if not friend:
@@ -1748,11 +2476,140 @@ def _tool_message_friend(cur, db, user_id, args):
         "message": {"id": message_id, "sender_id": user_id, "recipient_id": friend["id"], "content": content},
         "sender_username": sender_name,
     })
-    _spawn_background(send_fcm_to_user, 
+    _spawn_background(send_fcm_to_user,
         friend["id"], title=sender_name, body=content,
         data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message_id)},
     )
     return {"ok": True, "friend_name": friend["name"], "message_id": message_id}
+
+
+def _tool_log_expense(cur, db, user_id, args):
+    """No DB write here -- the proposed expense lives entirely in the
+    action_card JSON until confirmed, and 'confirm' is just a normal call
+    to the already-existing POST /transactions (which already dedupes by
+    amount+payee within 10 minutes). Mirrors chat_global_image's own
+    normalization so a voice-logged expense and a photographed receipt
+    end up with identically-shaped categories/payment methods."""
+    amount = args.get("amount")
+    if amount is None:
+        return {"error": "amount is required"}
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return {"error": "amount must be a number"}
+
+    card = {
+        "type": "expense_confirm",
+        "amount": amount,
+        "payee": (args.get("payee") or "").strip() or None,
+        "category": _normalize_category(args.get("category")),
+        "payment_method": _normalize_payment_method(args.get("payment_method")),
+        "item": (args.get("item") or "").strip() or None,
+    }
+    if args.get("_source_email"):  # set by the tool loop -- see _attach_source_email
+        card["source_email"] = args["_source_email"]
+    return {"ok": True, "pending": True, "_action_card": card}
+
+
+def _tool_query_spending(cur, db, user_id, args):
+    local_tz = datetime.now().astimezone().tzinfo  # dates mean the user's local days, not UTC
+    start_arg = (args.get("start_date") or "").strip()
+    end_arg = (args.get("end_date") or "").strip()
+    today = datetime.now(local_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    if not start_arg and not end_arg:
+        # No period named ("how much have I paid to Gopal Pan Shop?") means
+        # everything logged -- confirmed live that the model otherwise picked
+        # "this month" on its own and reported 1 payment out of many.
+        cur.execute("SELECT min(created_at) AS first FROM transactions WHERE user_id = %s", (user_id,))
+        first = cur.fetchone()["first"]
+        start = first.astimezone(local_tz).replace(hour=0, minute=0, second=0, microsecond=0) if first else today
+        last = today
+    else:
+        try:
+            start = datetime.strptime(start_arg, "%Y-%m-%d").replace(tzinfo=local_tz) if start_arg else None
+            last = datetime.strptime(end_arg, "%Y-%m-%d").replace(tzinfo=local_tz) if end_arg else today
+        except ValueError:
+            return {"error": "start_date and end_date must be YYYY-MM-DD"}
+        if start is None:
+            cur.execute("SELECT min(created_at) AS first FROM transactions WHERE user_id = %s", (user_id,))
+            first = cur.fetchone()["first"]
+            start = first.astimezone(local_tz).replace(hour=0, minute=0, second=0, microsecond=0) if first else last
+    if last < start:
+        start, last = last, start
+    end = last + timedelta(days=1)  # end_date is inclusive
+    keywords = args.get("keywords")
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    rows, total, count, by_category = query_transactions(cur, user_id, start, end, keywords, args.get("category"),
+                                                         payment_method=args.get("payment_method"))
+    period = f"{start:%Y-%m-%d} to {last:%Y-%m-%d}"
+    label = (f"Checked your logged expenses ({period}) · "
+             f"{count} {'match' if count == 1 else 'matches'}{' · Rs ' + format(total, ',.0f') if count else ''}")
+
+    # How much of the period the logged data can even speak for: a user who
+    # started logging last week has no logged history for last year at all
+    # -- confirmed live, where "0 matches" for 2025 was then presented as if
+    # it were the answer instead of a gap.
+    cur.execute("SELECT min(created_at) AS first FROM transactions WHERE user_id = %s", (user_id,))
+    first_logged = cur.fetchone()["first"]
+    covered_from = max(start, first_logged) if first_logged else None
+    uncovered = first_logged is None or first_logged > start
+    try:
+        import mail_common
+        mail_linked = mail_common.any_enabled() and bool(mail_common.agent_tools(cur, user_id))
+    except Exception:
+        mail_linked = False
+
+    narrowed = bool(keywords or args.get("category"))
+    # Email only when it can add something: part of the period predates
+    # logging, or the question is about a specific item. (A plain "today"
+    # with nothing logged, inside the logged range, is just Rs 0 -- confirmed
+    # live that sending those to email only made the answer slow.) A specific
+    # item searches email over the WHOLE period: logging only has what the
+    # user typed in, and a flight booked after logging began but never logged
+    # was missed (confirmed live). find_purchases flags the email purchases
+    # that are already logged, so nothing is counted twice.
+    if mail_linked and (uncovered or narrowed):
+        gap = (f"The user only started logging expenses on {first_logged:%Y-%m-%d}, so " if first_logged and uncovered
+               else "")
+        gap_last = (min(end, first_logged) if first_logged and uncovered and count and not narrowed else end) - timedelta(days=1)
+        overlaps = bool(first_logged) and gap_last + timedelta(days=1) > first_logged
+        words = [w for w in (keywords if isinstance(keywords, list) else []) if isinstance(w, str) and w.strip()][:8]
+        topic = " OR ".join(f'"{w.strip()}"' if " " in w.strip() else w.strip() for w in words)
+        call = (f"start_date={start:%Y-%m-%d}, end_date={gap_last:%Y-%m-%d}" + (f", query={topic!r}" if topic else ""))
+        note = (
+            f"{gap}logged expenses can't fully answer this{' for part of the period' if count else ''}. A mailbox IS "
+            "connected: do NOT ask the user for permission (it's read-only) -- in this same turn call "
+            f"gmail_find_purchases and/or outlook_find_purchases ({call}); they open the emails and return the amounts. "
+            "In the answer, list each purchase with its amount and source, say the total comes from emails (bookings "
+            "made elsewhere may be missing), "
+            + ("" if not count else
+               "logged matches come from keyword matching, so first drop any that aren't this item (e.g. a cab or "
+               "airport cafe for a flight question) and count only the ones that are; then "
+               "combine them with the email results -- add only the email results' `not_logged_total` (purchases "
+               "marked already_logged are in the logged amount already), " if overlaps else
+               "combine it with the logged amount above (only logged entries that are this item), ")
+            + "and offer to log them as expenses."
+        )
+    elif count == 0:
+        note = ("Nothing logged matches this period. Say so plainly (Rs 0); if they paid without logging it, suggest "
+                "logging it" + ("." if mail_linked else ", or connecting Gmail/Outlook in Settings so receipts can be checked."))
+    else:
+        note = "These are only expenses the user logged in the app. Say so if they may have spent more without logging it."
+
+    return {
+        "ok": True, "period": period, "total": round(total, 2), "count": count,
+        "logging_started": f"{first_logged:%Y-%m-%d}" if first_logged else None,
+        "logged_data_covers_from": f"{covered_from:%Y-%m-%d}" if covered_from else None,
+        "by_category": by_category,
+        "transactions": [{
+            "date": r["created_at"].strftime("%Y-%m-%d") if isinstance(r["created_at"], datetime) else str(r["created_at"]),
+            "amount": float(r["amount"]), "item": r["item"], "payee": r["payee"],
+            "category": r["category"], "payment_method": r["payment_method"],
+        } for r in rows],
+        "note": note,
+        "_activity": {"tool": "query_spending", "icon": "spending", "label": label},
+    }
 
 
 def _tool_make_call(cur, db, user_id, args):
@@ -1837,8 +2694,25 @@ def _tool_send_email(cur, db, user_id, args):
     body = args.get("body") or ""
 
     if sends_immediately:
-        sent = send_plain_email(to_email, subject, body, from_name=from_name, reply_to=reply_to)
-        return {"ok": sent, "to_email": to_email} if sent else {"error": f"Failed to send email to {to_email}"}
+        # Recorded like a draft and sent through the same path, so it has a
+        # Message-ID, a Sent-folder copy, and can be checked later.
+        _ensure_email_draft_columns(cur, db)
+        cur.execute(
+            "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to, kind) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'direct') RETURNING id",
+            (user_id, to_email, subject, body, from_name, reply_to),
+        )
+        record_id = cur.fetchone()["id"]
+        db.commit()
+        _, payload = send_email_record(cur, db, user_id, record_id)
+        if payload.get("ok"):
+            payload["_action_card"] = _email_status_card(cur, payload)
+        else:
+            # Nothing went out; don't leave a draft card-less row waiting.
+            cur.execute("UPDATE email_drafts SET status = 'dismissed', resolved_at = now() WHERE id = %s AND status = 'pending'",
+                        (record_id,))
+            db.commit()
+        return payload
 
     cur.execute(
         "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to) "
@@ -1856,14 +2730,214 @@ def _tool_send_email(cur, db, user_id, args):
     }
 
 
+def _vehicle_group_key(row):
+    """Identity for grouping policy rows into one vehicle -- vehicle_registration
+    when present (the real-world identity of a vehicle), falling back to
+    label for a policy saved without one."""
+    return row["vehicle_registration"] or row["label"] or f"policy #{row['id']}"
+
+
+def _vehicle_group_label(rows):
+    """Human-readable name for a vehicle group, for disambiguation
+    messages -- e.g. 'Bike (KA53JF2057)'."""
+    sample = rows[0]
+    label, reg = sample["label"], sample["vehicle_registration"]
+    if label and reg:
+        return f"{label} ({reg})"
+    return label or reg or f"policy #{sample['id']}"
+
+
+def _tool_file_vehicle_insurance_claim(cur, db, user_id, args):
+    """Drafts a claim email the same way send_email's arbitrary-address
+    branch does -- an insurer's claims address is exactly that case (an
+    untrusted recipient, where a wrong detail can't be unsent), so this
+    reuses email_drafts/EmailDraftCard as-is rather than a new mechanism.
+    The only new state is vehicle_insurance_claims, which exists purely so
+    the user can later ask about a claim's status; confirm_email_draft/
+    dismiss_email_draft (below) flip its status in lockstep with the
+    underlying email draft.
+
+    Three-tier resolution, each tier using the same "return an error, let
+    the model relay it as a natural follow-up" mechanism as the hard-
+    required-fields check below:
+    1. Resolve a VEHICLE from vehicle_hint. A hint matching rows across
+       more than one vehicle, or matching none while the user has other
+       policies on file, returns a disambiguation listing grouped by
+       vehicle (so a split own_damage+third_party pair shows as ONE
+       vehicle, not two confusing entries) instead of a flat not-found.
+    2. Resolve COVERAGE within that vehicle. One policy row -> just use
+       it, claim_type is irrelevant and never asked about. Two rows (a
+       real own_damage/third_party split, e.g. two different insurers) ->
+       use claim_type if given and it matches one of the rows; otherwise
+       prefer a 'comprehensive' row if one exists (it covers either case);
+       otherwise ask the one clarifying question needed."""
+    vehicle_hint = (args.get("vehicle_hint") or "").strip()
+    incident_date = (args.get("incident_date") or "").strip()
+    description = (args.get("description") or "").strip()
+    if not vehicle_hint:
+        return {"error": "vehicle_hint is required -- which vehicle/policy is this for?"}
+    if not incident_date:
+        return {"error": "incident_date is required -- ask the user exactly when this happened"}
+    if not description:
+        return {"error": "description is required -- ask the user what actually happened"}
+    try:
+        datetime.fromisoformat(incident_date)
+    except ValueError:
+        return {"error": f"'{incident_date}' isn't a valid date -- ask the user for the actual date"}
+
+    cur.execute(
+        "SELECT * FROM vehicle_insurance_policies WHERE user_id = %s AND "
+        "(label ILIKE %s OR insurer_name ILIKE %s OR vehicle_registration ILIKE %s)",
+        (user_id, f"%{vehicle_hint}%", f"%{vehicle_hint}%", f"%{vehicle_hint}%"),
+    )
+    hint_matches = cur.fetchall()
+
+    if not hint_matches:
+        cur.execute("SELECT * FROM vehicle_insurance_policies WHERE user_id = %s", (user_id,))
+        all_policies = cur.fetchall()
+        if not all_policies:
+            return {"error": f"No vehicle insurance policy found matching '{vehicle_hint}' -- share a photo of the policy first."}
+        groups = {}
+        for row in all_policies:
+            groups.setdefault(_vehicle_group_key(row), []).append(row)
+        labels = ", ".join(_vehicle_group_label(rows) for rows in groups.values())
+        return {"error": f"'{vehicle_hint}' doesn't match any vehicle on file -- which one did you mean: {labels}?"}
+
+    groups = {}
+    for row in hint_matches:
+        groups.setdefault(_vehicle_group_key(row), []).append(row)
+    if len(groups) > 1:
+        labels = ", ".join(_vehicle_group_label(rows) for rows in groups.values())
+        return {"error": f"Found more than one matching vehicle -- which one did you mean: {labels}?"}
+
+    # Pull every policy row for the resolved vehicle, not just whichever
+    # ones the hint happened to textually match -- a hint like an insurer
+    # name might only match the own_damage leg of a split policy, but the
+    # coverage decision below needs to see the third_party leg too.
+    vehicle_key = next(iter(groups))
+    cur.execute(
+        "SELECT * FROM vehicle_insurance_policies WHERE user_id = %s AND "
+        "(vehicle_registration = %s OR (vehicle_registration IS NULL AND label = %s))",
+        (user_id, vehicle_key, vehicle_key),
+    )
+    vehicle_policies = cur.fetchall() or groups[vehicle_key]
+
+    if len(vehicle_policies) == 1:
+        policy = vehicle_policies[0]
+    else:
+        comprehensive = next((p for p in vehicle_policies if p["coverage_type"] == "comprehensive"), None)
+        claim_type = (args.get("claim_type") or "").strip().lower()
+        policy = None
+        if claim_type in ("own_damage", "third_party"):
+            policy = next((p for p in vehicle_policies if p["coverage_type"] == claim_type), None)
+        if not policy:
+            policy = comprehensive
+        if not policy:
+            return {
+                "error": (
+                    "This vehicle has separate own-damage and third-party policies -- ask the user: was "
+                    "your own vehicle damaged, or did this involve someone else's vehicle/property? Then "
+                    "call this again with claim_type set to 'own_damage' or 'third_party'."
+                )
+            }
+
+    location = (args.get("location") or "").strip() or None
+    third_party = (args.get("third_party_involved") or "").strip() or None
+    fir_number = (args.get("fir_number") or "").strip() or None
+    estimated_amount = args.get("estimated_amount")
+    estimated_amount = float(estimated_amount) if isinstance(estimated_amount, (int, float)) else None
+
+    cur.execute("SELECT username, email FROM users WHERE id = %s", (user_id,))
+    sender = cur.fetchone()
+
+    body_lines = [
+        f"Dear {policy['insurer_name']},",
+        "",
+        f"I would like to file a claim under policy number {policy['policy_number']}"
+        + (f" (vehicle {policy['vehicle_registration']})" if policy["vehicle_registration"] else "") + ".",
+        "",
+        f"Date of incident: {incident_date}",
+        f"Description: {description}",
+    ]
+    if location:
+        body_lines.append(f"Location: {location}")
+    if third_party:
+        body_lines.append(f"Third party involved: {third_party}")
+    if fir_number:
+        body_lines.append(f"Police FIR number: {fir_number}")
+    if estimated_amount is not None:
+        body_lines.append(f"Estimated loss/repair amount: {estimated_amount}")
+    body_lines += ["", "Please let me know the next steps and any documents required.", "", "Regards,", sender["username"] if sender else ""]
+    body = "\n".join(body_lines)
+    subject = f"Insurance Claim - Policy {policy['policy_number']}"
+
+    cur.execute(
+        "INSERT INTO email_drafts (user_id, to_email, subject, body, from_name, reply_to) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (user_id, policy["claims_email"], subject, body, sender["username"] if sender else None,
+         sender["email"] if sender and sender.get("email") else None),
+    )
+    draft_id = cur.fetchone()["id"]
+    cur.execute(
+        "INSERT INTO vehicle_insurance_claims "
+        "(user_id, policy_id, email_draft_id, incident_date, description, location, "
+        "third_party_involved, fir_number, estimated_amount) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (user_id, policy["id"], draft_id, incident_date, description, location,
+         third_party, fir_number, estimated_amount),
+    )
+    db.commit()
+    return {
+        "ok": True, "pending": True, "draft_id": draft_id,
+        "_action_card": {
+            "type": "email_draft", "draft_id": draft_id,
+            "to_email": policy["claims_email"], "subject": subject, "body": body,
+        },
+    }
+
+
+def _tool_get_latest_draft(cur, db, user_id, args):
+    """Read-only lookup for the user's most recent still-pending email
+    draft (from send_email's arbitrary-address branch or
+    file_vehicle_insurance_claim) -- gives the model real text to quote
+    verbatim when asked to show/confirm exact drafted content, instead of
+    reconstructing it from memory. Confirmed live that a prompt-only
+    instruction NOT to fabricate wasn't enough on its own -- the model
+    kept inventing a plausible-but-wrong email, complete with placeholder
+    text like "[insert policy number]", even when told explicitly not to.
+    Giving it an actual tool that returns ground truth is the real fix."""
+    cur.execute(
+        "SELECT to_email, subject, body, created_at FROM email_drafts "
+        "WHERE user_id = %s AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    )
+    draft = cur.fetchone()
+    if not draft:
+        return {"ok": True, "found": False, "message": "No pending draft right now."}
+    return {
+        "ok": True, "found": True,
+        "to_email": draft["to_email"], "subject": draft["subject"], "body": draft["body"],
+    }
+
+
 AGENT_TOOL_DISPATCH = {
     "create_task": lambda cur, db, user_id, args: _tool_create_task(cur, db, user_id, args),
     "message_friend": lambda cur, db, user_id, args: _tool_message_friend(cur, db, user_id, args),
+    "log_expense": lambda cur, db, user_id, args: _tool_log_expense(cur, db, user_id, args),
+    "query_spending": lambda cur, db, user_id, args: _tool_query_spending(cur, db, user_id, args),
     "make_call": lambda cur, db, user_id, args: _tool_make_call(cur, db, user_id, args),
     "send_email": lambda cur, db, user_id, args: _tool_send_email(cur, db, user_id, args),
+    "file_vehicle_insurance_claim": lambda cur, db, user_id, args: _tool_file_vehicle_insurance_claim(cur, db, user_id, args),
+    "get_latest_draft": lambda cur, db, user_id, args: _tool_get_latest_draft(cur, db, user_id, args),
+    "send_email_draft": lambda cur, db, user_id, args: _tool_send_email_draft(cur, db, user_id, args),
+    "check_email_status": lambda cur, db, user_id, args: _tool_check_email_status(cur, db, user_id, args),
 }
 
-AGENT_LOOP_MAX_TURNS = 4
+# 6: a spending question answered from email needs query_spending -> mail
+# search(es) -> read receipts -> answer, sometimes across two providers.
+# Only chains that long ever use the extra rounds; past the cap the loop
+# asks for a final answer explicitly (see run_agent_tool_loop).
+AGENT_LOOP_MAX_TURNS = 6
 
 
 def run_agent_tool_loop(cur, db, user_id, messages):
@@ -1871,22 +2945,48 @@ def run_agent_tool_loop(cur, db, user_id, messages):
     call_llm_with_tools: dispatches every tool_call the model returns,
     feeds each result back as a `tool` message, and stops as soon as a
     turn comes back with no tool_calls (that message's content is the
-    final reply). Returns (reply_text, action_card, created_task).
+    final reply). Returns (reply_text, action_cards, created_task).
+
+    action_cards is a list, not a single card -- one request can
+    legitimately trigger several staged actions at once (e.g. "log this
+    expense AND message Kunal about it AND email the same update"), each
+    with its own card. Collecting only the last one silently dropped every
+    earlier action's card, so there was nothing on screen to confirm/send
+    for anything but the final tool call.
 
     created_task is surfaced so the caller can skip the separate
     trigger_reminder_extraction background pass for this same message --
     without it, a single "remind me to..." could create two tasks: one
     from this loop's create_task call, one from that older regex-triggered
-    extraction path."""
-    action_card = None
+    extraction path.
+
+    reply_meta (4th value) is None unless an optional integration's tool
+    ran -- then it's what the client shows alongside the reply (which tools
+    ran, which emails it drew on; see outlook.adapter.build_reply_meta)."""
+    action_cards = []
     created_task = False
+    tool_activity, mail_sources = [], []
     messages = list(messages)
 
+    # Mailbox tools (Outlook/Gmail, via mail_common) ride along only for the
+    # mailboxes this user has actually linked -- with every MAIL flag off,
+    # or nothing linked, this is exactly AGENT_TOOLS, unchanged.
+    tools, extra_handler = AGENT_TOOLS, (lambda name: None)
+    try:
+        import mail_common
+        mail_tools = mail_common.agent_tools(cur, user_id) if mail_common.any_enabled() else []
+        if mail_tools:
+            tools, extra_handler = AGENT_TOOLS + mail_tools, mail_common.get_tool_handler
+    except Exception as e:
+        print(f"[mail] tool setup failed, continuing without mail tools: {e!r}")
+
     for _ in range(AGENT_LOOP_MAX_TURNS):
-        message = call_llm_with_tools(messages, AGENT_TOOLS)
+        message = call_llm_with_tools(messages, tools)
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            return message.get("content") or "", action_card, created_task
+            if (message.get("content") or "").strip():
+                return message.get("content"), action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
+            break  # an empty answer: ask for one explicitly below, never return a blank reply
 
         messages.append(message)
         for call in tool_calls:
@@ -1901,7 +3001,8 @@ def run_agent_tool_loop(cur, db, user_id, messages):
             else:
                 args = raw_args or {}
 
-            handler = AGENT_TOOL_DISPATCH.get(name)
+            args = _attach_source_email(_strip_nul(args), mail_sources)
+            handler = AGENT_TOOL_DISPATCH.get(name) or extra_handler(name)
             if not handler:
                 result = {"error": f"Unknown tool '{name}'"}
             else:
@@ -1913,20 +3014,55 @@ def run_agent_tool_loop(cur, db, user_id, messages):
 
             if name == "create_task" and result.get("ok"):
                 created_task = True
+            if name in ("send_email", "send_email_draft", "check_email_status"):
+                # Read by _email_claim_backstop after the reply is written.
+                outcomes = g.setdefault("email_outcomes", [])
+                outcomes.append({"tool": name, "ok": bool(result.get("ok")), "status": result.get("status")})
             card = result.pop("_action_card", None)
             if card:
-                action_card = card
+                action_cards.append(card)
+            activity = result.pop("_activity", None)
+            if isinstance(activity, list):  # one line per mailbox (multi-account mail tools)
+                tool_activity.extend(a for a in activity if a)
+            elif activity:
+                tool_activity.append(activity)
+            mail_sources.extend(result.pop("_mail_sources", None) or [])
 
-            messages.append({"role": "tool", "content": json.dumps(result)})
+            # tool_call_id: OpenAI-style providers (OpenRouter, Groq) match each result to its call.
+            messages.append({"role": "tool", "content": json.dumps(result),
+                             **({"tool_call_id": call["id"]} if call.get("id") else {})})
 
-    # Ran out of turns -- fall back to a plain call so the user still gets
-    # a reply instead of an empty response.
-    final = call_llm(messages)
-    return final, action_card, created_task
+    # Ran out of turns (or got an empty answer). A bare call_llm on a transcript ending in tool
+    # results came back EMPTY (confirmed live: flight-spend questions that
+    # read several receipts showed the user a blank reply), so tell the
+    # model explicitly to answer now, and never hand back nothing.
+    messages.append({"role": "user", "content": (
+        "You've used all your tool calls. Answer my original question now, using only the tool results above. "
+        "Say what you found and what you couldn't check. Do not call any tools."
+    )})
+    final = ""
+    try:
+        final = (call_llm(messages) or "").strip()
+    except Exception as e:
+        print(f"[agent] final answer call failed: {e!r}")
+    if not final:
+        final = ("I looked through what I could, but couldn't put together a complete answer this time. "
+                 "Try asking about a narrower period or a specific merchant.")
+    return final, action_cards, created_task, _build_reply_meta(tool_activity, mail_sources)
+
+
+def _build_reply_meta(tool_activity, mail_sources):
+    if not tool_activity and not mail_sources:
+        return None
+    try:
+        from mail_common import build_reply_meta
+        return build_reply_meta(tool_activity, mail_sources)
+    except Exception:
+        return None  # display-only extra, never worth failing a reply over
 
 
 # Strips a leading <think>...</think> reasoning block some models (e.g. Groq's
-# qwen/qwen3.6-27b, used by call_groq_vision below) prepend to their own
+# qwen/qwen3.8-27b, used by call_groq_vision below) prepend to their own
 # answer -- confirmed via a live test call that the chain-of-thought lands
 # inline in the same content string, not a separate field. Without this, that
 # reasoning monologue would end up stored as part of raw_transcript/the chat
@@ -1958,7 +3094,7 @@ def call_groq_vision(image_bytes, mimetype, instruction):
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
     payload = {
-        "model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b"),
+        "model": os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b"),
         "messages": [{
             "role": "user",
             "content": [
@@ -1967,6 +3103,17 @@ def call_groq_vision(image_bytes, mimetype, instruction):
             ],
         }],
         "temperature": 0.2,
+        # Confirmed live: a dense table (a real insurance policy's premium
+        # breakdown) sent the model into a degenerate loop, repeating one
+        # line dozens of times and never reaching the SUMMARY/TRANSACTION/
+        # POLICY sections at all. frequency_penalty discourages exactly
+        # this. max_tokens was briefly 3000 as a hard backstop, but that
+        # truncated legitimate long multi-page documents mid-section before
+        # ever reaching SUMMARY/POLICY (confirmed live) -- _looks_degenerate
+        # is the real backstop against a runaway loop regardless of the cap,
+        # so this just needs enough room for genuine long content.
+        "frequency_penalty": 0.4,
+        "max_tokens": 6000,
     }
     response = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -2120,12 +3267,14 @@ def generate_conversation_title(raw_transcript):
     return title[:80] or None
 
 
+@ops_tasks.tracked("conversation_titling")
 def run_conversation_titling(user_id, conversation_id, raw_transcript):
     """Runs in its own thread with its own pooled connection, same pattern
     as run_background_analysis -- generating the title is an LLM call and
     shouldn't hold up the websocket teardown it's triggered from."""
     title = generate_conversation_title(raw_transcript)
     if not title:
+        ops_tasks.fail("no title generated")
         return
     conn = get_raw_connection()
     try:
@@ -2143,6 +3292,7 @@ def run_conversation_titling(user_id, conversation_id, raw_transcript):
             cache_delete(f"user:{user_id}:conversation:{conversation_id}", f"user:{user_id}:conversations")
     except Exception as e:
         print(f"[run_conversation_titling] DB error: {e!r}")
+        ops_tasks.fail(f"DB error: {e!r}")
         conn.rollback()
     finally:
         release_raw_connection(conn)
@@ -2373,6 +3523,7 @@ def _apply_tags_questions_setting(user_id, topics, questions):
     return topics, questions
 
 
+@ops_tasks.tracked("transcript_analysis")
 def run_background_analysis(user_id, conversation_id, delta_text, push):
     """Runs in its own thread with its own pooled connection -- Flask's
     request-scoped `g` connection can't be shared across threads. Extracts
@@ -2380,6 +3531,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
     pass (not the whole conversation), then pushes a summary back over the
     websocket so the UI can show it without the user clicking Analyze."""
     if not delta_text.strip():
+        ops_tasks.ignore()
         return
 
     conn = get_raw_connection()
@@ -2395,11 +3547,13 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
             {"role": "system", "content": build_analysis_prompt(mode, persona_context)},
             {"role": "user", "content": delta_text},
         ])
-    except Exception:
+    except Exception as e:
+        ops_tasks.fail(f"LLM call failed: {e!r}")
         return
 
     parsed = extract_json(content)
     if not parsed:
+        ops_tasks.fail("LLM reply was not valid JSON")
         return
 
     tasks = parsed.get("tasks") or []
@@ -2480,6 +3634,7 @@ def run_background_analysis(user_id, conversation_id, delta_text, push):
         cur.close()
     except Exception as e:
         print(f"[run_background_analysis] DB error: {e!r}")
+        ops_tasks.fail(f"DB error: {e!r}")
         conn.rollback()
         created_tasks = []
         notify_mood_friend_ids = []
@@ -2526,6 +3681,61 @@ _AGENT_ACTION_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# See the deterministic-backstop comment at its one call site in
+# chat_global below -- catches the literal tell of fabricated drafted
+# content (template placeholder brackets), regardless of why it happened.
+_FABRICATED_PLACEHOLDER_RE = re.compile(r"\[(insert|your)\b", re.IGNORECASE)
+
+# Model-internal citation markers -- lenticular brackets (never used in
+# normal prose), optionally preceded by spaces.
+_TOOL_CITATION_RE = re.compile(r"[ \t]*【[^】\n]{0,400}】")
+
+# The assistant saying an email went out ("already sent", "I've sent it",
+# "has been sent", "email sent"). Deliberately narrow: "Oracle sent you a
+# reminder" or "was sent on 3 Oct" (reading someone's mail) must not match.
+_EMAIL_SENT_CLAIM_RE = re.compile(
+    r"\b(?:already\s+(?:been\s+)?sent"
+    r"|I(?:'ve|\s+have)?\s+(?:already\s+|just\s+|now\s+|successfully\s+)?sent"
+    r"|(?:has|have)\s+(?:already\s+|now\s+|just\s+|successfully\s+)?been\s+(?:successfully\s+)?(?:sent|delivered)"
+    r"|e-?mail\s+(?:was\s+|is\s+)?(?:successfully\s+)?sent)\b",
+    re.IGNORECASE,
+)
+_EMAIL_WORD_RE = re.compile(r"\be-?mail|\bmail\b", re.IGNORECASE)
+_NEGATION_RE = re.compile(r"\b(?:not|never|yet\s+to)\b|n't\b", re.IGNORECASE)
+
+
+def _claims_email_sent(reply):
+    if not reply or not _EMAIL_WORD_RE.search(reply):
+        return False
+    for m in _EMAIL_SENT_CLAIM_RE.finditer(reply):
+        if not _NEGATION_RE.search(reply[max(0, m.start() - 30):m.end()]):
+            return True
+    return False
+
+
+def _email_claim_backstop(cur, db, user_id, reply, outcomes):
+    """Deterministic check, not just a prompt rule -- confirmed live: asked
+    to "send it", the model answered "already sent" while the Oracle draft
+    sat unsent, because nothing in chat could send a draft. If the reply
+    says an email went out but no tool sent (or confirmed) one this turn,
+    replace it with what the record and mailbox actually say."""
+    if not _claims_email_sent(reply):
+        return reply
+    if any(o["ok"] and o.get("status") == "sent" for o in outcomes):
+        return reply
+    _ensure_email_draft_columns(cur, db)
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE user_id = %s "
+                f"ORDER BY created_at DESC LIMIT 1", (user_id,))
+    latest = cur.fetchone()
+    if latest and latest["status"] == "pending":
+        return (f"Correction: the email to {latest['to_email']} (“{latest['subject']}”) has NOT been sent "
+                "yet. It is still a draft. Tap Send on the card, or tell me “send it” and I’ll send it "
+                "and check that it reached the Sent folder.")
+    if latest and latest["status"] == "sent":
+        return "I checked the mailbox: " + check_email_record(cur, db, user_id, latest)["verdict"]
+    return ("I can’t confirm that any email was sent: there is no sent email on record. "
+            "Tell me what to send and I’ll draft it for you to approve.")
+
 REMINDER_EXTRACTION_PROMPT_TEMPLATE = """Today is {today}, current time {now}.
 
 The user just said this in chat. Determine whether they're asking to be reminded of one or more things (tasks, events, commitments, deadlines) -- not just using the word "remind" in passing. There can be MORE than one -- e.g. a list of exams/classes/bills where they asked for a reminder for each -- extract one entry per distinct thing to remind about, never one combined summary covering several of them.
@@ -2544,6 +3754,7 @@ Reply with ONLY this JSON, no preamble/fences:
 {{"reminders": [{{"description": "", "due_date": null, "reminder_at": null}}]}}"""
 
 
+@ops_tasks.tracked("reminder_extraction")
 def trigger_reminder_extraction(user_id, message_content) -> None:
     """Fire-and-forget, mirrors trigger_chat_feedback_extraction exactly --
     call from a background thread right after /chat or /chat/global has
@@ -2564,9 +3775,8 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
     response is already on its way, so a failure here must never surface to
     the user."""
     message_content = (message_content or "").strip()
-    if not user_id or not message_content:
-        return
-    if not _REMINDER_INTENT_RE.search(message_content):
+    if not user_id or not message_content or not _REMINDER_INTENT_RE.search(message_content):
+        ops_tasks.ignore()  # most chat messages: not a reminder request, no LLM call
         return
 
     try:
@@ -2599,6 +3809,7 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
             conn.commit()
         except Exception as e:
             print(f"[trigger_reminder_extraction] DB error: {e!r}")
+            ops_tasks.fail(f"DB error: {e!r}")
             conn.rollback()
             return
         finally:
@@ -2620,6 +3831,7 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
             )
     except Exception as e:
         print(f"[trigger_reminder_extraction] failed: {e!r}")
+        ops_tasks.fail(repr(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2635,6 +3847,19 @@ def trigger_reminder_extraction(user_id, message_content) -> None:
 
 _NEARBY_INTENT_RE = re.compile(
     r"\bnear(?:by)?\s+me\b|\bnear\s+here\b|\baround\s+(?:here|me)\b|\bclose\s+to\s+me\b|\bnearest\b|\bin\s+my\s+area\b",
+    re.IGNORECASE,
+)
+
+# Spending-habit questions ("where am I spending the most", "show my
+# purchasing habits") -- see compute_monthly_spending_summary below and its
+# splice into chat_global's context. Same hand-picked-regex approach as
+# _NEARBY_INTENT_RE above rather than a full intent classifier.
+_FINANCE_INTENT_RE = re.compile(
+    r"\bspending\b|\bspent\b|\bexpenses?\b|\bpurchas(?:e|ing|es)\b|\bwhere.*money.*go\b|"
+    r"\bhow\s+much.*(?:spend|spent)\b|\btransactions?\b|"
+    # "what did I spend today?" -- bare "spend" only as a money question, not
+    # "how should I spend my weekend".
+    r"\b(?:did|do|have|will)\s+i\s+spend\b|\bspend\s+(?:on|today|yesterday|this|last)\b",
     re.IGNORECASE,
 )
 
@@ -2878,19 +4103,29 @@ def relay_ephemeral(user_id, event):
         pass
 
 
+_notify_listener_state = ops_checks.ListenerState()
+_live_listen_sessions = ops_checks.LiveCounter()  # /ws/listen Deepgram sessions open right now
+
+
 def _notify_pubsub_listener():
     """Cross-process delivery: if some other worker process holds the live
     connection for a user an event was just published for, this delivers it
     there. In today's single-process deployment this never fires for a
     connection this same process already handled synchronously above (the
     `origin` check skips those) -- it only matters once/if this ever runs
-    with more than one worker."""
+    with more than one worker.
+
+    Polls with a timeout instead of blocking in pubsub.listen() forever, so
+    every pass (message or not) ticks _notify_listener_state -- that's what
+    ops/checks.py's probe reads to tell a live listener from a stuck one."""
     while True:
         try:
             pubsub = redis_pubsub_client.pubsub()
             pubsub.subscribe(_NOTIFY_CHANNEL)
-            for message in pubsub.listen():
-                if message.get("type") != "message":
+            while True:
+                message = pubsub.get_message(timeout=30)
+                _notify_listener_state.tick(connected=True)
+                if not message or message.get("type") != "message":
                     continue
                 try:
                     payload = json.loads(message["data"])
@@ -2909,15 +4144,18 @@ def _notify_pubsub_listener():
                         ws.send(json.dumps(event))
                     except Exception:
                         pass
+                _notify_listener_state.delivered_one()
                 try:
                     redis_client.lrem(f"pending_events:{user_id}", 1, json.dumps(event))
                 except redis.RedisError:
                     pass
         except redis.RedisError as e:
             print(f"[redis] notify pubsub listener error: {e!r}; retrying in 5s")
+            _notify_listener_state.failed(e)
             time.sleep(5)
         except Exception as e:
             print(f"[redis] notify pubsub listener crashed: {e!r}; retrying in 5s")
+            _notify_listener_state.failed(e)
             time.sleep(5)
 
 
@@ -3035,27 +4273,12 @@ def send_fcm_to_user(user_id, title, body, data=None, include_notification=True)
     conn = get_raw_connection()
     try:
         cur = conn.cursor()
-        # Best-effort tracking for the admin dashboard's FCM Push card --
-        # same idempotent ensure as ops.job_runs, reused here since this is
-        # the first write path for this table. A failure here must never
-        # block the actual push, which is why every call below is its own
-        # try/except rather than one wrapping the whole function.
-        try:
-            _admin_ensure_ops_schema(cur, conn)
-        except Exception as e:
-            print(f"[fcm] ops.fcm_sends ensure failed (tracking only, push still proceeds): {e!r}")
-            conn.rollback()
 
         def _record(status):
-            try:
-                cur.execute(
-                    "INSERT INTO ops.fcm_sends (user_id, status, notification_type) VALUES (%s, %s, %s)",
-                    (user_id, status, notif_type),
-                )
-                conn.commit()
-            except Exception as e:
-                print(f"[fcm] failed to record send status (tracking only): {e!r}")
-                conn.rollback()
+            # Best-effort tracking for the admin dashboard's FCM Push card
+            # (ops/stats.py's fcm_stats) -- a failure here must never block
+            # the actual push, which record_fcm_send already guarantees.
+            record_fcm_send(cur, conn, user_id, status, notif_type)
 
         cur.execute("SELECT token FROM push_tokens WHERE user_id = %s", (user_id,))
         tokens = [r[0] for r in cur.fetchall()]
@@ -3419,6 +4642,7 @@ def ws_listen(ws):
     threading.Thread(target=receive_from_deepgram, daemon=True).start()
     threading.Thread(target=audio_classifier_worker, daemon=True).start()
 
+    _live_listen_sessions.opened()
     try:
         while True:
             chunk = ws.receive()
@@ -3456,6 +4680,7 @@ def ws_listen(ws):
             except Exception:
                 break
     finally:
+        _live_listen_sessions.closed()
         state["stop"] = True
         try:
             dg_ws.close()
@@ -3973,11 +5198,169 @@ def confirm_email_draft(draft_id):
     one point where a drafted email actually goes out. Ownership + pending
     check in the same query via the WHERE clause, same shape as
     delete_task below, rather than a separate SELECT-then-check."""
+    db = get_db()
+    status, payload = send_email_record(dict_cursor(db), db, current_user_id(), draft_id)
+    return jsonify(payload), status
+
+
+@app.route("/email-drafts/<int:draft_id>", methods=["GET"])
+@login_required
+def get_email_draft(draft_id):
+    """Current state of one email, so a card shows the truth after a
+    reload, a scroll, or a send from the chat or another device.
+    ?verify=1 also re-checks the mailbox's Sent folder and inbox bounces."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    _ensure_email_draft_columns(cur, db)
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s AND user_id = %s", (draft_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "No email with that id"}), 404
+    payload = check_email_record(cur, db, user_id, row) if request.args.get("verify") == "1" else _email_record_payload(row)
+    payload["ok"] = True
+    payload["attachments"] = _email_draft_attachments_list(cur, draft_id)
+    return jsonify(payload)
+
+
+@app.route("/email-drafts/<int:draft_id>/dismiss", methods=["POST"])
+@login_required
+def dismiss_email_draft(draft_id):
+    """User tapped Cancel -- nothing is ever sent for a dismissed draft.
+    Only a still-pending draft can be cancelled; anything else answers 409
+    with its real status, so the card never shows "cancelled" for an email
+    that already went out."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    _ensure_email_draft_columns(cur, db)
+    cur.execute(
+        f"UPDATE email_drafts SET status = 'dismissed', resolved_at = now() "
+        f"WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING {_EMAIL_ROW_COLUMNS}",
+        (draft_id, user_id),
+    )
+    updated = cur.fetchone()
+    if updated:
+        # No-op unless this draft came from file_vehicle_insurance_claim.
+        cur.execute(
+            "UPDATE vehicle_insurance_claims SET status = 'dismissed', resolved_at = now() WHERE email_draft_id = %s",
+            (draft_id,),
+        )
+    db.commit()
+    if updated:
+        return jsonify({**_email_record_payload(updated), "ok": True})
+    cur.execute(f"SELECT {_EMAIL_ROW_COLUMNS} FROM email_drafts WHERE id = %s AND user_id = %s", (draft_id, user_id))
+    current = cur.fetchone()
+    if not current:
+        return jsonify({"ok": False, "error": "No email with that id"}), 404
+    payload = _email_record_payload(current)
+    payload.update(ok=False, error=f"This draft can no longer be cancelled. {payload['verdict']}")
+    return jsonify(payload), 409
+
+
+def _email_draft_attachments_list(cur, draft_id):
+    cur.execute(
+        "SELECT id, filename, content_type, created_at FROM email_draft_attachments "
+        "WHERE draft_id = %s ORDER BY created_at",
+        (draft_id,),
+    )
+    return [
+        {"id": r["id"], "filename": r["filename"], "content_type": r["content_type"]}
+        for r in cur.fetchall()
+    ]
+
+
+@app.route("/email-drafts/<int:draft_id>/attachments", methods=["POST"])
+@login_required
+def attach_email_draft_file(draft_id):
+    """User tapped Attach on a still-pending EmailDraftCard -- object_key
+    already exists in R2 (the client already did presign+PUT+confirm via
+    the same /uploads/* flow chat/DM attachments use, see upload_service.dart),
+    this just records which draft it belongs to. confirm_email_draft
+    downloads the real bytes from R2 at send time; nothing is fetched or
+    duplicated here. Returns the draft's full attachment list so the
+    client can update its card from this response alone."""
+    import storage
+    blocked = storage.storage_feature_check()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    object_key = (data.get("object_key") or "").strip()
+    filename = (data.get("filename") or "").strip()
+    content_type = (data.get("content_type") or "").strip() or None
+    if not object_key or not filename:
+        return jsonify({"error": "object_key and filename are required"}), 400
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    # FOR UPDATE: a send that starts at the same moment waits for this
+    # insert, so a file is never "attached" to an email that already left.
+    cur.execute("SELECT status FROM email_drafts WHERE id = %s AND user_id = %s FOR UPDATE", (draft_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        db.rollback()
+        return jsonify({"ok": False, "error": "No email with that id"}), 404
+    if row["status"] != "pending":
+        db.rollback()
+        return jsonify({"ok": False, "status": row["status"],
+                        "error": "This email is no longer a draft, so files can't be added to it."}), 409
+
+    size = storage.object_size(object_key)
+    if size is None:
+        db.rollback()
+        return jsonify({"ok": False, "error": "The file didn't finish uploading. Please attach it again."}), 400
+    if size > storage.DOWNLOAD_MAX_BYTES:
+        db.rollback()
+        storage.delete_object(object_key)
+        limit_mb = storage.DOWNLOAD_MAX_BYTES // (1024 * 1024)
+        return jsonify({"ok": False, "error": f"That file is too large to email (the limit is {limit_mb} MB)."}), 400
+
+    cur.execute(
+        "INSERT INTO email_draft_attachments (draft_id, object_key, filename, content_type) "
+        "VALUES (%s, %s, %s, %s)",
+        (draft_id, object_key, filename, content_type),
+    )
+    db.commit()
+    return jsonify({"ok": True, "attachments": _email_draft_attachments_list(cur, draft_id)})
+
+
+@app.route("/email-drafts/<int:draft_id>/attachments/<int:attachment_id>", methods=["DELETE"])
+@login_required
+def remove_email_draft_attachment(draft_id, attachment_id):
+    """User tapped the '×' on an attachment chip before sending -- same
+    reversibility every other draft/card action already has."""
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT to_email, subject, body, from_name, reply_to FROM email_drafts "
+        "SELECT a.object_key FROM email_draft_attachments a JOIN email_drafts d ON d.id = a.draft_id "
+        "WHERE a.id = %s AND a.draft_id = %s AND d.user_id = %s AND d.status = 'pending'",
+        (attachment_id, draft_id, user_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "No matching attachment on a pending draft with that id"}), 404
+
+    cur.execute("DELETE FROM email_draft_attachments WHERE id = %s", (attachment_id,))
+    db.commit()
+    import storage
+    storage.delete_object(row["object_key"])
+    return jsonify({"ok": True, "attachments": _email_draft_attachments_list(cur, draft_id)})
+
+
+@app.route("/message-drafts/<int:draft_id>/confirm", methods=["POST"])
+@login_required
+def confirm_message_draft(draft_id):
+    """User tapped Send on a MessageDraftCard (see _tool_message_friend) --
+    the one point where a drafted direct message actually goes out. Does
+    the INSERT INTO direct_messages + push/FCM that _tool_message_friend
+    used to do immediately, same shape as confirm_email_draft above."""
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT friend_id, content FROM message_drafts "
         "WHERE id = %s AND user_id = %s AND status = 'pending'",
         (draft_id, user_id),
     )
@@ -3985,30 +5368,40 @@ def confirm_email_draft(draft_id):
     if not draft:
         return jsonify({"error": "No pending draft with that id"}), 404
 
-    sent = send_plain_email(
-        draft["to_email"], draft["subject"], draft["body"],
-        from_name=draft["from_name"], reply_to=draft["reply_to"],
-    )
-    if not sent:
-        return jsonify({"error": f"Failed to send email to {draft['to_email']}"}), 502
-
     cur.execute(
-        "UPDATE email_drafts SET status = 'sent', resolved_at = now() WHERE id = %s",
+        "INSERT INTO direct_messages (sender_id, recipient_id, content) VALUES (%s, %s, %s) RETURNING id",
+        (user_id, draft["friend_id"], draft["content"]),
+    )
+    message_id = cur.fetchone()["id"]
+    cur.execute(
+        "UPDATE message_drafts SET status = 'sent', resolved_at = now() WHERE id = %s",
         (draft_id,),
     )
     db.commit()
+
+    cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+    sender_name = cur.fetchone()["username"]
+    push_notification(draft["friend_id"], {
+        "type": "direct_message",
+        "message": {"id": message_id, "sender_id": user_id, "recipient_id": draft["friend_id"], "content": draft["content"]},
+        "sender_username": sender_name,
+    })
+    _spawn_background(send_fcm_to_user,
+        draft["friend_id"], title=sender_name, body=draft["content"],
+        data={"type": "direct_message", "sender_id": str(user_id), "message_id": str(message_id)},
+    )
     return jsonify({"ok": True, "status": "sent"})
 
 
-@app.route("/email-drafts/<int:draft_id>/dismiss", methods=["POST"])
+@app.route("/message-drafts/<int:draft_id>/dismiss", methods=["POST"])
 @login_required
-def dismiss_email_draft(draft_id):
+def dismiss_message_draft(draft_id):
     """User tapped Cancel -- nothing is ever sent for a dismissed draft."""
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "UPDATE email_drafts SET status = 'dismissed', resolved_at = now() "
+        "UPDATE message_drafts SET status = 'dismissed', resolved_at = now() "
         "WHERE id = %s AND user_id = %s AND status = 'pending' RETURNING id",
         (draft_id, user_id),
     )
@@ -4289,6 +5682,49 @@ def list_friends():
             f["friends_since"] = f["friends_since"].isoformat()
 
     return jsonify(friends)
+
+
+@app.route("/friends/search", methods=["GET"])
+@login_required
+def search_extended_network():
+    """Friends-of-friends matching `q` by username -- the discovery half of
+    the Friends screen's search box (the direct-friends half is a client-
+    side filter over the already-loaded GET /friends list, no backend call
+    needed for that part). Two-hop join over the same bidirectional
+    friendships table GET /friends already uses: for each of the caller's
+    own friends, find THEIR friends who aren't the caller and aren't
+    already a direct friend of the caller. mutual_via names which of the
+    caller's own friends connects them (their nickname if the caller has
+    set one, matching Friend.displayName's own fallback) -- can be more
+    than one name if several of the caller's friends all know this person.
+
+    Matched on username only, never nickname -- a nickname is the caller's
+    own private label for a DIRECT friend (see Friend.displayName's doc
+    comment); the caller has no such label for someone two hops away."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    cur.execute(
+        "SELECT u.id, u.username, u.profile_picture_url, "
+        "array_agg(DISTINCT COALESCE(mf.nickname, mu.username)) AS mutual_via "
+        "FROM friendships f1 "
+        "JOIN friendships f2 ON f2.user_id = f1.friend_id "
+        "JOIN users u ON u.id = f2.friend_id "
+        "JOIN friendships mf ON mf.user_id = %(me)s AND mf.friend_id = f1.friend_id "
+        "JOIN users mu ON mu.id = f1.friend_id "
+        "WHERE f1.user_id = %(me)s "
+        "AND f2.friend_id != %(me)s "
+        "AND f2.friend_id NOT IN (SELECT friend_id FROM friendships WHERE user_id = %(me)s) "
+        "AND u.username ILIKE %(pattern)s "
+        "GROUP BY u.id, u.username, u.profile_picture_url "
+        "ORDER BY u.username LIMIT 20",
+        {"me": user_id, "pattern": f"%{q}%"},
+    )
+    return jsonify([serialize_row(r) for r in cur.fetchall()])
 
 
 @app.route("/friends/<int:friend_id>/calls", methods=["GET"])
@@ -4792,6 +6228,26 @@ def list_direct_messages(friend_id):
     return jsonify(messages)
 
 
+_dm_client_id_ready = False
+_dm_client_id_lock = threading.Lock()
+
+
+def _ensure_dm_client_id_column(cur, db):
+    """Lazy, idempotent: direct_messages.client_id + its per-sender unique
+    index (see send_direct_message). Same pattern as meet/schema.py."""
+    global _dm_client_id_ready
+    if _dm_client_id_ready:
+        return
+    with _dm_client_id_lock:
+        if _dm_client_id_ready:
+            return
+        cur.execute("ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS client_id TEXT")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_messages_sender_client "
+                    "ON direct_messages (sender_id, client_id) WHERE client_id IS NOT NULL")
+        db.commit()
+        _dm_client_id_ready = True
+
+
 @app.route("/friends/<int:friend_id>/messages", methods=["POST"])
 @login_required
 def send_direct_message(friend_id):
@@ -4813,6 +6269,12 @@ def send_direct_message(friend_id):
     if thumbnail_data_url and len(thumbnail_data_url) > 60_000:
         return jsonify({"error": "thumbnail_data_url is too large"}), 400
 
+    # Idempotency key from the client (the web outbox's localId): a retry of
+    # a send that actually reached the server returns the original row
+    # instead of storing -- and pushing -- the message a second time.
+    # Confirmed live: messages arrived twice at the recipient.
+    client_id = (data.get("client_id") or "").strip()[:64] or None
+
     user_id = current_user_id()
     db = get_db()
     cur = dict_cursor(db)
@@ -4820,14 +6282,31 @@ def send_direct_message(friend_id):
     if not cur.fetchone():
         return jsonify({"error": "Not friends with that user"}), 403
 
-    cur.execute(
-        "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, thumbnail_data_url) "
-        "VALUES (%s, %s, %s, %s, %s, %s) "
-        "RETURNING id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
-        "attachment_url, attachment_type, thumbnail_data_url",
-        (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url),
-    )
-    message = serialize_row(cur.fetchone())
+    columns = ("id, sender_id, recipient_id, content, created_at, delivered_at, read_at, "
+               "attachment_url, attachment_type, thumbnail_data_url")
+    if client_id:
+        _ensure_dm_client_id_column(cur, db)
+        cur.execute(
+            "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, "
+            "thumbnail_data_url, client_id) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (sender_id, client_id) WHERE client_id IS NOT NULL DO NOTHING "
+            f"RETURNING {columns}",
+            (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url, client_id),
+        )
+        row = cur.fetchone()
+        if row is None:  # already stored by an earlier attempt -- hand that back, no second push
+            db.commit()
+            cur.execute(f"SELECT {columns} FROM direct_messages WHERE sender_id = %s AND client_id = %s",
+                        (user_id, client_id))
+            return jsonify(serialize_row(cur.fetchone()))
+    else:
+        cur.execute(
+            "INSERT INTO direct_messages (sender_id, recipient_id, content, attachment_url, attachment_type, thumbnail_data_url) "
+            f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {columns}",
+            (user_id, friend_id, content, attachment_url, attachment_type, thumbnail_data_url),
+        )
+        row = cur.fetchone()
+    message = serialize_row(row)
     db.commit()
 
     # Cognitive Sharing attachment summary -- only for a real document (not
@@ -5304,6 +6783,7 @@ def upload_call_recording(call_id):
     return jsonify({"conversation_id": primary_conversation_id})
 
 
+@ops_tasks.tracked("call_titling")
 def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
     """Legacy web mixed-stream call path: every participant's conversation
     holds the exact same raw_transcript already, so generate its title once
@@ -5312,6 +6792,7 @@ def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
     different wording for what's the same conversation."""
     title = generate_conversation_title(raw_transcript)
     if not title:
+        ops_tasks.fail("no title generated")
         return
     conn = get_raw_connection()
     try:
@@ -5321,12 +6802,18 @@ def _title_all_call_conversations(conversation_ids_by_user, raw_transcript):
         conn.commit()
     except Exception as e:
         print(f"[_title_all_call_conversations] DB error: {e!r}")
+        ops_tasks.fail(f"DB error: {e!r}")
         conn.rollback()
         return
     finally:
         release_raw_connection(conn)
     for pid, conv_id in conversation_ids_by_user.items():
         cache_delete(f"user:{pid}:conversation:{conv_id}", f"user:{pid}:conversations")
+
+
+# Callables (call_id, user_id, conversation_id, transcript, category) run after a
+# call recording has become a conversation. Features register themselves at startup.
+_call_ready_hooks = []
 
 
 def process_own_call_recording_job(call_id, user_id, audio_path, content_type, category):
@@ -5382,6 +6869,11 @@ def process_own_call_recording_job(call_id, user_id, audio_path, content_type, c
     cache_delete(f"user:{user_id}:conversations")
     assign_shared_call_title(call_id, user_id, conversation_id, raw_transcript)
     run_background_analysis(user_id, conversation_id, raw_transcript, lambda *a, **k: None)
+    for hook in _call_ready_hooks:  # features that build on calls (Corporate: work call -> meeting)
+        try:
+            hook(call_id, user_id, conversation_id, raw_transcript, category)
+        except Exception as e:
+            print(f"[calls] call-ready hook failed: {e!r}")
     push_notification(user_id, {
         "type": "call_conversation_ready", "call_id": call_id, "conversation_id": conversation_id,
     })
@@ -5518,14 +7010,62 @@ def build_global_chat_system_prompt(persona_context="", speaker_name=None):
         "excerpts from several of the user's own past recorded conversations, each labeled with "
         "its own date/title/category. Use those dates to resolve relative time references "
         "('last week', 'a few days ago'). Treat each excerpt as its own session, not one "
-        "continuous conversation. Ground your answer only in what's in these excerpts; if the "
-        "answer isn't there, say so briefly rather than guessing. Be concise, no preamble. "
+        "continuous conversation. For questions about the user's own life (what was said, by whom, "
+        "plans, promises, people, spending), ground your answer only in these excerpts; if it isn't "
+        "there, say so briefly rather than guessing. For general questions that don't depend on their "
+        "data (advice, recommendations such as books, explanations, how-to), answer helpfully from "
+        "general knowledge, and bring in anything relevant from the excerpts if there is some. "
+        "Be concise, no preamble. "
         + CHAT_FORMATTING_GUIDANCE + " " + CHAT_CLOSING_GUIDANCE + " " + CHAT_REMINDER_GUIDANCE
     )
     if speaker_name:
         base += f" These excerpts were chosen because they involve {speaker_name} -- focus on that person."
     base += _commerce_safety_guardrail()
+    base += _agent_continuation_guardrail()
     return base + (f" {persona_context}" if persona_context else "")
+
+
+def _agent_continuation_guardrail() -> str:
+    """Always-on, same reasoning as _commerce_safety_guardrail above: a
+    real production conversation showed this failing twice in one
+    exchange. (1) The assistant asked "what date did the accident
+    happen?", the user replied with just a bare date, and the model
+    treated that terse reply as a brand-new standalone question -- the
+    retrieval block above (unfiltered, just "most recent N conversations")
+    happened to include other same-dated material (a receipt, a policy
+    upload) and the model answered a "what happened on this date" question
+    nobody asked, derailing an in-progress claim instead of continuing it.
+    (2) Asked afterward to show the exact drafted claim email, the model
+    had no access to the literal stored text (only its own prior summary
+    of it) and fabricated a plausible-looking one from scratch, complete
+    with placeholder text like "[insert policy number]" in place of the
+    real one it had actually used when drafting. Both are the same root
+    failure as the commerce hallucination above -- answering from a
+    plausible guess instead of admitting a gap -- just not commerce-
+    specific, so this must apply to every turn, not just one gated by an
+    intent regex.
+
+    For (2), telling the model to just decline wasn't enough on its own in
+    testing -- it kept fabricating anyway. get_latest_draft (a real tool,
+    see AGENT_TOOLS) gives it actual ground truth to call instead, which
+    is what this now points it at."""
+    return (
+        " If your own immediately preceding reply asked the user a specific question (a date, a "
+        "name, a missing detail for something you were drafting or filing), and their current "
+        "message looks like a short, direct answer to it, treat it as continuing that exact "
+        "flow and act on it accordingly -- do not treat it as a new standalone question, even if "
+        "the excerpts above happen to contain other material that is loosely related to the words "
+        "in their reply. You have no way to read back the literal, exact text of an email, "
+        "message, or claim you already drafted from memory -- only your own prior summary of it. "
+        "If asked to show, repeat, or confirm the exact content of something already drafted, call "
+        "the get_latest_draft tool and quote its real result -- never reconstruct or guess the "
+        "content yourself, and never use placeholder/bracket text like \"[insert policy number]\" in "
+        "anything you say, ever. You also cannot know from memory whether an email was sent. When "
+        "the user tells you to send a drafted email, call send_email_draft; when they ask whether "
+        "an email was sent, call check_email_status. Only ever say an email was sent if one of those "
+        "tools (or send_email) returned it in THIS turn, and repeat its 'verdict' -- otherwise say "
+        "it is still a draft waiting for them."
+    )
 
 
 def _commerce_safety_guardrail() -> str:
@@ -5587,12 +7127,37 @@ def load_chat_context(cur, user_id, conversation_id):
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
-def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
-    cur.execute(
-        "INSERT INTO chat_messages (user_id, conversation_id, role, content) "
-        "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
-        (user_id, conversation_id, prompt, user_id, conversation_id, reply),
-    )
+def _strip_nul(value):
+    """Postgres TEXT/JSONB can't hold NUL (0x00) -- confirmed live that the
+    model occasionally emits one, and the INSERT then failed the whole
+    request ("A string literal cannot contain NUL"). Drops it from strings,
+    recursively through lists/dicts."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    return value
+
+
+def append_chat_messages(cur, user_id, conversation_id, prompt, reply, reply_meta=None):
+    prompt, reply, reply_meta = _strip_nul(prompt), _strip_nul(reply), _strip_nul(reply_meta)
+    if reply_meta:
+        # Only this branch touches the reply_meta column -- every ordinary
+        # reply keeps using the exact INSERT below.
+        cur.execute(
+            "INSERT INTO chat_messages (user_id, conversation_id, role, content, reply_meta) "
+            "VALUES (%s, %s, 'user', %s, NULL), (%s, %s, 'assistant', %s, %s)",
+            (user_id, conversation_id, prompt, user_id, conversation_id, reply,
+             psycopg2.extras.Json(reply_meta)),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO chat_messages (user_id, conversation_id, role, content) "
+            "VALUES (%s, %s, 'user', %s), (%s, %s, 'assistant', %s)",
+            (user_id, conversation_id, prompt, user_id, conversation_id, reply),
+        )
     # Keep the message-list cache (if any is warm) up to date in place rather
     # than invalidating it -- this is the highest-frequency write path, and
     # re-fetching the full history from Postgres on every single chat turn
@@ -5601,10 +7166,10 @@ def append_chat_messages(cur, user_id, conversation_id, prompt, reply):
     cached = cache_get_json(cache_key)
     if cached is not None:
         ts = datetime.now(timezone.utc).isoformat()
-        cached = cached + [
-            {"role": "user", "content": prompt, "created_at": ts},
-            {"role": "assistant", "content": reply, "created_at": ts},
-        ]
+        assistant_row = {"role": "assistant", "content": reply, "created_at": ts}
+        if reply_meta:
+            assistant_row["reply_meta"] = reply_meta
+        cached = cached + [{"role": "user", "content": prompt, "created_at": ts}, assistant_row]
         cache_set_json(cache_key, cached, ttl=3600)
 
 
@@ -5919,21 +7484,41 @@ GLOBAL_CHAT_CHARS_PER_CONVERSATION = 1200
 @app.route("/chat/global", methods=["GET"])
 @login_required
 def get_global_chat_history():
-    user_id = current_user_id()
+    """The whole thread, oldest first -- or, with ?limit=N, one page of it:
+    {"messages": the N before index `before` (default: the newest N),
+    "start": index of the first one}. Paged so the web chat doesn't download
+    and render ~1,000 messages just to open (confirmed live: 542 KB); the
+    full-list form stays as-is for clients that don't page (Flutter)."""
+    rows = _global_chat_rows(current_user_id())
+    limit = request.args.get("limit", type=int)
+    if not limit or limit < 1:
+        return jsonify(rows)
+    before = request.args.get("before", type=int)
+    end = len(rows) if before is None else max(0, min(before, len(rows)))
+    start = max(0, end - min(limit, 200))
+    return jsonify({"messages": rows[start:end], "start": start})
+
+
+def _global_chat_rows(user_id):
     cache_key = _messages_cache_key(user_id, None)
     cached = cache_get_json(cache_key)
     if cached is not None:
-        return jsonify(cached)
+        return cached
     db = get_db()
     cur = dict_cursor(db)
     cur.execute(
-        "SELECT role, content, created_at FROM chat_messages "
+        "SELECT role, content, created_at, reply_meta FROM chat_messages "
         "WHERE user_id = %s AND conversation_id IS NULL ORDER BY created_at ASC",
         (user_id,),
     )
-    result = [serialize_row(r) for r in cur.fetchall()]
+    result = []
+    for r in cur.fetchall():
+        row = serialize_row(r)
+        if row.get("reply_meta") is None:
+            row.pop("reply_meta", None)  # same row shape as before for every ordinary message
+        result.append(row)
     cache_set_json(cache_key, result, ttl=3600)
-    return jsonify(result)
+    return result
 
 
 @app.route("/chat/global", methods=["POST"])
@@ -5967,9 +7552,10 @@ def chat_global():
     # appear there) -- matched_friend below covers real friendships instead,
     # which is what unlocks the direct-message content further down.
     cur.execute("SELECT id, name FROM speaker_profiles WHERE user_id = %s", (user_id,))
+    speaker_rows = cur.fetchall()
     matched = None
     prompt_lower = prompt.lower()
-    for p in cur.fetchall():
+    for p in speaker_rows:
         if re.search(r"\b" + re.escape(p["name"].lower()) + r"\b", prompt_lower):
             matched = p
             break
@@ -5979,11 +7565,64 @@ def chat_global():
         "JOIN users u ON u.id = f.friend_id WHERE f.user_id = %s",
         (user_id,),
     )
+    friend_rows = cur.fetchall()
     matched_friend = None
-    for f in cur.fetchall():
+    for f in friend_rows:
         if re.search(r"\b" + re.escape(f["name"].lower()) + r"\b", prompt_lower):
             matched_friend = f
             break
+
+    # Prior exchanges in this thread, read back from the DB -- same
+    # follow-up-resolution role load_chat_context plays for /chat. Read here
+    # (not just before the final call) because the resolver below needs it.
+    history = load_global_chat_context(cur, user_id)
+    # Everything older than that window, kept as a running summary
+    # (chat_summary.py) -- '' when off or nothing has scrolled out yet.
+    thread_summary = chat_summary.load(cur, db, user_id) if chat_summary.enabled() else ""
+
+    # Resolver (chat_followup.py): for a follow-up, a small model rewrites the
+    # message into a standalone question; names and the spending topic are
+    # then also looked for in that rewrite. Fetch decisions only -- the user's
+    # own words are still what gets saved and answered.
+    resolved = None
+    if chat_followup.resolver_enabled() and chat_followup.needs_resolution(prompt, history):
+        known_people = [r["name"] for r in speaker_rows] + [r["name"] for r in friend_rows]
+        resolved = ops_tasks.run("chat_resolver", chat_followup.resolve_with_llm,
+                                 history, prompt, known_people, thread_summary=thread_summary)
+    if resolved:
+        resolved_lower = resolved["standalone"].lower()
+        hinted = {n.lower() for n in resolved["people"]}
+
+        def _named(rows):
+            return next((r for r in rows if r["name"].lower() in hinted
+                         or re.search(r"\b" + re.escape(r["name"].lower()) + r"\b", resolved_lower)), None)
+
+        matched = matched or _named(speaker_rows)
+        matched_friend = matched_friend or _named(friend_rows)
+
+    # Follow-ups that don't name anyone ("and what did he say?") pick up the
+    # person/spending topic the previous turn was about -- see
+    # chat_followup.py. Carried ids are only used if they're still among this
+    # user's own rows above.
+    followup_on = chat_followup.enabled()
+    followup_state = cache_get_json(chat_followup.state_key(user_id)) if followup_on else None
+    carried = {}
+    if followup_state:
+        try:
+            from mail_common import mentions_mail as _mentions_mail_fu
+            mail_fresh = _mentions_mail_fu(prompt_lower)
+        except Exception:
+            mail_fresh = False
+        carried = chat_followup.resolve(
+            prompt, followup_state,
+            named_person_found=bool(matched or matched_friend),
+            fresh_topic_found=bool(_FINANCE_INTENT_RE.search(prompt_lower) or _NEARBY_INTENT_RE.search(prompt_lower)
+                                   or _detect_nearby_category(prompt_lower) or mail_fresh),
+        )
+        if carried.get("speaker"):
+            matched = next((p for p in speaker_rows if p["id"] == carried["speaker"]["id"]), None)
+        if carried.get("friend"):
+            matched_friend = next((f for f in friend_rows if f["id"] == carried["friend"]["id"]), None)
 
     remember_ei_recent_statement(user_id, prompt)
 
@@ -6131,6 +7770,65 @@ def chat_global():
     except Exception:
         commerce_context, action_card = "", None  # optional and additive, never affects this endpoint otherwise
 
+    # Spending-habit questions -- "where am I spending the most", "show my
+    # purchasing habits this month". Cheap (one indexed GROUP BY), so just
+    # gated on the intent regex, no flag needed.
+    finance_context = ""
+    if (_FINANCE_INTENT_RE.search(prompt_lower) or carried.get("finance")
+            or (resolved and ("spending" in resolved["topics"] or _FINANCE_INTENT_RE.search(resolved_lower)))):
+        # Local time (the server runs in the users' timezone), not UTC --
+        # "this month"/"today" must flip at local midnight.
+        now_local = datetime.now().astimezone()
+        month_start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_end = now_local
+        spending_rows = compute_monthly_spending_summary(cur, user_id, month_start, month_end)
+        if spending_rows:
+            # Today's total computed here, not left to the model to pick out
+            # of the transaction list -- confirmed live that it otherwise
+            # reused yesterday's "today" answer from earlier in the chat.
+            day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            _, today_total, today_count, _ = query_transactions(cur, user_id, day_start, now_local + timedelta(seconds=1))
+            lines = [
+                f"Real spending data for {month_start.strftime('%B %Y')} so far, by category (highest first). "
+                f"This snapshot covers THIS MONTH ONLY -- for any other period, or a specific item/merchant "
+                f"(e.g. flights last year), call the query_spending tool instead of answering from this. "
+                f"These figures are fresh as of now: never reuse a total from earlier in this chat instead.",
+                f"Today ({now_local:%Y-%m-%d}) so far: Rs {today_total:.2f} across {today_count} "
+                f"transaction{'s' if today_count != 1 else ''}.",
+            ]
+            for r in spending_rows:
+                lines.append(f"- {r['category']}: Rs {r['total']:.2f} across {r['count']} transaction{'s' if r['count'] != 1 else ''}")
+            # Second breakdown, same data but grouped by which UPI app was
+            # used -- a different question ("which app do I pay through
+            # most") than category, so both are handed to the LLM rather
+            # than guessing which one the user meant from the wording alone.
+            method_rows = compute_monthly_payment_method_summary(cur, user_id, month_start, month_end)
+            if method_rows:
+                lines.append("\nSame period, by payment app instead:")
+                for r in method_rows:
+                    lines.append(f"- {r['payment_method']}: Rs {r['total']:.2f} across {r['count']} transaction{'s' if r['count'] != 1 else ''}")
+            # Individual transactions too, not just the aggregates above --
+            # needed any time the user wants specifics named (e.g. "send
+            # today's purchases to Kunal"), which a SUM-by-category row
+            # can't answer since it has no item field. Capped list, newest
+            # first; "today" is judged by the LLM from each timestamp.
+            recent_rows = compute_recent_transactions(cur, user_id, month_start, month_end)
+            if recent_rows:
+                lines.append("\nIndividual transactions this period, newest first (use these to name what was actually bought, not just totals):")
+                for r in recent_rows:
+                    what = r["item"] or r["payee"] or r["category"] or "Unspecified"
+                    when = r["created_at"].strftime("%Y-%m-%d %H:%M") if isinstance(r["created_at"], datetime) else str(r["created_at"])
+                    via = f" via {r['payee']}" if r["item"] and r["payee"] else ""
+                    lines.append(f"- {when}: {what}{via} -- Rs {float(r['amount']):.2f} ({r['category'] or 'Uncategorized'}, {r['payment_method'] or 'unknown app'})")
+            finance_context = "\n".join(lines)
+        else:
+            finance_context = (
+                "The user asked about their spending. Nothing has been logged THIS MONTH -- but if they're asking "
+                "about any other period or a specific item/merchant (e.g. flights last year), call the "
+                "query_spending tool first. Only if that also finds nothing, say so plainly rather than "
+                "inventing numbers."
+            )
+
     if matched:
         cur.execute(
             "SELECT DISTINCT c.id, c.title, c.created_at, c.category, c.raw_transcript "
@@ -6146,8 +7844,15 @@ def chat_global():
         )
     conversations = cur.fetchall()
 
+    try:
+        from mail_common import mentions_mail as _mentions_mail
+        mail_intent = _mentions_mail(prompt_lower)
+    except Exception:
+        mail_intent = False
+
     if (not conversations and not ei_context and not personal_notes_context and not direct_messages_context
-            and not nearby_context and not commerce_context and not _AGENT_ACTION_INTENT_RE.search(prompt_lower)):
+            and not nearby_context and not commerce_context and not finance_context
+            and not _AGENT_ACTION_INTENT_RE.search(prompt_lower) and not mail_intent):
         reply = "I don't have any past conversations to draw from yet."
         append_chat_messages(cur, user_id, None, prompt, reply)
         db.commit()
@@ -6163,10 +7868,6 @@ def chat_global():
         excerpt = (c["raw_transcript"] or "")[:GLOBAL_CHAT_CHARS_PER_CONVERSATION]
         when = c["created_at"].strftime("%A, %Y-%m-%d %H:%M") if isinstance(c["created_at"], datetime) else str(c["created_at"])
         blocks.append(f"[{when} - {c['title'] or 'Untitled'} ({c['category']})]\n{excerpt}")
-
-    # Prior exchanges in this thread, read back from the DB -- same
-    # follow-up-resolution role load_chat_context plays for /chat.
-    history = load_global_chat_context(cur, user_id)
 
     # Built up rather than defaulting to the "(No saved conversation
     # transcripts available.)" placeholder up front -- that literal string,
@@ -6189,11 +7890,34 @@ def chat_global():
         transcripts_section = _prepend(transcripts_section, nearby_context)
     if commerce_context:
         transcripts_section = _prepend(transcripts_section, commerce_context)
+    if finance_context:
+        transcripts_section = _prepend(transcripts_section, finance_context)
     if not transcripts_section:
         transcripts_section = "(No saved conversation transcripts available.)"
     user_content = f"{transcripts_section}\n\n---\n\nUser question:\n{prompt}"
-    matched_name = matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
+    if resolved and resolved["standalone"].strip().lower() != prompt.strip().lower():
+        user_content += f"\n\n(In the context of this chat, this most likely means: {resolved['standalone']})"
+    if finance_context:
+        # Confirmed live: with the same question already answered earlier in
+        # the thread, the model repeated that old total without any tool
+        # call -- even with "never reuse" in the system prompt. The latest
+        # user turn is what it weighs most, so the reminder goes here (only
+        # in what the model sees; chat history stores the user's own words).
+        user_content += ("\n\n(Work this out fresh with the tools -- don't reuse an answer or total from earlier "
+                         "in this chat; new expenses or receipts may have arrived since.)")
+    matched_name =matched["name"] if matched else (matched_friend["name"] if matched_friend else None)
     global_chat_system_prompt = build_global_chat_system_prompt(persona_context, matched_name)
+    # Which mailboxes (Outlook/Gmail) this user has linked -- the base prompt
+    # says to answer only from conversation excerpts, so without this the
+    # model refuses mail questions instead of calling the mail tools.
+    try:
+        from mail_common import system_prompt_note as _mail_prompt_note
+        global_chat_system_prompt += _mail_prompt_note(cur, user_id)
+    except Exception:
+        pass  # optional and additive
+    if followup_on:
+        global_chat_system_prompt += chat_followup.PROMPT_NOTE
+    global_chat_system_prompt += chat_summary.prompt_block(thread_summary)
     if ei_context:
         global_chat_system_prompt = f"{global_chat_system_prompt}\n\n{ei_context}"
     messages = [{"role": "system", "content": global_chat_system_prompt}]
@@ -6201,7 +7925,7 @@ def chat_global():
     messages.append({"role": "user", "content": user_content})
 
     try:
-        reply, tool_action_card, created_task_this_turn = run_agent_tool_loop(cur, db, user_id, messages)
+        reply, tool_action_cards, created_task_this_turn, reply_meta = run_agent_tool_loop(cur, db, user_id, messages)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 500
         if status == 429:
@@ -6220,15 +7944,63 @@ def chat_global():
             "reply": "The assistant is taking too long to respond right now. Please try again in a moment."
         })
 
-    if tool_action_card:
-        action_card = tool_action_card
+    # A single request can trigger several staged actions at once (e.g.
+    # "log this expense AND message Kunal AND email the same update") --
+    # every one of them needs its own card, not just whichever ran last.
+    action_cards = ([action_card] if action_card else []) + tool_action_cards
+
+    # How the resolver read a follow-up, shown as a small "Understood as"
+    # line under the reply (both clients) so a wrong reading is easy to
+    # spot. Saved in reply_meta, so it survives a reload of the thread.
+    if resolved and resolved["standalone"].strip().lower() != prompt.strip().lower():
+        reply_meta = {**(reply_meta or {}), "understood_as": resolved["standalone"]}
+
+    # Deterministic backstop, not just a prompt instruction -- confirmed
+    # live that telling the model not to fabricate drafted content (and
+    # even giving it get_latest_draft, a real tool to fetch the ground
+    # truth) was NOT reliably enough; it kept composing a fake email from
+    # scratch anyway, with placeholder text standing in for details it
+    # didn't actually have. Every observed failure (skipping the real
+    # tool call and inventing one outright, or being asked to re-show
+    # already-drafted content and inventing a different version) shares
+    # one unmistakable tell: literal template placeholder brackets like
+    # "[insert policy number]". This can't fix the model's choice not to
+    # call a tool, but it reliably stops the fabricated text from ever
+    # reaching the user, regardless of why it happened.
+    if reply and _FABRICATED_PLACEHOLDER_RE.search(reply):
+        reply = (
+            "I don't have a reliable way to show exact drafted content here -- please review it "
+            "directly on the card, or tell me what you'd like changed and I'll redo it properly."
+        )
+    # gpt-oss sometimes leaves its own tool-citation markers in the answer
+    # ("【...read_email result showing ...】" -- confirmed live). They mean
+    # nothing to the user; the source chips already show where data came from.
+    if reply:
+        reply = _TOOL_CITATION_RE.sub("", reply).strip()
+    if reply:
+        try:
+            reply = _email_claim_backstop(cur, db, user_id, reply, g.get("email_outcomes", []))
+        except Exception as e:
+            db.rollback()
+            print(f"[email] sent-claim backstop failed: {e!r}")
 
     if reply:
         # Store the clean question/reply, not the retrieval blob -- that
         # gets freshly rebuilt from profile_conversations/conversations on
         # every turn already, so saving it too would duplicate it forever.
-        append_chat_messages(cur, user_id, None, prompt, reply)
+        append_chat_messages(cur, user_id, None, prompt, reply, reply_meta=reply_meta)
         db.commit()
+        if followup_on:
+            cache_set_json(
+                chat_followup.state_key(user_id),
+                chat_followup.next_state(followup_state, matched, matched_friend, bool(finance_context)),
+                ttl=chat_followup.STATE_TTL_SECONDS,
+            )
+        if chat_summary.enabled():
+            # Background: folds whatever just scrolled out of the history
+            # window into the running summary; the reply never waits on it.
+            _spawn_background(ops_tasks.wrap("chat_summary", chat_summary.update), get_raw_connection, release_raw_connection,
+                              user_id, CHAT_HISTORY_MAX_TURNS * 2)
 
     try:
         from emotional_intelligence.ei_adapter import trigger_chat_feedback_extraction
@@ -6245,7 +8017,9 @@ def chat_global():
         "reply": reply,
         "matched_speaker": matched["name"] if matched else None,
         "conversations_used": len(conversations),
-        "action_card": action_card,
+        "action_cards": action_cards,
+        # Only present when a mail tool ran -- {tool_activity, mail_sources}.
+        **({"reply_meta": reply_meta} if reply_meta else {}),
     })
 
 
@@ -6505,6 +8279,216 @@ def swiggy_track_order():
 
 
 IMAGE_UPLOAD_PLACEHOLDER = "[Image uploaded]"
+PDF_UPLOAD_PLACEHOLDER = "[PDF document uploaded]"
+
+
+_VALID_COVERAGE_TYPES = {"own_damage", "third_party", "comprehensive"}
+
+
+def _build_vehicle_policy_dict(parsed):
+    """Shared shape for a POLICY extraction result -- used by both
+    chat_global_image's POLICY section (photo path) and
+    extract_vehicle_policy_pdf (PDF path) below, so the two sources
+    produce identical fields for PolicyConfirmSheet. coverage_type falls
+    back to 'comprehensive' when missing or not one of the three
+    recognized values, rather than failing the whole extraction over it."""
+    coverage_type = (parsed.get("coverage_type") or "").strip().lower()
+    if coverage_type not in _VALID_COVERAGE_TYPES:
+        coverage_type = "comprehensive"
+    return {
+        "insurer_name": str(parsed["insurer_name"]).strip(),
+        "policy_number": str(parsed["policy_number"]).strip(),
+        "vehicle_registration": (parsed.get("vehicle_registration") or "").strip() or None,
+        "insured_name": (parsed.get("insured_name") or "").strip() or None,
+        "issue_date": parsed.get("issue_date") or None,
+        "expiry_date": parsed.get("expiry_date") or None,
+        "sum_insured": float(parsed["sum_insured"]) if isinstance(parsed.get("sum_insured"), (int, float)) else None,
+        "coverage_type": coverage_type,
+        "claims_email": (parsed.get("claims_email") or "").strip() or None,
+    }
+
+
+_COVERAGE_TYPE_LABELS = {
+    "own_damage": "an Own Damage",
+    "third_party": "a Third Party",
+    "comprehensive": "a Comprehensive",
+}
+
+
+def _format_policy_summary(policy):
+    """Deterministic, server-built overview of an extracted vehicle
+    policy -- NOT left to the model's own prose. Confirmed live that
+    asking the model to conditionally write a rich summary only for
+    policy documents (vs. a generic one-liner for everything else, in
+    chat_global_image's shared vision prompt) wasn't reliable -- the
+    photo and PDF paths ended up sounding noticeably different from each
+    other, since each prompted for it independently and the photo path's
+    conditional branch didn't always get picked. One shared formatter
+    used by BOTH upload paths guarantees identical wording regardless of
+    source, and the closing line can never accidentally turn into a
+    yes/no question since it isn't generated at all."""
+    coverage_label = _COVERAGE_TYPE_LABELS.get(policy["coverage_type"], "a Comprehensive")
+    lines = [f"This is {coverage_label} motor insurance policy" + (
+        f" for vehicle {policy['vehicle_registration']}." if policy.get("vehicle_registration") else "."
+    )]
+    lines.append(f"Underwritten by {policy['insurer_name']} (policy number {policy['policy_number']}).")
+    if policy.get("issue_date") and policy.get("expiry_date"):
+        lines.append(f"Coverage runs {policy['issue_date']} to {policy['expiry_date']}.")
+    elif policy.get("expiry_date"):
+        lines.append(f"Coverage valid until {policy['expiry_date']}.")
+    if policy.get("sum_insured"):
+        lines.append(f"Sum insured (IDV): Rs {policy['sum_insured']:,.0f}.")
+    lines.append("You can ask me to file a claim for this anytime.")
+    return " ".join(lines)
+
+
+def _build_transaction_dict(parsed):
+    """Shared shape for a TRANSACTION extraction result -- used by both
+    chat_global_image (photo path) and the PDF upload path below,
+    mirroring _build_vehicle_policy_dict's role for POLICY."""
+    return {
+        "amount": float(parsed["amount"]),
+        "payee": (parsed.get("payee") or "").strip() or None,
+        "category": _normalize_category(parsed.get("category")),
+        "payment_method": _normalize_payment_method(parsed.get("payment_method")),
+        "item": (parsed.get("item") or "").strip() or None,
+    }
+
+
+def _build_content_extraction_instruction(subject, description):
+    """Shared EXTRACTED/SUMMARY/TRANSACTION/POLICY instruction -- used by
+    both chat_global_image (a photo, sent to a vision model) and the PDF
+    upload path below (already-extracted text, appended after this
+    instruction, sent to a plain text model) -- so a receipt, a vehicle
+    insurance policy, or neither is recognized and described identically
+    regardless of which form the user shared it in. The model decides
+    from the actual content every time; nothing upstream hardcodes which
+    of the three a given upload is. `subject` slots into the opening
+    sentence ('This image', 'This document'); `description` is the
+    user's own caption, or '' for an upload flow with no caption step
+    (e.g. the PDF path, which has none)."""
+    return (
+        f"{subject} was shared in a personal chat assistant. Extract ALL text and structured "
+        "information visible in it, thoroughly and literally (amounts, dates, merchant/sender names, "
+        "line items if it's a bill/receipt; the full text if it's a handwritten note) -- this will be "
+        "stored as searchable text, not shown directly to the user, so be exhaustive rather than "
+        "concise. EXCEPTION: for a table with many similar or repeated rows (e.g. a premium/fee "
+        "breakdown where most line items are zero or blank), describe the structure once and list "
+        "only the non-zero/meaningfully different rows -- never transcribe the same or a near-"
+        "identical line over and over. The user's own description: "
+        f"{description or '(none given)'}\n\n"
+        "Reply with exactly four labeled sections, nothing else, IN THIS ORDER -- SUMMARY/TRANSACTION/"
+        "POLICY first because they're short and functionally critical, EXTRACTED last because it's the "
+        "longest section: if you run low on room, it's fine for EXTRACTED to be cut short or incomplete, "
+        "but never skip or shorten SUMMARY/TRANSACTION/POLICY to make room for it.\n"
+        "SUMMARY: <a brief, natural 1-2 sentence acknowledgment of what this is, for a chat reply -- "
+        "don't repeat the extraction verbatim. If this turns out to be a vehicle insurance policy "
+        "document (see POLICY below), this text is replaced automatically with a proper overview, so "
+        "just keep this one brief either way.>\n"
+        "TRANSACTION: <if this is a payment receipt or confirmation of ANY kind -- a UPI app (GPay, PhonePe, "
+        "Paytm, or similar), a credit/debit card transaction alert, a net-banking or bank-transfer "
+        "confirmation, or similar -- a single-line JSON object {\"amount\": <number>, \"payee\": "
+        "\"<merchant or person paid>\", \"category\": \"<one or two words, e.g. Food, Travel, Shopping, "
+        "Bills, Entertainment>\", \"payment_method\": \"<the actual payment rail used, read literally from "
+        "the receipt, never guessed -- for UPI, the app name (Google Pay, PhonePe, Paytm, Amazon Pay, BHIM, "
+        "CRED); otherwise the rail plus issuer if shown, e.g. 'HDFC Credit Card', 'ICICI Debit Card', 'SBI "
+        "Net Banking', 'Axis Bank Transfer' -- preserve the bank's own capitalization (HDFC, ICICI, SBI are "
+        "acronyms, not words) rather than rewriting it. In India small everyday payments are usually UPI "
+        "while larger ones (insurance, big-ticket purchases, bills) are often credit card or net banking -- "
+        "read what's actually on the receipt rather than assuming either>\", \"item\": \"<a short 2-5 word "
+        "description of what was actually bought, e.g. 'Power bank', 'Grocery items' -- most payment "
+        "confirmations show no line items at all, so this is very often NOT on the receipt itself: use the "
+        "user's own description above when it names what they bought (e.g. they wrote 'bought a power bank "
+        "from blinkit' -> item is 'Power bank'), falling back to the receipt's line items if it has any, "
+        "and null only if neither source says what it was for>\"} -- amount and payee must be literally "
+        "visible on the receipt; if category isn't explicitly printed, infer the single best-fitting one "
+        "from the merchant name, any line items, and the item above. If this is NOT a payment "
+        "receipt/confirmation, or no amount is readable, reply with exactly: NONE>\n"
+        "POLICY: <if this is a vehicle (two-wheeler or four-wheeler) insurance policy document or "
+        "insurance card -- a single-line JSON object {\"insurer_name\": \"<the insurance company that "
+        "actually underwrites the policy, e.g. 'Tata AIG', 'ICICI Lombard' -- not a broker's name if a "
+        "broker is also shown>\", \"policy_number\": \"<exactly as printed>\", "
+        "\"vehicle_registration\": \"<the vehicle's registration number, e.g. 'KA01AB1234', or null if not "
+        "shown>\", \"insured_name\": \"<the policyholder's name, or null>\", \"issue_date\": \"<YYYY-MM-DD, "
+        "or null>\", \"expiry_date\": \"<YYYY-MM-DD, or null -- the actual coverage/validity period's end "
+        "date, not an administrative 'issued on' timestamp if the two differ>\", \"sum_insured\": <the "
+        "insured declared value/sum insured/IDV as a number, or null>, \"coverage_type\": \"<one of "
+        "'own_damage', 'third_party', or 'comprehensive' -- 'own_damage' if the document explicitly says "
+        "Own Damage/Standalone OD/OD only, 'third_party' if it explicitly says Third Party/Liability "
+        "Only/Act Policy, otherwise (a bundled/package policy, or unclear) 'comprehensive'>\", "
+        "\"claims_email\": \"<the INSURER's own literal support/claims email if printed -- prefer the "
+        "underwriting insurer's address over a broker's if both appear, or null if none is printed>\"} -- "
+        "insurer_name and policy_number must be literally visible; dates read exactly as printed, not "
+        "guessed. If this is NOT a vehicle insurance policy/card (e.g. it's a receipt, handled above, "
+        "or anything else), reply with exactly: NONE>\n"
+        "EXTRACTED: <the thorough, literal extraction described above>"
+    )
+
+
+_DEGENERATE_MIN_LINE_REPEATS = 8
+
+
+def _looks_degenerate(text):
+    """Detects a classic LLM repetition-loop failure -- confirmed live on
+    a real policy photo with a dense premium table: the vision model
+    repeated a single line dozens of times and never reached the later
+    SUMMARY/TRANSACTION/POLICY sections at all, so the raw EXTRACTED-
+    prefixed blob leaked straight into the user-facing reply. A cheap
+    line-frequency check catches this reliably; call_groq_vision's
+    frequency_penalty/max_tokens reduce how often it happens in the first
+    place, but aren't a guarantee, so this is the actual backstop."""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return False
+    counts = {}
+    for ln in lines:
+        counts[ln] = counts.get(ln, 0) + 1
+    return max(counts.values()) >= _DEGENERATE_MIN_LINE_REPEATS
+
+
+def _parse_content_extraction_reply(raw_text):
+    """Splits a raw EXTRACTED/SUMMARY/TRANSACTION/POLICY reply (produced
+    from _build_content_extraction_instruction, via vision for a photo or
+    a plain text call for PDF-extracted text) into (extracted_text,
+    reply, transaction, policy) -- shared by chat_global_image and the
+    PDF upload path so a receipt/policy/neither is recognized the same
+    way regardless of upload form. `reply` is overridden to a
+    deterministic summary when a policy is found (see
+    _format_policy_summary)."""
+    if _looks_degenerate(raw_text):
+        return (
+            "(extraction failed -- the model got stuck repeating itself on a dense table)",
+            "I had trouble reading that clearly -- it looked like a dense table and I got stuck on "
+            "part of it. Could you try again, maybe with a clearer photo, better lighting, or just "
+            "the page with the key details cropped in?",
+            None, None,
+        )
+
+    summary_match = re.search(r"SUMMARY:\s*(.*?)(?=\nTRANSACTION:|\Z)", raw_text, re.DOTALL)
+    transaction_match = re.search(r"TRANSACTION:\s*(.*?)(?=\nPOLICY:|\Z)", raw_text, re.DOTALL)
+    policy_match = re.search(r"POLICY:\s*(.*?)(?=\nEXTRACTED:|\Z)", raw_text, re.DOTALL)
+    extracted_match = re.search(r"EXTRACTED:\s*(.*)", raw_text, re.DOTALL)
+    extracted_text = (extracted_match.group(1) if extracted_match else raw_text).strip()
+    reply = (summary_match.group(1) if summary_match else raw_text).strip()
+
+    transaction = None
+    if transaction_match:
+        transaction_raw = transaction_match.group(1).strip()
+        if transaction_raw and transaction_raw.upper() != "NONE":
+            parsed = extract_json(transaction_raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("amount"), (int, float)):
+                transaction = _build_transaction_dict(parsed)
+
+    policy = None
+    if policy_match:
+        policy_raw = policy_match.group(1).strip()
+        if policy_raw and policy_raw.upper() != "NONE":
+            parsed = extract_json(policy_raw)
+            if isinstance(parsed, dict) and parsed.get("insurer_name") and parsed.get("policy_number"):
+                policy = _build_vehicle_policy_dict(parsed)
+                reply = _format_policy_summary(policy)
+
+    return extracted_text, reply, transaction, policy
 
 
 @app.route("/chat/global/image", methods=["POST"])
@@ -6541,18 +8525,7 @@ def chat_global_image():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    instruction = (
-        "This image was shared in a personal chat assistant. Extract ALL text and structured "
-        "information visible in it, thoroughly and literally (amounts, dates, merchant/sender names, "
-        "line items if it's a bill/receipt; the full text if it's a handwritten note) -- this will be "
-        "stored as searchable text, not shown directly to the user, so be exhaustive rather than "
-        "concise. The user's own description of the image: "
-        f"{description or '(none given)'}\n\n"
-        "Reply with exactly two labeled sections, nothing else:\n"
-        "EXTRACTED: <the thorough, literal extraction described above>\n"
-        "SUMMARY: <a brief, natural 1-2 sentence acknowledgment of what this image is, for a chat reply "
-        "-- don't repeat the extraction verbatim>"
-    )
+    instruction = _build_content_extraction_instruction("This image", description)
     try:
         vision_reply = call_groq_vision(image_bytes, mimetype, instruction)
     except requests.HTTPError as e:
@@ -6565,11 +8538,7 @@ def chat_global_image():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
 
-    extracted_match = re.search(r"EXTRACTED:\s*(.*?)(?=\nSUMMARY:|\Z)", vision_reply, re.DOTALL)
-    summary_match = re.search(r"SUMMARY:\s*(.*)", vision_reply, re.DOTALL)
-    extracted_text = (extracted_match.group(1) if extracted_match else vision_reply).strip()
-    reply = (summary_match.group(1) if summary_match else vision_reply).strip()
-
+    extracted_text, reply, transaction, policy = _parse_content_extraction_reply(vision_reply)
     if not extracted_text:
         return jsonify({"error": "Could not extract any text from that image"}), 422
 
@@ -6609,7 +8578,451 @@ def chat_global_image():
         "conversation_id": conversation_id,
         "title": title,
         "category": category,
+        "transaction": transaction,
+        "policy": policy,
     })
+
+
+@app.route("/transactions", methods=["POST"])
+@login_required
+def save_transaction():
+    """Confirm-card save step for a transaction extracted by chat_global_image
+    above -- the user may have edited amount/payee/category before this is
+    called, so this never re-derives them from the image itself, only
+    persists whatever the client sends. conversation_id links back to the
+    chat message the receipt was shared as, but is optional (ON DELETE SET
+    NULL in schema.sql) since a transaction should outlive its source
+    conversation being deleted.
+
+    Dedupes against the same (user, amount, payee) saved in the last 10
+    minutes -- catches the real accidental-duplicate case (the same receipt
+    shared twice, or a double-tapped Save) without blocking a genuine
+    second purchase from the same payee later the same day. Returns the
+    EXISTING row with duplicate:true rather than erroring, so the client's
+    confirm-card flow doesn't need special-case handling -- it already
+    treats a 200 as "saved"."""
+    data = request.get_json(silent=True) or {}
+    amount = data.get("amount")
+    if not isinstance(amount, (int, float)):
+        return jsonify({"error": "amount is required and must be a number"}), 400
+
+    conversation_id = data.get("conversation_id")
+    payee = (data.get("payee") or "").strip() or None
+    category = _normalize_category(data.get("category"))
+    payment_method = _normalize_payment_method(data.get("payment_method"))
+    item = (data.get("item") or "").strip() or None
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    cur.execute(
+        "SELECT id, amount, payee, category, payment_method, item, created_at FROM transactions "
+        "WHERE user_id = %s AND amount = %s AND payee IS NOT DISTINCT FROM %s "
+        "AND created_at >= now() - INTERVAL '10 minutes' ORDER BY created_at DESC LIMIT 1",
+        (user_id, float(amount), payee),
+    )
+    existing = cur.fetchone()
+    if existing:
+        return jsonify({
+            "id": existing["id"],
+            "amount": float(existing["amount"]),
+            "payee": existing["payee"],
+            "category": existing["category"],
+            "payment_method": existing["payment_method"],
+            "item": existing["item"],
+            "created_at": existing["created_at"].isoformat(),
+            "duplicate": True,
+        })
+
+    cur.execute(
+        "INSERT INTO transactions (user_id, conversation_id, amount, payee, category, payment_method, item) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at",
+        (user_id, conversation_id, float(amount), payee, category, payment_method, item),
+    )
+    row = cur.fetchone()
+    db.commit()
+    return jsonify({
+        "id": row["id"],
+        "amount": float(amount),
+        "payee": payee,
+        "category": category,
+        "payment_method": payment_method,
+        "item": item,
+        "created_at": row["created_at"].isoformat(),
+        "duplicate": False,
+    })
+
+
+@app.route("/vehicle-policies", methods=["POST"])
+@login_required
+def save_vehicle_policy():
+    """Confirm-card save step for a policy extracted by chat_global_image's
+    POLICY section (or extract_vehicle_policy_pdf below) -- same shape as
+    save_transaction, but the "duplicate" question here is really "is this
+    a renewal of a policy already on file", not "was this exact receipt
+    shared twice". A renewed policy keeps the same vehicle but gets a NEW
+    policy number, so without this, re-uploading a renewal would leave two
+    rows for one vehicle and make file_vehicle_insurance_claim's lookup
+    ambiguous ("found more than one matching policy") for a vehicle that
+    only ever has one *active* policy of that coverage type. Matches on
+    (vehicle_registration, coverage_type) first (the renewal case -- a
+    vehicle can legitimately have two active rows at once, an own_damage
+    and a third_party policy, often from different insurers, so the match
+    key includes coverage_type to avoid one renewal clobbering the other),
+    falling back to an exact policy_number match (re-uploading the same
+    document) -- either way, REPLACES the existing row in place rather
+    than inserting a second one. claims_email is always required server-
+    side: the PolicyConfirmSheet pre-fills it when the extraction found one
+    printed on the document, but always leaves it editable and never saves
+    a blank one, since a missing claims_email means
+    file_vehicle_insurance_claim has nowhere to send a claim."""
+    data = request.get_json(silent=True) or {}
+    insurer_name = (data.get("insurer_name") or "").strip()
+    policy_number = (data.get("policy_number") or "").strip()
+    claims_email = (data.get("claims_email") or "").strip()
+    if not insurer_name or not policy_number:
+        return jsonify({"error": "insurer_name and policy_number are required"}), 400
+    if not claims_email:
+        return jsonify({"error": "claims_email is required"}), 400
+
+    label = (data.get("label") or "").strip() or None
+    vehicle_registration = (data.get("vehicle_registration") or "").strip() or None
+    insured_name = (data.get("insured_name") or "").strip() or None
+    issue_date = data.get("issue_date") or None
+    expiry_date = data.get("expiry_date") or None
+    sum_insured = data.get("sum_insured") if isinstance(data.get("sum_insured"), (int, float)) else None
+    coverage_type = (data.get("coverage_type") or "").strip().lower()
+    if coverage_type not in _VALID_COVERAGE_TYPES:
+        coverage_type = "comprehensive"
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+
+    # Matched on (vehicle_registration, coverage_type), not vehicle_registration
+    # alone -- a vehicle can legitimately carry two active rows at once (a
+    # split own_damage + third_party policy, often from different insurers),
+    # so renewing just the OD leg must not touch the TP row and vice versa.
+    existing = None
+    if vehicle_registration:
+        cur.execute(
+            "SELECT id FROM vehicle_insurance_policies WHERE user_id = %s AND "
+            "vehicle_registration = %s AND coverage_type = %s",
+            (user_id, vehicle_registration, coverage_type),
+        )
+        existing = cur.fetchone()
+    if not existing:
+        cur.execute(
+            "SELECT id FROM vehicle_insurance_policies WHERE user_id = %s AND policy_number = %s",
+            (user_id, policy_number),
+        )
+        existing = cur.fetchone()
+
+    if existing:
+        cur.execute(
+            "UPDATE vehicle_insurance_policies SET label = %s, insurer_name = %s, policy_number = %s, "
+            "vehicle_registration = %s, insured_name = %s, issue_date = %s, expiry_date = %s, "
+            "sum_insured = %s, claims_email = %s, coverage_type = %s WHERE id = %s RETURNING id, created_at",
+            (label, insurer_name, policy_number, vehicle_registration, insured_name,
+             issue_date, expiry_date, sum_insured, claims_email, coverage_type, existing["id"]),
+        )
+        row = cur.fetchone()
+        db.commit()
+        return jsonify({"id": row["id"], "created_at": row["created_at"].isoformat(), "replaced": True})
+
+    cur.execute(
+        "INSERT INTO vehicle_insurance_policies "
+        "(user_id, label, insurer_name, policy_number, vehicle_registration, insured_name, "
+        "issue_date, expiry_date, sum_insured, claims_email, coverage_type) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at",
+        (user_id, label, insurer_name, policy_number, vehicle_registration, insured_name,
+         issue_date, expiry_date, sum_insured, claims_email, coverage_type),
+    )
+    row = cur.fetchone()
+    db.commit()
+    return jsonify({"id": row["id"], "created_at": row["created_at"].isoformat(), "replaced": False})
+
+
+@app.route("/vehicle-policies/extract-pdf", methods=["POST"])
+@login_required
+def extract_vehicle_policy_pdf():
+    """PDF counterpart to chat_global_image -- an insurer-issued policy
+    document is almost always a text-based PDF (unlike a photo of a
+    physical card, which genuinely needs vision OCR), so this extracts
+    text via _extract_document_text (the same helper the Cognitive
+    Sharing attachment-summary feature already uses for PDF attachments)
+    and runs one plain-text LLM call through the exact same
+    _build_content_extraction_instruction/_parse_content_extraction_reply
+    chat_global_image uses for photos. Despite the route's name (kept
+    as-is -- the Flutter client already calls it, and renaming the URL
+    buys nothing), this is NOT policy-only: the model decides from the
+    extracted text whether it's a receipt, a vehicle insurance policy, or
+    neither, same as a photo. A PDF that's neither still succeeds (stored
+    as a normal searchable conversation, same as a photo of a random
+    note) -- it just carries neither a transaction nor a policy."""
+    if "document" not in request.files:
+        return jsonify({"error": "No PDF file uploaded"}), 400
+    doc_file = request.files["document"]
+    content_length = request.content_length or 0
+    if content_length > IMAGE_MAX_UPLOAD_BYTES:
+        return jsonify({"error": "File is too large (max 10MB)"}), 400
+
+    file_bytes = doc_file.read()
+    text = _extract_document_text(file_bytes, "application/pdf")
+    if not text or not text.strip():
+        return jsonify({"error": "Could not extract any text from that PDF"}), 422
+
+    instruction = (
+        _build_content_extraction_instruction("This document, extracted from a PDF a user shared,", "")
+        + f"\n\n---\n{text[:20000]}\n---"
+    )
+    raw_reply = call_llm([{"role": "user", "content": instruction}])
+    extracted_text, reply, transaction, policy = _parse_content_extraction_reply(raw_reply)
+    if not extracted_text:
+        return jsonify({"error": "Could not extract any text from that PDF"}), 422
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = dict_cursor(db)
+    category = get_user_personalization(cur, user_id)
+    title = generate_conversation_title(extracted_text)
+    cur.execute(
+        "INSERT INTO conversations (user_id, title, raw_transcript, category) "
+        "VALUES (%s, %s, %s, %s) RETURNING id",
+        (user_id, title, extracted_text, category),
+    )
+    conversation_id = cur.fetchone()["id"]
+    append_chat_messages(cur, user_id, None, PDF_UPLOAD_PLACEHOLDER, reply)
+    db.commit()
+
+    return jsonify({
+        "reply": reply, "conversation_id": conversation_id, "title": title, "category": category,
+        "transaction": transaction, "policy": policy,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Outlook mail (outlook/adapter.py) -- per-user Microsoft OAuth link; the
+# actual mail access happens through the outlook_* agent tools in
+# run_agent_tool_loop. Same gating as the Swiggy routes: OUTLOOK_ENABLED off
+# -> every route 404s except /status, which reports enabled=false.
+# ---------------------------------------------------------------------------
+
+def _outlook_feature_check():
+    from outlook.adapter import is_enabled
+    if not is_enabled():
+        return jsonify({"error": "Outlook integration is not enabled."}), 404
+    return None
+
+
+@app.route("/integrations/outlook/status")
+@login_required
+def outlook_status():
+    from outlook.adapter import get_status
+    db = get_db()
+    cur = dict_cursor(db)
+    return jsonify(get_status(cur, current_user_id()))
+
+
+@app.route("/integrations/outlook/connect")
+@login_required
+def outlook_connect():
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    from outlook.adapter import OutlookError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        # login_hint: reconnecting one already-linked mailbox
+        url = get_authorize_url(cur, db, current_user_id(), login_hint=request.args.get("login_hint"))
+    except OutlookError as e:
+        return jsonify({"error": str(e)}), 400
+    return redirect(url)
+
+
+@app.route("/integrations/outlook/connect_url")
+@login_required
+def outlook_connect_url():
+    # JSON variant of /connect for Flutter -- see swiggy_connect_url.
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    from outlook.adapter import OutlookError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), client="app", login_hint=request.args.get("login_hint"))
+    except OutlookError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"url": url})
+
+
+def _mail_callback_response(provider: str, label: str, client: str, success: bool,
+                            email: str | None = None, error: str | None = None):
+    """End of a mailbox OAuth round trip (Outlook or Gmail). Web: land back
+    inside the SPA as /app?<provider>=connected|error, which App.jsx toasts
+    and strips -- never a dead-end page (/app's DefaultRedirect keeps the
+    query string while picking the phone/desktop route). Flutter, which
+    signed in through the system browser: a static page saying to go back."""
+    if client == "web":
+        from urllib.parse import urlencode
+        params = ({provider: "connected", f"{provider}_email": email or ""} if success
+                  else {provider: "error", f"{provider}_error": error or ""})
+        return redirect("/app?" + urlencode(params))
+    message = (f"Your {label} account is connected. You can close this window and go back to the app." if success
+               else f"Couldn't connect your {label} account: {html.escape(error or '')}")
+    return f"<html><body style='font-family:sans-serif;padding:32px;text-align:center;'>{message}</body></html>"
+
+
+def _outlook_callback_response(client: str, success: bool, email: str | None = None, error: str | None = None):
+    return _mail_callback_response("outlook", "Outlook", client, success, email, error)
+
+
+@app.route("/integrations/outlook/callback")
+def outlook_callback():
+    # No @login_required -- the user is recovered from the single-use
+    # pending-state row, same as swiggy_callback.
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    code, state = request.args.get("code"), request.args.get("state")
+    from outlook.adapter import OutlookError, friendly_callback_error, handle_callback, pending_client
+    db = get_db()
+    cur = dict_cursor(db)
+    client = pending_client(cur, state)
+    if request.args.get("error") or not code or not state:
+        message = friendly_callback_error(request.args.get("error"), request.args.get("error_description"))
+        return _outlook_callback_response(client, False, error=message)
+    try:
+        linked = handle_callback(cur, db, code, state)
+    except OutlookError as e:
+        return _outlook_callback_response(client, False, error=str(e))
+    except Exception as e:
+        db.rollback()
+        print(f"[outlook] callback failed: {e!r}")
+        return _outlook_callback_response(client, False, error="Something went wrong linking your Outlook account.")
+    return _outlook_callback_response(client, True, email=linked.get("email"))
+
+
+@app.route("/integrations/outlook/disconnect", methods=["POST"])
+@login_required
+def outlook_disconnect():
+    blocked = _outlook_feature_check()
+    if blocked:
+        return blocked
+    from outlook.adapter import disconnect
+    db = get_db()
+    cur = dict_cursor(db)
+    # account_id: one mailbox; omitted (older clients): all of them
+    disconnect(cur, db, current_user_id(), _mail_account_id_arg())
+    return jsonify({"ok": True})
+
+
+def _mail_account_id_arg():
+    raw = (request.get_json(silent=True) or {}).get("account_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Gmail (gmail/adapter.py) -- per-user Google OAuth link, same shape as the
+# Outlook routes above; the mail access itself is the gmail_* agent tools
+# (offered through mail_common). GMAIL_ENABLED off -> every route 404s
+# except /status, which reports enabled=false.
+# ---------------------------------------------------------------------------
+
+def _gmail_feature_check():
+    from gmail.adapter import is_enabled
+    if not is_enabled():
+        return jsonify({"error": "Gmail integration is not enabled."}), 404
+    return None
+
+
+@app.route("/integrations/gmail/status")
+@login_required
+def gmail_status():
+    from gmail.adapter import get_status
+    db = get_db()
+    cur = dict_cursor(db)
+    return jsonify(get_status(cur, current_user_id()))
+
+
+@app.route("/integrations/gmail/connect")
+@login_required
+def gmail_connect():
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    from gmail.adapter import GmailError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        # login_hint: reconnecting one already-linked mailbox
+        url = get_authorize_url(cur, db, current_user_id(), login_hint=request.args.get("login_hint"))
+    except GmailError as e:
+        return jsonify({"error": str(e)}), 400
+    return redirect(url)
+
+
+@app.route("/integrations/gmail/connect_url")
+@login_required
+def gmail_connect_url():
+    # JSON variant of /connect for Flutter -- see swiggy_connect_url.
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    from gmail.adapter import GmailError, get_authorize_url
+    db = get_db()
+    cur = dict_cursor(db)
+    try:
+        url = get_authorize_url(cur, db, current_user_id(), client="app", login_hint=request.args.get("login_hint"))
+    except GmailError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"url": url})
+
+
+@app.route("/integrations/gmail/callback")
+def gmail_callback():
+    # No @login_required -- the user is recovered from the single-use
+    # pending-state row, same as outlook_callback.
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    code, state = request.args.get("code"), request.args.get("state")
+    from gmail.adapter import GmailError, friendly_callback_error, handle_callback, pending_client
+    db = get_db()
+    cur = dict_cursor(db)
+    client = pending_client(cur, state)
+    if request.args.get("error") or not code or not state:
+        message = friendly_callback_error(request.args.get("error"), request.args.get("error_description"))
+        return _mail_callback_response("gmail", "Gmail", client, False, error=message)
+    try:
+        linked = handle_callback(cur, db, code, state)
+    except GmailError as e:
+        return _mail_callback_response("gmail", "Gmail", client, False, error=str(e))
+    except Exception as e:
+        db.rollback()
+        print(f"[gmail] callback failed: {e!r}")
+        return _mail_callback_response("gmail", "Gmail", client, False, error="Something went wrong linking your Gmail account.")
+    return _mail_callback_response("gmail", "Gmail", client, True, email=linked.get("email"))
+
+
+@app.route("/integrations/gmail/disconnect", methods=["POST"])
+@login_required
+def gmail_disconnect():
+    blocked = _gmail_feature_check()
+    if blocked:
+        return blocked
+    from gmail.adapter import disconnect
+    db = get_db()
+    cur = dict_cursor(db)
+    # account_id: one mailbox; omitted (older clients): all of them
+    disconnect(cur, db, current_user_id(), _mail_account_id_arg())
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -6707,459 +9120,6 @@ def update_profile_picture():
     return jsonify({"ok": True, "profile_picture_url": url})
 
 
-# ----------------------------------------------------------------------------
-# Admin ops dashboard -- a separate fixed credential (ADMIN_USERNAME/
-# ADMIN_PASSWORD in .env), not tied to the users table at all, since there's
-# no admin/role concept anywhere else in this app and this is a single-
-# operator ops view, not a per-user feature. Session-scoped via its own
-# "is_admin" flag, independent of the normal login's "user_id" flag.
-# ----------------------------------------------------------------------------
-
-def admin_required(view_func):
-    @wraps(view_func)
-    def wrapped(*args, **kwargs):
-        if not session.get("is_admin"):
-            return redirect("/admin/login")
-        return view_func(*args, **kwargs)
-    return wrapped
-
-
-@app.route("/admin/login", methods=["GET"])
-def admin_login_page():
-    if session.get("is_admin"):
-        return redirect("/admin")
-    return render_template("admin_login.html", error=None)
-
-
-@app.route("/admin/login", methods=["POST"])
-def admin_login_submit():
-    username = (request.form.get("username") or "").strip()
-    password = request.form.get("password") or ""
-    expected_user = os.getenv("ADMIN_USERNAME", "")
-    expected_pass = os.getenv("ADMIN_PASSWORD", "")
-    # hmac.compare_digest instead of == -- a naive comparison short-circuits
-    # on the first mismatched character, leaking how many leading
-    # characters matched via response timing.
-    user_ok = bool(expected_user) and hmac.compare_digest(username, expected_user)
-    pass_ok = bool(expected_pass) and hmac.compare_digest(password, expected_pass)
-    if not (user_ok and pass_ok):
-        return render_template("admin_login.html", error="Invalid username or password"), 401
-    session["is_admin"] = True
-    return redirect("/admin")
-
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("is_admin", None)
-    return redirect("/admin/login")
-
-
-@app.route("/admin")
-@admin_required
-def admin_dashboard_page():
-    # Both optional -- an unset URL renders its nav item disabled instead
-    # of a broken/empty link. Infra vs Finance stays two separate external
-    # tools linked from one nav, not merged into this page, per standing
-    # instruction (ops and finance stay apart for now).
-    return render_template(
-        "admin_dashboard.html",
-        grafana_url=os.getenv("GRAFANA_DASHBOARD_URL", "").strip(),
-        costlens_url=os.getenv("COSTLENS_DASHBOARD_URL", "").strip(),
-    )
-
-
-_admin_ops_schema_ensured = False
-
-
-def _admin_ensure_ops_schema(cur, db) -> None:
-    """Idempotent; only actually runs the DDL once per process (module-level
-    flag) since this gets called on every dashboard poll -- same table
-    run_daily_ei_pipeline.py and nudges/nudge_engine.py write to, so
-    whichever of those three runs first creates it in practice."""
-    global _admin_ops_schema_ensured
-    if _admin_ops_schema_ensured:
-        return
-    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.job_runs (
-            id SERIAL PRIMARY KEY,
-            job_name TEXT NOT NULL,
-            started_at TIMESTAMPTZ NOT NULL,
-            finished_at TIMESTAMPTZ,
-            status TEXT NOT NULL DEFAULT 'running',
-            detail JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.fcm_sends (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER,
-            status TEXT NOT NULL,
-            notification_type TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_fcm_sends_created ON ops.fcm_sends (created_at DESC)")
-    db.commit()
-    _admin_ops_schema_ensured = True
-
-
-# job_name -> expected max gap between runs before it's flagged stale, in
-# hours. ei_pipeline runs twice daily (cron: 08:00/20:00 UTC -- see
-# emotional_intelligence/run_daily_ei_pipeline.py), nudge_cycle hourly (see
-# nudges/nudge_engine.py's start_nudge_worker); both get a generous buffer
-# over their own schedule so a slightly late run doesn't flash red.
-_ADMIN_JOB_STALE_HOURS = {"ei_pipeline": 15, "nudge_cycle": 3}
-
-# Schedule metadata for the dashboard's "Autosys-style" job cards -- this is
-# just documentation of the real schedule (root's crontab for ei_pipeline,
-# see infra/BASTION_ACCESS.md-adjacent ops notes; nudge_engine.py's
-# start_nudge_worker(interval_seconds=3600) for nudge_cycle), not read from
-# either live -- if either schedule ever changes, this dict has to be
-# updated to match, same as _ADMIN_JOB_STALE_HOURS above it already does.
-_ADMIN_JOB_SCHEDULE = {
-    "ei_pipeline": {
-        "kind": "cron", "hours_utc": [8, 20],
-        "cadence_label": "Daily at 08:00 & 20:00 UTC",
-    },
-    "nudge_cycle": {
-        "kind": "interval", "interval_seconds": 3600,
-        "cadence_label": "Every 1 hour",
-    },
-}
-
-
-def _admin_next_run_at(job_name: str, last_started_at, now):
-    """cron-kind jobs have a next run independent of history (the next
-    clock time the schedule fires); interval-kind jobs (the in-process
-    nudge worker, not a real cron entry) only have a next run relative to
-    when they last actually started, so None without any history yet."""
-    sched = _ADMIN_JOB_SCHEDULE.get(job_name)
-    if not sched:
-        return None
-    if sched["kind"] == "cron":
-        candidates = []
-        for hour in sched["hours_utc"]:
-            candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-            if candidate <= now:
-                candidate += timedelta(days=1)
-            candidates.append(candidate)
-        return min(candidates)
-    if sched["kind"] == "interval":
-        if last_started_at is None:
-            return None
-        return last_started_at + timedelta(seconds=sched["interval_seconds"])
-    return None
-
-
-_ADMIN_JOB_HISTORY_LIMIT = 5
-
-
-def _admin_job_status(cur) -> list:
-    """Last 5 runs per job, not just the latest -- a job that flips
-    success/fail/success looks identical to a solidly healthy one if only
-    its single latest row is shown; the history list makes a flaky job
-    visible instead of just its current (possibly lucky) state."""
-    cur.execute(
-        """
-        SELECT job_name, started_at, finished_at, status, detail
-        FROM (
-            SELECT job_name, started_at, finished_at, status, detail,
-                   ROW_NUMBER() OVER (PARTITION BY job_name ORDER BY started_at DESC) AS rn
-            FROM ops.job_runs
-        ) ranked
-        WHERE rn <= %s
-        ORDER BY job_name, started_at DESC
-        """,
-        (_ADMIN_JOB_HISTORY_LIMIT,),
-    )
-    rows = cur.fetchall()
-    now = datetime.now(timezone.utc)
-    by_job: dict = {}
-    for r in rows:
-        by_job.setdefault(r["job_name"], []).append(r)
-
-    jobs = []
-    for job_name, runs in by_job.items():
-        latest = runs[0]
-        reference = latest["finished_at"] or latest["started_at"]
-        age_hours = (now - reference).total_seconds() / 3600 if reference else None
-        stale_after = _ADMIN_JOB_STALE_HOURS.get(job_name, 24)
-        duration_seconds = None
-        if latest["started_at"] and latest["finished_at"]:
-            duration_seconds = (latest["finished_at"] - latest["started_at"]).total_seconds()
-        next_run_at = _admin_next_run_at(job_name, latest["started_at"], now)
-        sched = _ADMIN_JOB_SCHEDULE.get(job_name, {})
-        jobs.append({
-            "job_name": job_name,
-            "started_at": latest["started_at"].isoformat() if latest["started_at"] else None,
-            "finished_at": latest["finished_at"].isoformat() if latest["finished_at"] else None,
-            "status": latest["status"],
-            "detail": latest["detail"],
-            "age_hours": round(age_hours, 2) if age_hours is not None else None,
-            "stale": age_hours is not None and age_hours > stale_after,
-            "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
-            "cadence_label": sched.get("cadence_label", "—"),
-            "next_run_at": next_run_at.isoformat() if next_run_at else None,
-            "history": [
-                {
-                    "status": r["status"],
-                    "started_at": r["started_at"].isoformat() if r["started_at"] else None,
-                }
-                for r in runs
-            ],
-        })
-    for job_name in _ADMIN_JOB_STALE_HOURS:
-        if job_name not in by_job:
-            sched = _ADMIN_JOB_SCHEDULE.get(job_name, {})
-            jobs.append({
-                "job_name": job_name, "started_at": None, "finished_at": None,
-                "status": "never_run", "detail": None, "age_hours": None, "stale": True,
-                "duration_seconds": None, "cadence_label": sched.get("cadence_label", "—"),
-                "next_run_at": (lambda n: n.isoformat() if n else None)(_admin_next_run_at(job_name, None, now)),
-                "history": [],
-            })
-    return jobs
-
-
-def _admin_ei_realtime_stats(cur) -> dict:
-    """Derived entirely from existing emotional_intelligence.analysis_runs
-    rows -- no new writes needed, since real_user_extraction.py and
-    chat_feedback_extraction.py (both real-time and batch invocations)
-    already write one there per conversation/message processed."""
-    cur.execute(
-        """
-        SELECT run_type,
-               count(*) FILTER (WHERE status = 'success') AS success,
-               count(*) FILTER (WHERE status != 'success') AS error,
-               max(created_at) AS last_at
-        FROM emotional_intelligence.analysis_runs
-        WHERE created_at > now() - interval '24 hours'
-          AND run_type IN ('chat_feedback_extraction_realtime', 'chat_feedback_extraction',
-                            'real_user_extraction', 'personality_batch', 'relationship_batch', 'fact_dedup')
-        GROUP BY run_type
-        """
-    )
-    return {
-        r["run_type"]: {
-            "success": r["success"], "error": r["error"],
-            "last_at": r["last_at"].isoformat() if r["last_at"] else None,
-        }
-        for r in cur.fetchall()
-    }
-
-
-def _admin_weekly_digest_stats(cur) -> dict:
-    cur.execute(
-        "SELECT count(*) AS n, max(sent_at) AS last_at FROM nudges.sent_log "
-        "WHERE nudge_type = 'weekly_digest' AND sent_at > now() - interval '7 days'"
-    )
-    r = cur.fetchone()
-    return {"sent_last_7d": r["n"], "last_sent_at": r["last_at"].isoformat() if r["last_at"] else None}
-
-
-def _admin_fcm_stats(cur) -> dict:
-    """Derived from ops.fcm_sends, written by send_fcm_to_user itself --
-    'no_token' means the push never reached Firebase at all (no device
-    registered), distinct from 'error' (Firebase rejected or the call
-    itself failed) and 'stale' (a token that's since been deleted)."""
-    cur.execute(
-        """
-        SELECT status, count(*) AS n
-        FROM ops.fcm_sends
-        WHERE created_at > now() - interval '24 hours'
-        GROUP BY status
-        """
-    )
-    by_status = {r["status"]: r["n"] for r in cur.fetchall()}
-    cur.execute("SELECT max(created_at) AS last_at FROM ops.fcm_sends")
-    last_at = cur.fetchone()["last_at"]
-    cur.execute("SELECT count(*) AS n FROM push_tokens")
-    registered_tokens = cur.fetchone()["n"]
-    return {
-        "last_24h": by_status,
-        "last_send_at": last_at.isoformat() if last_at else None,
-        "registered_tokens": registered_tokens,
-    }
-
-
-def _admin_db_stats(cur) -> dict:
-    cur.execute("SELECT pg_database_size(current_database()) AS bytes")
-    db_bytes = cur.fetchone()["bytes"]
-    cur.execute(
-        """
-        SELECT schemaname || '.' || relname AS table_name,
-               pg_total_relation_size(schemaname || '.' || relname) AS bytes
-        FROM pg_catalog.pg_statio_user_tables
-        ORDER BY bytes DESC
-        LIMIT 8
-        """
-    )
-    largest = [{"table": r["table_name"], "bytes": r["bytes"]} for r in cur.fetchall()]
-    return {"total_bytes": db_bytes, "largest_tables": largest}
-
-
-def _admin_system_stats() -> dict:
-    """Linux-only (os.getloadavg(), /proc/meminfo) -- this dashboard only
-    ever runs against the real prod host, the same single Oracle Cloud VM
-    that runs Postgres (DATABASE_URL is localhost), so shutil.disk_usage('/')
-    reports the real volume both the app and the DB live on. Falls back to
-    an "error" field per section rather than failing the whole endpoint if
-    run somewhere these aren't available (e.g. local Windows dev)."""
-    out = {}
-    try:
-        total, used, free = shutil.disk_usage("/")
-        out["disk"] = {
-            "total_gb": round(total / 1e9, 1), "used_gb": round(used / 1e9, 1),
-            "free_gb": round(free / 1e9, 1), "percent_used": round(used / total * 100, 1),
-        }
-    except Exception as e:
-        out["disk"] = {"error": str(e)}
-    try:
-        load1, load5, load15 = os.getloadavg()
-        out["cpu"] = {"load_1m": round(load1, 2), "load_5m": round(load5, 2),
-                      "load_15m": round(load15, 2), "core_count": os.cpu_count()}
-    except Exception as e:
-        out["cpu"] = {"error": str(e)}
-    try:
-        meminfo = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                key, _, rest = line.partition(":")
-                meminfo[key] = int(rest.strip().split()[0])  # kB
-        total_kb = meminfo.get("MemTotal", 0)
-        available_kb = meminfo.get("MemAvailable", 0)
-        used_kb = total_kb - available_kb
-        out["memory"] = {
-            "total_mb": round(total_kb / 1024, 1), "available_mb": round(available_kb / 1024, 1),
-            "used_mb": round(used_kb / 1024, 1),
-            "percent_used": round(used_kb / total_kb * 100, 1) if total_kb else None,
-        }
-    except Exception as e:
-        out["memory"] = {"error": str(e)}
-    return out
-
-
-@app.route("/admin/api/status")
-@admin_required
-def admin_api_status():
-    db = get_db()
-    cur = dict_cursor(db)
-    _admin_ensure_ops_schema(cur, db)
-    return jsonify({
-        "jobs": _admin_job_status(cur),
-        "ei_realtime": _admin_ei_realtime_stats(cur),
-        "weekly_digest": _admin_weekly_digest_stats(cur),
-        "fcm": _admin_fcm_stats(cur),
-        "db": _admin_db_stats(cur),
-        "system": _admin_system_stats(),
-        "flags": {
-            "emotional_intelligence_enabled": os.getenv("EMOTIONAL_INTELLIGENCE_ENABLED", "false").strip().lower() == "true",
-            "nudge_feature_enabled": os.getenv("NUDGE_FEATURE_ENABLED", "false").strip().lower() == "true",
-        },
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-_ADMIN_ALERT_CHECK_INTERVAL_SECONDS = 1800  # 30 min
-_ADMIN_ALERT_COOLDOWN_HOURS = 6  # re-alert while still stale, but not every check
-
-
-def _admin_ensure_alerts_table(cur, conn) -> None:
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.alerts_sent (
-            job_name TEXT PRIMARY KEY,
-            last_alerted_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    conn.commit()
-
-
-_ADMIN_ALERT_CONFIRM_COUNT = 2  # consecutive stale checks required before actually alerting
-_admin_alert_consecutive_stale: dict = {}  # job_name -> count, in-memory, reset to 0 the moment a job looks healthy
-
-
-def ops_alert_worker():
-    """Runs continuously in a background thread, same pattern as
-    email_reminder_worker above -- this is what turns the admin dashboard
-    from a pull view (only useful if someone opens it) into something that
-    actually catches a job going silently stale overnight. Only fires when
-    ADMIN_ALERT_EMAIL is configured; otherwise this loop is a cheap no-op,
-    same convention as nudge_engine.is_enabled()'s early return.
-
-    Two safeguards against a false alarm right after a deploy restart
-    (confirmed live: the very first check immediately after a restart once
-    reported ei_pipeline as never_run despite a real, hours-old successful
-    row already in ops.job_runs -- some transient visibility/startup race,
-    root cause not pinned down, but a one-off blip is exactly what these
-    two guards are for regardless of its exact cause):
-    1. Sleeps one full interval before its very first check, instead of
-       checking immediately on thread start -- skips the riskiest window
-       (the instant right after this and every other background worker/
-       migration starts concurrently).
-    2. Requires a job to look stale on _ADMIN_ALERT_CONFIRM_COUNT
-       consecutive checks (default 2, i.e. ~30-60 min of confirmed
-       staleness) before sending anything -- a transient one-check blip no
-       longer reaches send_plain_email at all, not just a logging fix."""
-    alert_email = os.getenv("ADMIN_ALERT_EMAIL", "").strip()
-    time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
-    while True:
-        if not alert_email:
-            time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
-            continue
-        conn = None
-        try:
-            conn = get_raw_connection()
-            cur = dict_cursor(conn)
-            _admin_ensure_ops_schema(cur, conn)
-            _admin_ensure_alerts_table(cur, conn)
-            for job in _admin_job_status(cur):
-                job_name = job["job_name"]
-                if not job["stale"]:
-                    _admin_alert_consecutive_stale[job_name] = 0
-                    continue
-                _admin_alert_consecutive_stale[job_name] = _admin_alert_consecutive_stale.get(job_name, 0) + 1
-                if _admin_alert_consecutive_stale[job_name] < _ADMIN_ALERT_CONFIRM_COUNT:
-                    print(f"[ops_alert_worker] {job_name} looks stale "
-                          f"({_admin_alert_consecutive_stale[job_name]}/{_ADMIN_ALERT_CONFIRM_COUNT} checks) -- not yet confirmed", flush=True)
-                    continue
-                cur.execute("SELECT last_alerted_at FROM ops.alerts_sent WHERE job_name = %s", (job_name,))
-                row = cur.fetchone()
-                if row and (datetime.now(timezone.utc) - row["last_alerted_at"]).total_seconds() < _ADMIN_ALERT_COOLDOWN_HOURS * 3600:
-                    continue
-                age_desc = f"{job['age_hours']:.1f}h ago" if job["age_hours"] is not None else "never run"
-                send_plain_email(
-                    alert_email,
-                    f"[Throughline] {job_name} is stale",
-                    f"{job_name} last ran: {age_desc} (status: {job['status']}).\n\n"
-                    f"Check https://129-213-21-239.sslip.io/admin for details.",
-                )
-                cur.execute(
-                    "INSERT INTO ops.alerts_sent (job_name, last_alerted_at) VALUES (%s, now()) "
-                    "ON CONFLICT (job_name) DO UPDATE SET last_alerted_at = now()",
-                    (job_name,),
-                )
-                conn.commit()
-                print(f"[ops_alert_worker] sent stale-job alert for {job_name}", flush=True)
-            cur.close()
-        except Exception as e:
-            print(f"[ops_alert_worker] error: {e!r}", flush=True)
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                release_raw_connection(conn)
-        time.sleep(_ADMIN_ALERT_CHECK_INTERVAL_SECONDS)
-
-
 @app.route("/<path:_any>")
 def spa_fallback(_any):
     """React Router client-side paths (e.g. /insights, /calls, once those
@@ -7189,10 +9149,120 @@ def _start_nudge_worker_safely():
     schema not yet applied, etc.) must never prevent the main app from
     starting."""
     try:
-        from nudges.nudge_engine import start_nudge_worker
+        from nudges.nudge_engine import run_nudge_cycle, start_nudge_worker
         start_nudge_worker(push_notification, send_fcm_to_user)
+        # Lets the dashboard's "start now" action on nudge_cycle trigger one
+        # extra cycle immediately (force=True bypasses NUDGE_FEATURE_ENABLED
+        # and the on-ice gate, same as a manual on-call trigger should).
+        register_nudge_runner(lambda: run_nudge_cycle(push_notification, send_fcm_to_user, force=True))
     except Exception as e:
         print(f"[nudges] worker not started: {e!r}")
+
+
+# Throughline Meet (meet/) -- swap personality cards by holding two phones
+# together. Self-contained package, off unless MEET_ENABLED=true; a failure
+# here must never stop the rest of the app from starting.
+def _meet_suggest_personality(user_id):
+    """Drafts the personality part of a Meet card -- up to 4 traits and a
+    one-line "how I communicate" -- from what Throughline has learned about
+    the user. Only ever shown in the card editor, for the user to keep, edit
+    or discard; it's a stranger-facing card, so the prompt rules out
+    anything private."""
+    from meet.cards import TRAIT_OPTIONS
+    cur = dict_cursor(get_db())
+    persona = build_persona_context(get_user_persona(cur, user_id))
+    try:
+        from emotional_intelligence.ei_adapter import get_user_cognitive_context
+        ei = get_user_cognitive_context(user_id, question="my personality, how I communicate, how I work with people")
+    except Exception:
+        ei = ""
+    if not (persona or ei):
+        return {}
+    prompt = (
+        "Draft the personality section of this person's introduction card -- shown to someone they have just met.\n"
+        f"Pick up to 4 traits, preferably from: {', '.join(TRAIT_OPTIONS)}.\n"
+        "Write 'style': one short first-person sentence on how they communicate or work with people "
+        "(e.g. \"I think out loud and like getting straight to the point.\").\n"
+        "Only use what the notes below support; if they don't support a trait, leave it out. NEVER mention health, "
+        "relationships, family, money, religion, politics, named people or anything private.\n"
+        'Reply with JSON only: {"traits": [...], "style": "..."}\n\n'
+        f"{persona}\n\n{ei}"
+    )
+    text = call_llm([{"role": "user", "content": prompt}])
+    match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    return json.loads(match.group(0)) if match else {}
+
+
+def _public_base_url():
+    """Where links in emails should point. PUBLIC_BASE_URL when set;
+    otherwise this request's host, over https unless it's local."""
+    base = os.getenv("PUBLIC_BASE_URL", "").strip() or request.host_url
+    if base.startswith("http://") and not re.match(r"http://(localhost|127\.0\.0\.1|192\.168\.)", base):
+        base = "https://" + base[len("http://"):]
+    return base
+
+
+# Features add (cur, user_id) callables here to run just before an account is deleted.
+_account_delete_hooks = []
+
+app.register_blueprint(legal.create_legal_blueprint(
+    get_db=get_db, dict_cursor=dict_cursor, login_required=login_required, current_user_id=current_user_id,
+    check_password_hash=check_password_hash, redis_client=redis_client, storage=storage_module,
+    send_plain_email=send_plain_email, before_delete=_account_delete_hooks,
+))
+
+from password_reset import create_password_reset_blueprint
+app.register_blueprint(create_password_reset_blueprint(
+    secret_key=app.secret_key, get_db=get_db, dict_cursor=dict_cursor,
+    generate_password_hash=generate_password_hash, send_plain_email=send_plain_email,
+    public_base_url=_public_base_url,
+))
+
+
+try:
+    from meet import create_meet_blueprint, is_enabled as _meet_enabled
+    if _meet_enabled():
+        app.register_blueprint(create_meet_blueprint(
+            get_db=get_db, dict_cursor=dict_cursor, login_required=login_required,
+            current_user_id=current_user_id, redis_client=redis_client,
+            suggest_personality=_meet_suggest_personality,
+        ))
+        print("[meet] enabled")
+except Exception as e:
+    print(f"[meet] not registered: {e!r}")
+
+
+# Throughline Corporate (corporate/) -- organisations, departments, teams,
+# invitations. Self-contained, off unless CORPORATE_ENABLED=true.
+try:
+    from corporate import create_corporate_blueprint, is_enabled as _corporate_enabled
+    from corporate import llm as _corp_llm
+    import mail_common  # work email for Corporate (mail_linked / mail_handler below)
+    if _corporate_enabled():
+        app.register_blueprint(create_corporate_blueprint(
+            get_db=get_db, dict_cursor=dict_cursor, login_required=login_required,
+            current_user_id=current_user_id, send_plain_email=send_plain_email,
+            public_base_url=_public_base_url, call_llm=_corp_llm.with_groq_fallback(call_llm), transcribe=transcribe_audio_bytes,
+            push=send_fcm_to_user, spawn=_spawn_background, get_raw_connection=get_raw_connection,
+            release_raw_connection=release_raw_connection, live=push_notification,
+            mail_linked=lambda cur, uid: [p.PROVIDER for p, _ in mail_common._linked(cur, uid)],
+        ))
+        from corporate.orgs import hand_over as _corp_hand_over
+        _account_delete_hooks.append(_corp_hand_over)
+        from corporate.calls import make_hook as _corp_call_hook
+        _call_ready_hooks.append(_corp_call_hook(get_raw_connection, release_raw_connection, dict_cursor,
+                                                 _corp_llm.with_groq_fallback(call_llm)))
+        # Background jobs run in the web process only -- not again in worker.py.
+        if IS_WEB_ROLE and os.getenv("CORPORATE_JOBS", "true").strip().lower() != "false":
+            from corporate import jobs as _corp_jobs
+            _corp_jobs.start(get_raw_connection, release_raw_connection, dict_cursor, _corp_llm.background(call_llm),
+                             push=send_fcm_to_user, spawn=_spawn_background,
+                             # ops dashboard: each step is a job (pause / run now / history).
+                             report=_ops_record_completed_run, paused=_ops_is_on_ice,
+                             register_runner=_ops_register_runner, mail_handler=mail_common.get_tool_handler)
+        print("[corporate] enabled")
+except Exception as e:
+    print(f"[corporate] not registered: {e!r}")
 
 
 # Under a WSGI server (gunicorn etc.) this module is imported, not run as
@@ -7200,10 +9270,35 @@ def _start_nudge_worker_safely():
 # the reminder-email worker needs its own start path here instead. Only
 # safe with a single worker process; running multiple gunicorn workers
 # would start one thread per worker and send duplicate reminder emails.
+def _start_ops_monitoring():
+    """Hands ops/ the objects this file owns; every check itself lives in
+    ops/checks.py, and ops/probe.py's worker runs them."""
+    def _costlens_stats():
+        try:
+            from costlens_agent import get_stats
+            return get_stats()
+        except Exception:
+            return None
+
+    ops_checks.install(
+        redis_client=redis_client,
+        notify_listener=_notify_listener_state,
+        rq_queues=[call_queue],
+        costlens_stats=_costlens_stats,
+        gauges={"live_transcription_sessions": _live_listen_sessions.snapshot},
+    )
+    ops_remediations.install(rq_queues=[call_queue],
+                             email=(send_email_record, get_raw_connection, release_raw_connection, dict_cursor))
+    ops_notify.register_push(send_fcm_to_user)
+    threading.Thread(target=ops_probe_worker, daemon=True).start()
+
+
 if __name__ != "__main__" and IS_WEB_ROLE:
     threading.Thread(target=email_reminder_worker, daemon=True).start()
     threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
     threading.Thread(target=ops_alert_worker, daemon=True).start()
+    threading.Thread(target=custom_job_scheduler, daemon=True).start()
+    _start_ops_monitoring()
     _start_nudge_worker_safely()
 
 if __name__ == "__main__":
@@ -7224,6 +9319,8 @@ if __name__ == "__main__":
         threading.Thread(target=email_reminder_worker, daemon=True).start()
         threading.Thread(target=call_ring_timeout_worker, daemon=True).start()
         threading.Thread(target=ops_alert_worker, daemon=True).start()
+        threading.Thread(target=custom_job_scheduler, daemon=True).start()
+        _start_ops_monitoring()
         _start_nudge_worker_safely()
 
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True, ssl_context=ssl_context)

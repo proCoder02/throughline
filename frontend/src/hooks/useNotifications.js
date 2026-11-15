@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { onCorpEvent } from '../lib/corpLive.js';
 import { getToken } from '../api.js';
 
 // Connects once (from App, not per-section, so it survives section
@@ -93,6 +94,8 @@ export function useNotifications(enabled) {
 
     const handleMessage = (event) => {
       const msg = JSON.parse(event.data);
+      // Work (Corporate) events go to their own store -- see lib/corpLive.js.
+      if (typeof msg.type === 'string' && msg.type.startsWith('corp_')) { onCorpEvent(msg); return; }
       if (msg.type === 'task_created') {
         setTaskCount((c) => c + 1);
       } else if (msg.type === 'chat_message' || msg.type === 'call_conversation_ready') {

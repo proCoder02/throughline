@@ -91,19 +91,27 @@ def _ollama_api_keys() -> list[str]:
 
 
 def call_llm(messages: list[dict]) -> tuple[str, dict]:
-    """Same Ollama Cloud endpoint/env-var convention as app.py's call_llm --
-    reimplemented standalone here (not imported) per the no-backend-changes
-    instruction. Returns (content, raw_response) so the caller can pull
-    timing/token metadata for analysis_runs provenance."""
+    """Returns (content, raw_response) so the caller can pull timing/token
+    metadata for analysis_runs provenance. Goes through the llm/ package (repo
+    root) like app.py's call_llm -- OpenRouter first when configured, Ollama
+    Cloud as fallback -- so every EI script keeps working when one provider
+    is out of credit. Token counts are only present for Ollama answers."""
+    try:
+        import llm
+    except ImportError:
+        llm = None
+    if llm is not None:
+        msg = llm.chat(messages, ollama_post=_ollama_post)
+        return msg.get("content", ""), {"message": msg}
+    result = _ollama_post({"model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"), "messages": messages, "stream": False})
+    return result.get("message", {}).get("content", ""), result
+
+
+def _ollama_post(payload: dict) -> dict:
+    """Ollama Cloud, trying each configured key in turn on 429/timeouts."""
     keys = _ollama_api_keys()
     if not keys:
         raise RuntimeError("Missing Ollama API key (OLLAMA_API_KEY / olama_api_key)")
-
-    payload = {
-        "model": os.getenv("OLLAMA_MODEL", "gpt-oss:120b"),
-        "messages": messages,
-        "stream": False,
-    }
     last_error = None
     for i, api_key in enumerate(keys):
         is_last_key = i == len(keys) - 1
@@ -123,8 +131,7 @@ def call_llm(messages: list[dict]) -> tuple[str, dict]:
             last_error = requests.HTTPError(response=response)
             continue
         response.raise_for_status()
-        result = response.json()
-        return result.get("message", {}).get("content", ""), result
+        return response.json()
     raise last_error
 
 

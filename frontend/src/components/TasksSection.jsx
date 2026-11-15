@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useState } from 'react';
 import ListPane from './ListPane.jsx';
 import CategoryMenu from './CategoryMenu.jsx';
 import ContextMenu from './ContextMenu.jsx';
+import EmailSourceLink from './EmailSourceLink.jsx';
 import { MailIcon, ChatIcon, PencilIcon, TrashIcon, BackIcon, CheckIcon } from '../icons.jsx';
 import { apiJson, post, del } from '../api.js';
 import { confirmDialog } from '../lib/notify.js';
@@ -11,7 +12,7 @@ import UseAnimations from 'react-useanimations';
 import checkBox from 'react-useanimations/lib/checkBox';
 
 function formatDate(iso) {
-  if (!iso) return '—';
+  if (!iso) return 'â€”';
   return new Date(iso).toLocaleDateString([], { year: 'numeric', month: 'long', day: 'numeric' });
 }
 
@@ -127,7 +128,7 @@ export default function TasksSection({ notify, onOpenConversation }) {
               title={t.status === 'done' ? 'Reopen' : 'Mark done'} aria-label={t.status === 'done' ? 'Reopen task' : 'Mark task done'}
               onClick={(e) => toggle(t, e)}
             >
-              {t.status === 'done' ? '✓' : '○'}
+              {t.status === 'done' ? 'âœ“' : 'â—‹'}
             </button>
             <div className="row-main">
               <div className="row-top">
@@ -139,8 +140,9 @@ export default function TasksSection({ notify, onOpenConversation }) {
                 )}
               </div>
               <div className="row-sub">
-                {[t.owner && `Owner: ${t.owner}`, t.due_date && `Due: ${t.due_date}`].filter(Boolean).join(' · ') || 'No details'}
+                {[t.owner && `Owner: ${t.owner}`, t.due_date && `Due: ${t.due_date}`].filter(Boolean).join(' Â· ') || 'No details'}
               </div>
+              {t.source_email && <EmailSourceLink source={t.source_email} compact style={{ marginTop: 2 }} />}
             </div>
           </div>
         ))}
@@ -194,16 +196,19 @@ export default function TasksSection({ notify, onOpenConversation }) {
             ) : (
               <p style={{ fontSize: 15.5, lineHeight: 1.5, margin: '4px 0 0' }}>{selected.description}</p>
             )}
+            {selected.source_email && (
+              <div style={{ marginTop: 8 }}><EmailSourceLink source={selected.source_email} /></div>
+            )}
 
             <div className="profile-section">
               <div className="profile-section-title">Details</div>
               <div className="detail-meta-row">
                 <span className="hint" style={{ margin: 0 }}>Owner</span>
-                <span className="detail-meta" style={{ margin: 0 }}>{selected.owner || '—'}</span>
+                <span className="detail-meta" style={{ margin: 0 }}>{selected.owner || 'â€”'}</span>
               </div>
               <div className="detail-meta-row">
                 <span className="hint" style={{ margin: 0 }}>Due</span>
-                <span className="detail-meta" style={{ margin: 0 }}>{selected.due_date || '—'}</span>
+                <span className="detail-meta" style={{ margin: 0 }}>{selected.due_date || 'â€”'}</span>
               </div>
               <div className="detail-meta-row">
                 <span className="hint" style={{ margin: 0 }}>Category</span>
@@ -243,7 +248,7 @@ export default function TasksSection({ notify, onOpenConversation }) {
       ) : (
         <div className="chat-panel empty">
           <div className="empty-state">
-            <UseAnimations animation={checkBox} size={110} autoplay loop strokeColor="#1FC8B4" />
+            <UseAnimations animation={checkBox} size={110} autoplay loop strokeColor="#D98E4A" />
             <div className="empty-state-text">Click a task to see its details.</div>
           </div>
         </div>

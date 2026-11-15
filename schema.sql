@@ -120,6 +120,43 @@ CREATE TABLE IF NOT EXISTS tv_activity_sessions (
 CREATE INDEX IF NOT EXISTS idx_tv_activity_sessions_user_started
     ON tv_activity_sessions (user_id, started_at);
 
+-- UPI payment receipts shared into global chat (chat_global_image) --
+-- amount/payee/category extracted by the same vision call that produces
+-- the conversation's searchable text, confirmed/edited by the user before
+-- being saved here (see POST /transactions). Optional per-feature table,
+-- same convention as heart_rate_sessions/tv_activity_sessions above --
+-- deliberately NOT in verify_db_connection's hard `required` set.
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    payee TEXT,
+    category TEXT,
+    -- Which UPI app processed the payment (GPay/PhonePe/Paytm/...) -- a
+    -- separate dimension from category (what was bought): a user pays the
+    -- same merchant through different apps, and the two questions ("where
+    -- am I spending" vs "which app do I pay through") shouldn't collapse
+    -- into one field.
+    payment_method TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Added after the table already existed in some installs -- ADD COLUMN IF
+-- NOT EXISTS, same migration-path convention as users.personalization above.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT;
+-- What was actually bought ("Power bank"), distinct from payee (who was
+-- paid, "Blinkit") and category ("Shopping") -- confirmed missing live: a
+-- "send today's purchases to a friend" message had nothing but the payee
+-- to fall back on ("Blinkit purchase: Rs 1,317") since neither amount,
+-- payee, nor category alone says WHAT was bought. Null for receipts with
+-- no readable line item (e.g. a generic bill/insurance payment, where
+-- payee + category already say enough).
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS item TEXT;
+CREATE INDEX IF NOT EXISTS idx_transactions_user_created
+    ON transactions (user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_transactions_user_category
+    ON transactions (user_id, category);
+
 -- Global-chat send_email tool, arbitrary-recipient path only (a known
 -- friend still sends immediately, see _tool_send_email) -- a draft held
 -- here until the user taps Send/Cancel on its action_card, same
@@ -133,12 +170,113 @@ CREATE TABLE IF NOT EXISTS email_drafts (
     body TEXT NOT NULL,
     from_name TEXT,
     reply_to TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | sending | sent | dismissed
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ,
+    -- Sent record (see app.py's send_email_record): every assistant email,
+    -- including friend/self emails that skip the draft step (kind 'direct').
+    kind TEXT NOT NULL DEFAULT 'draft',      -- draft | direct
+    message_id TEXT,                         -- the Message-ID header it went out with
+    sent_at TIMESTAMPTZ,
+    sent_box_verified BOOLEAN,               -- found in the mailbox's Sent folder by Message-ID
+    sent_box_folder TEXT,
+    send_error TEXT,                         -- last failed attempt, shown on the card
+    copy_to TEXT                             -- the sender's own address, BCC'd a copy
+);
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'draft';
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS message_id TEXT;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_verified BOOLEAN;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS sent_box_folder TEXT;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS send_error TEXT;
+ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS copy_to TEXT;
+CREATE INDEX IF NOT EXISTS idx_email_drafts_user_status
+    ON email_drafts (user_id, status);
+
+-- Files the user attached to a still-pending draft (e.g. photos of
+-- accident damage, a police FIR, for a vehicle insurance claim) --
+-- object_key points at the R2 object (see storage.py's 'chat_file'
+-- purpose, already built for an arbitrary-type upload like this).
+-- confirm_email_draft downloads each one and attaches it to the real
+-- outgoing email; dismiss_email_draft leaves them for ON DELETE CASCADE.
+CREATE TABLE IF NOT EXISTS email_draft_attachments (
+    id SERIAL PRIMARY KEY,
+    draft_id INTEGER NOT NULL REFERENCES email_drafts (id) ON DELETE CASCADE,
+    object_key TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content_type TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_email_draft_attachments_draft
+    ON email_draft_attachments (draft_id);
+
+-- Same shape as email_drafts above -- message_friend always drafts instead
+-- of sending immediately, so a stale/wrong detail gets caught in the UI.
+CREATE TABLE IF NOT EXISTS message_drafts (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    friend_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | dismissed
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_email_drafts_user_status
-    ON email_drafts (user_id, status);
+CREATE INDEX IF NOT EXISTS idx_message_drafts_user_status
+    ON message_drafts (user_id, status);
+
+-- Vehicle insurance: a policy extracted from a shared photo/PDF (see
+-- chat_global_image's POLICY section), confirmed/edited by the user before
+-- saving (same confirm-before-trust shape as transactions above).
+CREATE TABLE IF NOT EXISTS vehicle_insurance_policies (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- User-facing short name ("Bike", "Activa") -- matched against when
+    -- resolving a claim by voice/chat, same role as friendships.nickname.
+    label TEXT,
+    insurer_name TEXT NOT NULL,
+    policy_number TEXT NOT NULL,
+    vehicle_registration TEXT,
+    insured_name TEXT,
+    issue_date DATE,
+    expiry_date DATE,
+    sum_insured NUMERIC(12,2),
+    -- Always confirmed by the user in the save sheet, never
+    -- auto-extracted-and-trusted -- a wrong claims address is a silently
+    -- undeliverable claim, not just a cosmetic mistake.
+    claims_email TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Indian motor insurance routinely splits Own Damage and Third Party
+-- liability across TWO DIFFERENT INSURERS with different policy numbers
+-- and validity periods (confirmed from a real user's policy document) --
+-- one row per coverage type for the same vehicle, rather than cramming
+-- OD+TP sub-fields onto a single row, so claim routing just picks the
+-- right policy_id and the claims table needs no changes at all.
+ALTER TABLE vehicle_insurance_policies ADD COLUMN IF NOT EXISTS coverage_type TEXT NOT NULL DEFAULT 'comprehensive';
+CREATE INDEX IF NOT EXISTS idx_vehicle_policies_user
+    ON vehicle_insurance_policies (user_id);
+
+-- A filed (or drafted/dismissed) claim against one of the policies above.
+-- Its lifecycle is tied to the email_drafts row it creates (email_draft_id)
+-- -- confirm_email_draft/dismiss_email_draft update this table's status in
+-- lockstep, so there is no separate confirm/dismiss path to keep in sync.
+CREATE TABLE IF NOT EXISTS vehicle_insurance_claims (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    policy_id INTEGER NOT NULL REFERENCES vehicle_insurance_policies (id) ON DELETE CASCADE,
+    email_draft_id INTEGER REFERENCES email_drafts (id) ON DELETE SET NULL,
+    incident_date DATE NOT NULL,
+    description TEXT NOT NULL,
+    location TEXT,
+    third_party_involved TEXT,
+    fir_number TEXT,
+    estimated_amount NUMERIC(12,2),
+    status TEXT NOT NULL DEFAULT 'draft',  -- draft | filed | dismissed
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_vehicle_claims_user_status
+    ON vehicle_insurance_claims (user_id, status);
 
 -- Mutual friendship: adding a friend by code inserts both directions, so a
 -- friend list is always a plain "WHERE user_id = ?" with no OR/self-join.
@@ -620,3 +758,101 @@ ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS attachment_summary TEXT;
 -- time in GET /me/home-signals.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_tone TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_tone_at TIMESTAMPTZ;
+
+-- ============================================================================
+-- Outlook mail (outlook/adapter.py) -- read-only Microsoft Graph access for
+-- the global chat agent. Gated behind OUTLOOK_ENABLED in .env, same as the
+-- Swiggy tables above: these just sit empty when the flag is off.
+-- ============================================================================
+
+-- Short-lived PKCE state for an in-flight connect attempt, deleted by the
+-- OAuth callback (or swept after an hour). A table rather than an in-process
+-- dict so it survives across gunicorn workers/restarts.
+CREATE TABLE IF NOT EXISTS outlook_oauth_pending (
+    state TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    code_verifier TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One linked Microsoft account per user. Tokens are Fernet-encrypted at rest
+-- (OUTLOOK_TOKEN_ENCRYPTION_KEY) and wiped on disconnect.
+CREATE TABLE IF NOT EXISTS outlook_accounts (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    email TEXT,
+    access_token_encrypted TEXT NOT NULL,
+    refresh_token_encrypted TEXT,
+    token_expires_at TIMESTAMPTZ,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
+-- Added after the tables above shipped -- idempotent migrations.
+-- Set when Microsoft stops honoring the refresh token; cleared on reconnect.
+ALTER TABLE outlook_accounts ADD COLUMN IF NOT EXISTS needs_reconnect BOOLEAN NOT NULL DEFAULT FALSE;
+-- 'web' | 'app' -- decides whether the callback redirects into the SPA or
+-- shows a close-this-window page (Flutter signs in via the system browser).
+ALTER TABLE outlook_oauth_pending ADD COLUMN IF NOT EXISTS client TEXT NOT NULL DEFAULT 'web';
+-- Per-reply metadata for the global chat thread: which tools ran and which
+-- emails a reply drew on ({tool_activity: [...], mail_sources: [...]}), so
+-- source chips survive a reload. NULL for every ordinary reply.
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_meta JSONB;
+
+-- ============================================================================
+-- Gmail (gmail/adapter.py) -- read-only Gmail API access for the global chat
+-- agent, same shape as the Outlook tables above. Gated behind GMAIL_ENABLED;
+-- these just sit empty when the flag is off.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS gmail_oauth_pending (
+    state TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    code_verifier TEXT NOT NULL,
+    client TEXT NOT NULL DEFAULT 'web', -- 'web' | 'app', see outlook_oauth_pending
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One linked Google account per user. Tokens Fernet-encrypted at rest
+-- (GMAIL_TOKEN_ENCRYPTION_KEY), wiped and revoked at Google on disconnect.
+CREATE TABLE IF NOT EXISTS gmail_accounts (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    email TEXT,
+    access_token_encrypted TEXT NOT NULL,
+    refresh_token_encrypted TEXT,
+    token_expires_at TIMESTAMPTZ,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ,
+    needs_reconnect BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Several linked mailboxes per user (e.g. personal + work), for both
+-- providers: each row gets its own id key, and (user, address) becomes the
+-- unique pair a reconnect upserts on. Idempotent; existing links carry over
+-- (each keeps its row, gaining an id).
+ALTER TABLE outlook_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+ALTER TABLE gmail_accounts ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['outlook_accounts', 'gmail_accounts'] LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage k ON k.constraint_name = tc.constraint_name
+            WHERE tc.table_name = t AND tc.constraint_type = 'PRIMARY KEY' AND k.column_name = 'user_id'
+        ) THEN
+            EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', t, t || '_pkey');
+            EXECUTE format('ALTER TABLE %I ADD PRIMARY KEY (id)', t);
+        END IF;
+    END LOOP;
+END $$;
+-- Addresses are stored lowercased (the adapters normalize on link), so a
+-- reconnect always lands on the same row.
+UPDATE outlook_accounts SET email = lower(email) WHERE email <> lower(email);
+UPDATE gmail_accounts SET email = lower(email) WHERE email <> lower(email);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_outlook_accounts_user_email ON outlook_accounts (user_id, email);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_gmail_accounts_user_email ON gmail_accounts (user_id, email);
+CREATE INDEX IF NOT EXISTS idx_outlook_accounts_user ON outlook_accounts (user_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_accounts_user ON gmail_accounts (user_id);
+
+-- A task created from an email in chat ("remind me to pay this bill") keeps
+-- a link back to it: {provider, account, id, from, subject, received,
+-- web_link}. NULL for every other task.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS source_email JSONB;

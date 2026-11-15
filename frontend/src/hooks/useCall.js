@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { Room, RoomEvent, Track, createLocalAudioTrack } from 'livekit-client';
 import { post, postForm } from '../api.js';
+import { ensureRecordingNotice } from '../lib/consent.js';
 
 // Voice calling (1:1 + group) via LiveKit. Recording is deliberately done
 // client-side (not LiveKit Egress, which needs S3/IAM) -- the call
@@ -142,13 +143,17 @@ export function useCall() {
     setActiveCall((c) => (c ? { ...c, audioBlocked: false } : c));
   }, []);
 
+  // Calls are recorded and transcribed: the one-time recording notice comes
+  // first, and cancelling it means the call isn't placed or joined.
   const startCall = useCallback(async (friendIds) => {
+    if (!(await ensureRecordingNotice())) return null;
     const data = await post('/calls', { friend_ids: friendIds });
     await connectToRoom({ ...data, isInitiator: true });
     return data;
   }, [connectToRoom]);
 
   const joinCall = useCallback(async (callId) => {
+    if (!(await ensureRecordingNotice())) return null;
     const data = await post(`/calls/${callId}/join`, {});
     await connectToRoom({ ...data, isInitiator: false });
   }, [connectToRoom]);

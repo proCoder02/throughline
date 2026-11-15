@@ -1,5 +1,34 @@
 # Connecting to the production server
 
+## Direct SSH (preferred -- use this first)
+
+A direct, non-expiring SSH key now works against the instance's public IP
+-- no bastion session needed at all. Confirmed live (2026-10-20):
+
+```powershell
+ssh -i $env:USERPROFILE\.ssh\id_ed25519 ubuntu@129.213.21.239
+```
+
+Postgres, directly on the box:
+
+```powershell
+ssh -i $env:USERPROFILE\.ssh\id_ed25519 ubuntu@129.213.21.239 "sudo -u postgres psql -d throughline"
+```
+
+Or tunnel Postgres to a local port instead, for a local GUI client (pgAdmin,
+DBeaver, etc.) or a local script to connect through:
+
+```powershell
+ssh -i $env:USERPROFILE\.ssh\id_ed25519 -L 5433:localhost:5432 ubuntu@129.213.21.239
+# then connect to localhost:5433 from another terminal/tool while this stays open
+```
+
+This key has no 3-hour TTL and needs no `oci bastion session create-managed-ssh`
+dance -- use it for everything (deploys, log checks, psql) unless it stops
+working, in which case fall back to the Bastion section below.
+
+## Fallback: OCI Bastion managed SSH session
+
 The original `ssh_public_key` baked into the instance at launch
 (`infra/terraform/terraform.tfvars`) has no matching private key on this
 machine, and OCI does not allow `ssh_authorized_keys` to be changed on a
@@ -8,12 +37,14 @@ itself rejects a direct update with `"ssh_authorized_keys metadata field
 cannot be updated"`. Do not attempt either of those; both destroy/recreate
 the instance.
 
-The working path instead is an **OCI Bastion managed SSH session**: it
-pushes a temporary key to the instance for the session's lifetime (max
-10800s / 3 hours) without touching the instance itself. A session must be
-recreated each time the previous one expires.
+Before the direct key above was set up, the working path was an **OCI
+Bastion managed SSH session**: it pushes a temporary key to the instance for
+the session's lifetime (max 10800s / 3 hours) without touching the instance
+itself. A session must be recreated each time the previous one expires --
+this is the friction the direct key above exists to avoid, so only use this
+path if the direct key stops working.
 
-## One-time setup (already done)
+### One-time setup (already done)
 
 - A keypair for this purpose lives at
   `C:\Users\P3INW57\Desktop\speech2text\throughline_deploy_key` (private,
@@ -26,7 +57,7 @@ If the keypair is ever lost, generate a new one
 key just needs to be supplied to each new session below, no instance change
 needed.
 
-## Reference OCIDs
+### Reference OCIDs
 
 | What | OCID |
 |---|---|
@@ -37,7 +68,7 @@ needed.
 | Instance private IP | `10.0.1.153` |
 | Instance public IP | `129.213.21.239` |
 
-## Creating a new session
+### Creating a new session
 
 **The OCI CLI is already installed and configured on this machine**
 (`oci.exe` on PATH, `~/.oci/config` has user/fingerprint/key_file/tenancy/
@@ -83,7 +114,7 @@ OCI Cloud Shell (cloud.oracle.com) -- it's pre-authenticated independent of
 this machine's config and runs the same `oci` commands, just without the
 `--region` gotcha (Cloud Shell prompts region per-command context instead).
 
-## Connecting from this (Windows) machine
+### Connecting from this (Windows) machine
 
 Oracle's documented command uses `-W %h:%p` inside `ProxyCommand`, which
 **does not substitute correctly through Windows OpenSSH** -- it silently
@@ -109,13 +140,16 @@ Then:
 ssh throughline-bastion
 ```
 
-## Deploy commands over this connection
+## Deploy commands
 
 ```
-scp throughline-bastion:/opt/throughline/app/app.py ./prod_app.py.remote   # pull current prod state first, always
-ssh throughline-bastion "cd /opt/throughline/app && sudo git log --oneline -3 && sudo git status --short"
-ssh throughline-bastion "sudo systemctl status throughline"
+scp ubuntu@129.213.21.239:/opt/throughline/app/app.py ./prod_app.py.remote   # pull current prod state first, always
+ssh -i $env:USERPROFILE\.ssh\id_ed25519 ubuntu@129.213.21.239 "cd /opt/throughline/app && sudo git log --oneline -3 && sudo git status --short"
+ssh -i $env:USERPROFILE\.ssh\id_ed25519 ubuntu@129.213.21.239 "sudo systemctl status throughline"
 ```
+
+(Swap in `throughline-bastion` for the host if falling back to the Bastion
+session above.)
 
 The repo on the server is root-owned (cloud-init cloned it as root); use
 `sudo` for any git/file operation there, not `git config --global --add

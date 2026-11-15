@@ -1,0 +1,73 @@
+{% extends "legal/base.html" %}
+{% from "legal/_macros.html" import val %}
+{% set active = 'delete' %}
+{% block title %}Delete your account{% endblock %}
+{% block style %}
+  form { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-top: 18px; max-width: 460px; }
+  label { display: block; font-weight: 600; font-size: 14px; margin: 14px 0 4px; color: var(--text); }
+  input { width: 100%; padding: 10px 12px; font: inherit; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .hint { font-size: 13px; color: var(--faint); margin-top: 4px; }
+  button { margin-top: 18px; width: 100%; padding: 11px; font: inherit; font-weight: 700; border: 0; border-radius: 8px; background: var(--danger); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  .msg { margin-top: 12px; font-size: 14px; }
+  .msg.err { color: var(--danger); } .msg.ok { color: var(--accent); font-weight: 600; }
+{% endblock %}
+{% block content %}
+<h1>Delete your Throughline account</h1>
+<div class="meta">This can't be undone.</div>
+
+<p>Deleting your account permanently removes it and the data stored with it:</p>
+<ul>
+  <li>your profile, profile picture and settings;</li>
+  <li>transcripts, conversations, notes, tasks, reminders, people profiles and insights;</li>
+  <li>your chats with the assistant, and files and images you uploaded;</li>
+  <li>your friends list, direct messages you sent and received, and your call history;</li>
+  <li>connected Gmail, Outlook and Swiggy access (we delete the stored tokens);</li>
+  <li>email drafts, expenses, insurance details, mood, heart-rate and TV activity, and Meet cards.</li>
+</ul>
+<p>It happens straight away. Copies in backups, if any, are overwritten within 30 days. We'll send a confirmation
+to your account's email address. To keep a copy of anything, save it before you delete.</p>
+
+<h2>How to delete</h2>
+<p><strong>In the app:</strong> open <strong>Settings</strong> and choose <strong>Delete account</strong>.</p>
+<p><strong>Here:</strong> sign in below and confirm.</p>
+
+<form id="delete-form" novalidate>
+  <label for="username">Username</label>
+  <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <label for="confirm">Type DELETE to confirm</label>
+  <input id="confirm" name="confirm" autocomplete="off" autocapitalize="characters" required>
+  <div class="hint">Forgot your password? <a href="/app">Reset it from the log-in screen</a> first.</div>
+  <button type="submit" id="submit">Delete my account permanently</button>
+  <div class="msg" id="msg" role="status" aria-live="polite"></div>
+</form>
+
+<p style="margin-top:24px">Can't sign in? Email {% if info.contact_email %}<a href="mailto:{{ info.contact_email }}?subject=Delete%20my%20Throughline%20account">{{ info.contact_email }}</a>{% else %}{{ val('', "Contact email") }}{% endif %}
+from your account's email address and we'll delete it for you.</p>
+
+<script>
+  (function () {
+    var form = document.getElementById('delete-form'), msg = document.getElementById('msg'), btn = document.getElementById('submit');
+    function say(text, ok) { msg.textContent = text; msg.className = 'msg ' + (ok ? 'ok' : 'err'); }
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var username = form.username.value.trim(), password = form.password.value, confirmText = form.confirm.value.trim();
+      if (!username || !password) return say('Enter your username and password.');
+      if (confirmText !== 'DELETE') return say('Type DELETE (in capitals) to confirm.');
+      btn.disabled = true; say('Deleting…', true);
+      fetch('/account/delete', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username, password: password, confirm: confirmText })
+      }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { return [r.ok, d]; }); })
+        .then(function (res) {
+          if (res[0] && res[1].ok) { form.reset(); Array.prototype.forEach.call(form.elements, function (el) { el.disabled = true; }); say(res[1].message, true); }
+          else { btn.disabled = false; say(res[1].error || 'Something went wrong. Please try again.'); }
+        })
+        .catch(function () { btn.disabled = false; say('Network error. Please try again.'); });
+    });
+  })();
+</script>
+{% endblock %}

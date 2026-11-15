@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { getToken, apiJson } from '../api.js';
+import { ensureRecordingNotice } from '../lib/consent.js';
 
 // Ports the mic-capture + /ws/listen logic from the old vanilla-JS app.
 // Voice-activity pausing was dropped for brevity; audio streams continuously
@@ -33,6 +34,8 @@ export function useLiveSession({ onSessionStarted, onEnded }) {
   }, [loadKnownSpeakers]);
 
   const start = useCallback(async (resumeConversationId) => {
+    // One-time recording notice (see lib/consent.js); cancelling it means no recording.
+    if (!(await ensureRecordingNotice())) return;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     streamRef.current = stream;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

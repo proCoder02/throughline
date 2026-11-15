@@ -26,7 +26,11 @@ export default function CategoryMenu({ value, onChange }) {
     if (!open) return;
     const onClickAway = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
     document.addEventListener('mousedown', onClickAway);
-    return () => document.removeEventListener('mousedown', onClickAway);
+    document.addEventListener('touchstart', onClickAway);
+    return () => {
+      document.removeEventListener('mousedown', onClickAway);
+      document.removeEventListener('touchstart', onClickAway);
+    };
   }, [open]);
 
   return (

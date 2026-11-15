@@ -131,6 +131,17 @@ def download_object(object_key: str) -> bytes | None:
         return None
 
 
+def object_size(object_key: str) -> int | None:
+    """Size in bytes of an uploaded object, or None if it isn't there (or
+    storage can't be reached) -- lets a caller reject a file up front
+    instead of finding out at send time."""
+    try:
+        head = _client().head_object(Bucket=os.environ["R2_BUCKET_NAME"], Key=object_key)
+        return head["ContentLength"]
+    except Exception:
+        return None
+
+
 def delete_object(object_key: str):
     try:
         _client().delete_object(Bucket=os.environ["R2_BUCKET_NAME"], Key=object_key)
@@ -149,3 +160,32 @@ def key_from_public_url(url: str) -> str | None:
     if base and url.startswith(base + "/"):
         return url[len(base) + 1:]
     return None
+
+
+def delete_user_files(user_id: int) -> int:
+    """Deletes every object a user uploaded -- presign_upload() always puts
+    them under <purpose prefix>/<user_id>/, so each prefix is listed and
+    emptied. Used by account deletion. Returns how many objects were
+    deleted; raises on a storage error so the caller can report it (the
+    account itself is already gone by then)."""
+    if not is_enabled():
+        return 0
+    client = _client()
+    bucket = os.environ["R2_BUCKET_NAME"]
+    deleted = 0
+    for spec in _PURPOSES.values():
+        prefix = f"{spec['prefix']}/{int(user_id)}/"
+        token = None
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = client.list_objects_v2(**kwargs)
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if keys:
+                client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+                deleted += len(keys)
+            if not page.get("IsTruncated"):
+                break
+            token = page.get("NextContinuationToken")
+    return deleted

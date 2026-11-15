@@ -1,0 +1,142 @@
+<title>Insurance Agent Architecture</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* layout: single-column technical brief — overview, then two diagrams (ingestion/reminders, claim-filing), then the data model */
+:root{
+  --bg:#f5f4f0; --panel:#ffffff; --fg:#1b2420; --muted:#5b6660;
+  --accent:#1f7a5c; --accent-soft:#e3f0ea; --border:#dcdbd3; --mono-bg:#eceae3;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#10140f; --panel:#161b15; --fg:#e8ece6; --muted:#9aa89e;
+    --accent:#5fd6a8; --accent-soft:#1c3328; --border:#2a3128; --mono-bg:#1b2118;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#10140f; --panel:#161b15; --fg:#e8ece6; --muted:#9aa89e;
+  --accent:#5fd6a8; --accent-soft:#1c3328; --border:#2a3128; --mono-bg:#1b2118;
+  color-scheme: dark;
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--fg);
+  padding-left:max(16px, env(safe-area-inset-left,0px));
+  padding-right:max(16px, env(safe-area-inset-right,0px));
+  padding-block:40px;
+  font-family:'IBM Plex Sans',system-ui,sans-serif;
+  line-height:1.55;
+}
+.wrap{max-width:860px; margin:0 auto;}
+h1,h2,h3{font-family:'Fraunces',Georgia,serif; letter-spacing:-0.01em; text-wrap:balance; margin:0;}
+h1{font-size:clamp(28px,5vw,40px); font-weight:600;}
+h2{font-size:22px; font-weight:600; margin-top:48px; padding-bottom:10px; border-bottom:1px solid var(--border);}
+h3{font-size:16px; font-weight:600; margin-top:28px;}
+.eyebrow{
+  font-family:'IBM Plex Mono',monospace; font-size:12px; letter-spacing:0.08em; text-transform:uppercase;
+  color:var(--accent); margin-bottom:10px;
+}
+.lede{color:var(--muted); font-size:16px; max-width:65ch; margin-top:14px;}
+p{max-width:68ch;}
+.card{
+  background:var(--panel); border:1px solid var(--border); border-radius:14px;
+  padding:20px 22px; margin-top:18px;
+}
+.flow-note{font-size:13.5px; color:var(--muted); margin-top:8px;}
+.diagram-scroll{overflow-x:auto; margin-top:4px;}
+.legend{
+  display:flex; gap:18px; flex-wrap:wrap; font-family:'IBM Plex Mono',monospace;
+  font-size:12px; color:var(--muted); margin-top:10px;
+}
+.legend span{display:inline-flex; align-items:center; gap:6px;}
+.dot{width:8px; height:8px; border-radius:50%; display:inline-block;}
+.dot.reused{background:var(--accent);}
+.dot.new{background:var(--muted);}
+table{width:100%; border-collapse:collapse; margin-top:10px; font-size:14px;}
+th,td{text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:top;}
+th{font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.04em; text-transform:uppercase; color:var(--muted);}
+code{
+  font-family:'IBM Plex Mono',monospace; font-size:0.92em; background:var(--mono-bg);
+  padding:1px 6px; border-radius:5px;
+}
+.answer{
+  background:var(--accent-soft); border:1px solid var(--border); border-radius:14px;
+  padding:18px 20px; margin-top:16px;
+}
+.answer .eyebrow{color:var(--accent);}
+footer{margin-top:56px; padding-top:18px; border-top:1px solid var(--border); font-size:13px; color:var(--muted);}
+</style>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<div class="wrap">
+  <div class="eyebrow">Architecture · Insurance agent on Throughline</div>
+  <h1>From a photo of a policy to a filed claim</h1>
+  <p class="lede">Every new piece reuses a pattern you already shipped this session — the receipt-extraction pipeline, the email-draft confirm step, and the nudge engine. The teal nodes below are infrastructure that already exists; the grey ones are the only genuinely new pieces.</p>
+
+  <div class="legend">
+    <span><i class="dot reused"></i> already built</span>
+    <span><i class="dot new"></i> new for insurance</span>
+  </div>
+
+  <h2>1. Ingestion → extraction → renewal reminders</h2>
+  <p class="flow-note">User shares a policy PDF/photo the same way they already share a payment receipt. One extraction call reads it; a scheduled worker watches the expiry date.</p>
+  <div class="card">
+    <div class="diagram-scroll">
+<pre class="mermaid">
+flowchart TD
+    U["User"] -->|"shares policy PDF/photo\nvia share-sheet (reused)"| ING["Policy ingestion\nreceive_sharing_intent (reused)"]
+    ING --> EXT["Extraction agent\nvision call, same shape as\nchat_global_image (reused pattern)"]
+    EXT -->|"insurer, policy #, type,\npremium, issue + expiry date,\nsum insured, claims email"| DB["insurance_policies\n(new table)"]
+    DB --> CONFIRM["Confirm sheet\nsame as transaction_confirm_sheet (reused pattern)"]
+    CONFIRM -->|"user corrects misreads"| DB
+
+    WORKER["Renewal reminder worker\nsame shape as nudge_engine /\nemail_reminder_worker (reused pattern)"] -->|"polls on a cycle"| DB
+    WORKER -->|"N days before expiry"| TASK["tasks row + push notification\n(reused)"]
+    TASK --> U
+</pre>
+    </div>
+  </div>
+
+  <h2>2. Filing a claim</h2>
+  <p class="flow-note">Two ways in: the user asks directly, or the agent notices an incident while listening to a call. Either way it lands as a normal email draft — nothing sends until the user reviews it.</p>
+  <div class="card">
+    <div class="diagram-scroll">
+<pre class="mermaid">
+flowchart TD
+    A["User: &quot;file a claim for\nmy bike insurance&quot;"] --> AGENT
+    B["Listen feature transcript:\n&quot;...hit a pothole, bike's damaged...&quot;\n(reused call-transcription pipeline)"] -->|"incident detected"| AGENT
+
+    AGENT["Claim-filing agent\nnew tool in the AGENT_TOOLS loop\n(reused run_agent_tool_loop)"]
+    AGENT -->|"match incident to policy"| DB["insurance_policies\n(new table)"]
+    DB -->|"claims contact email,\npolicy #, sum insured"| AGENT
+    AGENT -->|"ask for incident date,\ndescription, supporting photos"| USER2["User"]
+    USER2 --> AGENT
+    AGENT -->|"drafts claim email\nto insurer's claims address"| DRAFT["email_drafts row\n(reused as-is --\narbitrary recipient = draft, never auto-send)"]
+    DRAFT --> CARD["EmailDraftCard\n(reused widget)"]
+    CARD -->|"user attaches docs,\nreviews, taps Send"| SEND["send_plain_email\n(reused)"]
+    SEND --> INSURER["Insurer's claims inbox"]
+    SEND --> CLAIM["claims row: status = filed\n(new table)"]
+    CLAIM -->|"&quot;what's the status\nof my claim?&quot;"| USER2
+</pre>
+    </div>
+  </div>
+
+  <div class="answer">
+    <div class="eyebrow">Your question</div>
+    <p style="margin:0">Yes — email is the right channel, and it costs almost nothing new to build. An insurer's claims address is exactly the "arbitrary, untrusted recipient" case <code>send_email</code> already drafts instead of sending immediately. The claim-filing agent's only real job is composing the draft correctly (right policy, right incident, right attachments) — the review-before-send safety net, the card UI, and the actual delivery are all infrastructure you shipped today.</p>
+  </div>
+
+  <h2>3. What's actually new</h2>
+  <table>
+    <tr><th>Piece</th><th>Why it's new</th></tr>
+    <tr><td><code>insurance_policies</code> table</td><td>No existing table holds policy number, insurer, type, or expiry date.</td></tr>
+    <tr><td><code>claims</code> table</td><td>Tracks status (filed / acknowledged / settled) so the user can ask about it later.</td></tr>
+    <tr><td>Renewal reminder worker</td><td>Same shape as <code>nudge_engine</code>, but watching expiry dates instead of task/relationship cadence.</td></tr>
+    <tr><td>Claim-filing agent tool</td><td>New entry in <code>AGENT_TOOLS</code> — the only new reasoning step; everything it calls into (policy lookup, email draft, confirm card) already exists.</td></tr>
+  </table>
+
+  <footer>Every box without "(new table)" or "new tool" in its label is code or schema you already have in production.</footer>
+</div>

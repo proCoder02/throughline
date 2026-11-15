@@ -57,7 +57,6 @@ Scheduling (Windows Task Scheduler, twice daily at 8am and 8pm):
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -73,65 +72,36 @@ HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / "logs"
 DB_URL = os.getenv("DATABASE_URL")
 
-
-def _ensure_ops_schema(conn) -> None:
-    """Idempotent, run every invocation -- same self-migrating convention
-    as real_user_extraction.py's ensure_migration(). Shared by this file,
-    nudge_engine.py, and app.py's admin dashboard (the reader), so whichever
-    of those runs first creates it."""
-    cur = conn.cursor()
-    cur.execute("CREATE SCHEMA IF NOT EXISTS ops")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ops.job_runs (
-            id SERIAL PRIMARY KEY,
-            job_name TEXT NOT NULL,
-            started_at TIMESTAMPTZ NOT NULL,
-            finished_at TIMESTAMPTZ,
-            status TEXT NOT NULL DEFAULT 'running',
-            detail JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_job_runs_job_name ON ops.job_runs (job_name, started_at DESC)")
-    conn.commit()
-    cur.close()
+# Tracking lives in the standalone ops/ package (repo_root/ops), not
+# duplicated here -- same cross-folder import trick extraction_pipeline.py
+# already uses for costlens_agent, since this script's own folder
+# (emotional_intelligence/) isn't on sys.path by default.
+_repo_root = str(Path(__file__).resolve().parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+from ops.tracking import start_job_run as _start_job_run  # noqa: E402
+from ops.tracking import finish_job_run as _finish_job_run  # noqa: E402
+from ops import db as _ops_db  # noqa: E402
+from ops import job_control as _job_control  # noqa: E402
 
 
-def _start_job_run(conn, job_name: str) -> int | None:
-    """Best-effort: a tracking-row failure must never stop the actual
-    pipeline from running, same reasoning as every other optional/additive
-    module in this repo (ei_adapter.py, nudges/nudge_engine.py)."""
+def _check_on_ice() -> bool:
+    """Checked at the very top of main(), before any real work -- the
+    dashboard's "on ice" action for ei_pipeline sets this flag; root's
+    crontab still fires this script on schedule either way (there's no
+    crontab entry to disable), so the gate has to live here. --force
+    (the dashboard's "start now"/"restart" actions use it) bypasses this,
+    same as a manual on-call run should be able to."""
     try:
-        _ensure_ops_schema(conn)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO ops.job_runs (job_name, started_at, status) VALUES (%s, now(), 'running') RETURNING id",
-            (job_name,),
-        )
-        run_id = cur.fetchone()[0]
-        conn.commit()
-        cur.close()
-        return run_id
+        conn = _ops_db.get_conn()
+        try:
+            cur = _ops_db.dict_cursor(conn)
+            return _job_control.is_on_ice(cur, conn, "ei_pipeline")
+        finally:
+            _ops_db.release_conn(conn)
     except Exception as e:
-        print(f"[ops.job_runs] failed to start tracking row: {e!r}")
-        return None
-
-
-def _finish_job_run(conn, run_id: int | None, status: str, detail: dict) -> None:
-    if run_id is None:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE ops.job_runs SET finished_at = now(), status = %s, detail = %s WHERE id = %s",
-            (status, json.dumps(detail), run_id),
-        )
-        conn.commit()
-        cur.close()
-    except Exception as e:
-        print(f"[ops.job_runs] failed to finish tracking row: {e!r}")
+        print(f"[ei_pipeline] on-ice check failed (proceeding as not iced): {e!r}")
+        return False
 
 
 def run_stage(name: str, cmd: list[str], log_file) -> dict:
@@ -158,7 +128,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the full real-user EI pipeline (extraction + personality + relationship) and log the outcome.")
     parser.add_argument("--user-id", type=int, default=None, help="Scope the extraction stage to one user (default: all users).")
     parser.add_argument("--limit", type=int, default=0, help="Max conversations the extraction stage processes (0 = all unprocessed).")
+    parser.add_argument("--force", action="store_true", help="Run even if the dashboard has this job on ice.")
     args = parser.parse_args()
+
+    if not args.force and _check_on_ice():
+        print("[ei_pipeline] on ice -- skipping this run (pass --force to override)")
+        conn = None
+        if DB_URL:
+            try:
+                conn = psycopg2.connect(DB_URL)
+                run_id = _start_job_run(conn, "ei_pipeline")
+                _finish_job_run(conn, run_id, "on_ice", {"reason": "job is on ice"})
+            except Exception as e:
+                print(f"[ops.job_runs] failed to record on-ice skip: {e!r}")
+            finally:
+                if conn is not None:
+                    conn.close()
+        return 0
 
     LOG_DIR.mkdir(exist_ok=True)
     log_path = LOG_DIR / f"ei_pipeline_{datetime.now().strftime('%Y-%m-%d')}.log"

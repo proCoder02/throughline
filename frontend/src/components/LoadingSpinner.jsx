@@ -1,4 +1,4 @@
-import UseAnimations from 'react-useanimations';
+﻿import UseAnimations from 'react-useanimations';
 import loading2 from 'react-useanimations/lib/loading2';
 
 /// Small inline Lottie spinner (react-useanimations) -- drop-in replacement
@@ -6,7 +6,7 @@ import loading2 from 'react-useanimations/lib/loading2';
 export default function LoadingSpinner({ size = 22, label }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-      <UseAnimations animation={loading2} size={size} autoplay loop strokeColor="#1FC8B4" />
+      <UseAnimations animation={loading2} size={size} autoplay loop strokeColor="#D98E4A" />
       {label && <span className="hint" style={{ margin: 0 }}>{label}</span>}
     </span>
   );

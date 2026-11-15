@@ -1,0 +1,134 @@
+{% extends "legal/base.html" %}
+{% from "legal/_macros.html" import val %}
+{% set active = 'privacy' %}
+{% block title %}Privacy Policy{% endblock %}
+{% block content %}
+<h1>Privacy Policy</h1>
+<div class="meta">Effective {{ info.effective_date }}</div>
+
+<p>Throughline is a personal assistant that listens to conversations you choose to record, turns them into notes,
+tasks and reminders, and answers questions about them. That means it handles personal information about you and
+about the people you talk to. This policy explains what we collect, why, who helps us process it, and the choices
+and rights you have. Throughline is provided by {{ val(info.entity, "Company legal name") }} ("we", "us").</p>
+
+<div class="summary">
+  <strong>In short</strong>
+  <ul>
+    <li>We only record when you start a recording or a call. Audio is turned into text and then deleted &mdash; we keep the transcript, not the audio.</li>
+    <li>We use your data to run Throughline for you. We don't sell it and we don't show ads.</li>
+    <li>Some processing is done by service providers (speech-to-text, AI models, hosting, push notifications), listed below.</li>
+    <li>You can delete your account and its data at any time, from Settings or at <a href="/account/delete">/account/delete</a>.</li>
+    <li>If you record other people, you are responsible for telling them and getting their consent where the law requires it.</li>
+  </ul>
+</div>
+
+<h2>1. Information we collect</h2>
+<h3>You give us</h3>
+<ul>
+  <li><strong>Account details:</strong> username, email address and password (stored only as a one-way hash), and an optional profile picture.</li>
+  <li><strong>Profile answers</strong> (optional): age, gender, language preference, hobbies, interests, occupation and what you want from the app, used to tailor replies and insights.</li>
+  <li><strong>What you record and type:</strong> transcripts of conversations you record with Listen, transcripts of calls you take part in, your chats with the assistant, and files or images you attach.</li>
+  <li><strong>Messages and contacts in the app:</strong> friends you add, direct messages, and call history.</li>
+  <li><strong>Things you log:</strong> tasks, reminders, expenses and transactions, vehicle insurance details, mood check-ins, and categories you create.</li>
+  <li><strong>Meet cards:</strong> the introduction card you choose to share, and the people you exchange cards with.</li>
+</ul>
+<h3>Created when you use Throughline</h3>
+<ul>
+  <li><strong>Notes we derive:</strong> summaries, tasks, people and their roles, topics, and &mdash; where the feature is on &mdash; mood, personality and relationship insights drawn from your conversations.</li>
+  <li><strong>Device and delivery data:</strong> a push-notification token for each device you sign in on, and whether each notification was delivered.</li>
+  <li><strong>Technical data:</strong> server logs (such as time, request path and errors) and usage counts used to measure our own costs. These usage counts do not contain the content of your conversations.</li>
+</ul>
+<h3>Only if you turn it on</h3>
+<ul>
+  <li><strong>Email (Gmail or Outlook):</strong> if you connect a mailbox, we read messages to answer your questions and find tasks. Access tokens are stored encrypted, and you can disconnect at any time.</li>
+  <li><strong>Location:</strong> if you ask about places nearby, the coordinates you share are used to answer that question.</li>
+  <li><strong>Watch and TV companion apps:</strong> heart-rate sessions and TV activity, if you use those apps.</li>
+  <li><strong>Food ordering (Swiggy):</strong> if you connect your Swiggy account, we search and place orders on it only after you confirm each order.</li>
+</ul>
+
+<h2>2. Recordings and other people</h2>
+<p>Recording happens only when you start it (Listen) or join a call. Audio is streamed or uploaded to our
+speech-to-text provider, turned into text, and the audio file is then deleted from our servers. The transcript and
+the notes derived from it are stored in your account.</p>
+<p>Conversations often include other people. Their words, and notes about them (for example a name or what they
+said they would do), become part of <em>your</em> account.</p>
+<p><strong>Calls are transcribed.</strong> In a Throughline call, everyone on the call sees a notice that it is
+being transcribed. When a call is started from the web app, the person who started it records the whole call
+(everyone's voices) and the transcript is added to their account. In the mobile app, each participant's phone
+records that participant's side, and the transcript is added to their own account.</p>
+<p><strong>Before you record anyone, tell them and, where the law
+requires it, get their consent.</strong> If someone asks us to remove information about them, contact us using the
+details below.</p>
+
+<h2>3. How we use information</h2>
+<ul>
+  <li>To provide the service: transcribe, summarise, extract tasks and reminders, answer your questions, send the emails and messages you ask it to, and deliver notifications.</li>
+  <li>To personalise it to you, using your profile answers, mode and history.</li>
+  <li>To keep it secure and working: preventing abuse, fixing errors and monitoring reliability.</li>
+  <li>To contact you about your account, for example password resets and important changes to these terms.</li>
+</ul>
+<p>We don't sell your personal information, we don't use it for advertising, and we don't use your conversations to
+train our own AI models. We process your information to provide the service you asked for, on the basis of your
+consent (which you can withdraw by stopping use or deleting your account) and, where it applies, our legitimate
+interest in keeping the service secure.</p>
+
+<h2>4. Who processes your information for us</h2>
+<p>We share information only with providers that help us run Throughline, only for that purpose, and with services
+you connect yourself.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Provider</th><th>What for</th><th>What they receive</th></tr></thead>
+  <tbody>
+    <tr><td>Oracle Cloud Infrastructure</td><td>Hosting our servers and database</td><td>All stored data</td></tr>
+    <tr><td>Deepgram; Groq</td><td>Speech-to-text</td><td>Audio you record</td></tr>
+    <tr><td>Ollama (cloud models); Groq</td><td>AI replies, summaries, task extraction, image understanding</td><td>Relevant transcript and chat text, and images you attach</td></tr>
+    <tr><td>Cloudflare (R2 storage)</td><td>Storing files you upload</td><td>Profile pictures and attachments</td></tr>
+    <tr><td>LiveKit</td><td>Real-time audio for calls</td><td>Call audio while the call is live</td></tr>
+    <tr><td>Google Firebase Cloud Messaging</td><td>Push notifications</td><td>Device token and notification content</td></tr>
+    <tr><td>Hostinger (email)</td><td>Sending reminders, password resets and emails you ask us to send</td><td>Recipient address and email content</td></tr>
+    <tr><td>OpenStreetMap (Overpass API)</td><td>Finding places near you, when you ask</td><td>The coordinates you share</td></tr>
+    <tr><td>Google (Gmail), Microsoft (Outlook), Swiggy</td><td>Only if you connect them</td><td>What's needed for that feature</td></tr>
+  </tbody>
+</table>
+</div>
+<p>We may also disclose information if required by law, to protect the safety of any person, or as part of a merger
+or sale of the business (in which case this policy continues to apply).</p>
+
+<h2>5. Where information is processed</h2>
+<p>Our servers and several of our providers are located outside India, including in the United States. Where we
+transfer personal data across borders, we do so as permitted by applicable law.</p>
+
+<h2>6. How long we keep it</h2>
+<ul>
+  <li>Audio recordings: deleted as soon as they're transcribed.</li>
+  <li>Your account data: kept until you delete it or your account.</li>
+  <li>When you delete your account, we delete its data from our database and file storage straight away. Copies in backups, if any, are overwritten within 30 days. Server logs are kept for a limited period for security.</li>
+</ul>
+
+<h2>7. Your rights and choices</h2>
+<ul>
+  <li><strong>Access and correction:</strong> you can see and edit most of your data in the app; contact us for anything else.</li>
+  <li><strong>Deletion:</strong> delete individual items in the app, or your whole account in Settings or at <a href="/account/delete">/account/delete</a>.</li>
+  <li><strong>Withdraw consent:</strong> stop recording, disconnect connected accounts, turn off smart features, or delete your account.</li>
+  <li><strong>Grievances:</strong> contact our Grievance Officer below. If you're in India, you may also complain to the Data Protection Board of India.</li>
+</ul>
+
+<h2>8. Security</h2>
+<p>We use encryption in transit (HTTPS), store passwords as one-way hashes and connected-account tokens encrypted,
+and limit who can access production systems. No system is perfectly secure; if we learn of a breach affecting your
+data, we will notify you and the authorities as the law requires.</p>
+
+<h2>9. Children</h2>
+<p>Throughline is not meant for children. You must be at least 18 years old, or the age of majority where you live,
+to use it. If you believe a child has created an account, contact us and we will delete it.</p>
+
+<h2>10. Changes</h2>
+<p>If we change this policy in a way that matters, we'll tell you in the app and ask you to agree again before you
+continue. The effective date at the top shows when it last changed.</p>
+
+<h2>11. Contact</h2>
+<p>{{ val(info.entity, "Company legal name") }}<br>
+{{ val(info.address, "Registered address") }}<br>
+Email: {% if info.contact_email %}<a href="mailto:{{ info.contact_email }}">{{ info.contact_email }}</a>{% else %}{{ val('', "Contact email") }}{% endif %}<br>
+Grievance Officer: {{ val(info.grievance_officer, "Name of Grievance Officer") }}</p>
+{% endblock %}
