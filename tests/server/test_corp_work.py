@@ -141,7 +141,11 @@ check("radar pushed both sides", any(p[0] == us_ for p in pushed))
 dev.post(f"{B}/threads/{bt}/messages", json={"body": "I sent the migration scripts to the team"})
 q("UPDATE corp.commitments SET checked_at = now() - interval '1 hour' WHERE id = %s", (cid,))
 q("UPDATE corp.commitments SET checked_at = now() WHERE org_id = %s AND id <> %s", (org, cid))
+# The job takes one oldest-checked batch across all orgs; open commitments
+# left in the local DB by earlier runs would fill it before this one.
+_batch, jobs.EVIDENCE_BATCH = jobs.EVIDENCE_BATCH, 100000
 jobs.check_evidence(cur, None, fake_push); conn.commit()
+jobs.EVIDENCE_BATCH = _batch
 r = dev.get(f"{B}/commitments/{cid}").get_json()
 check("evidence closes the commitment", r["commitment"]["status"] == "done" and "sent the migration" in r["commitment"]["evidence"], r["commitment"])
 od = dev.post(B + "/commitments", json={"text": "Old promise", "unit_id": be, "due_date": "2020-01-01"}).get_json()["id"]

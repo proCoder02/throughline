@@ -3395,6 +3395,26 @@ def _transcribe_with_deepgram(audio_bytes, content_type):
     return "\n".join(lines), segments
 
 
+def _sniff_audio_ext(audio_bytes):
+    """File extension from the audio's magic bytes, or None if unrecognised."""
+    head = audio_bytes[:12]
+    if head[4:8] == b"ftyp":
+        return "m4a"
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    # MPEG audio frame sync; layer bits 00 is ADTS AAC, not MP3 -- left as
+    # None so the mimetype decides (and Deepgram is the fallback).
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0 and (head[1] & 0x06)):
+        return "mp3"
+    return None
+
+
 _GROQ_EXT_BY_MIMETYPE = {
     "audio/webm": "webm",
     "audio/mp4": "m4a",
@@ -3426,7 +3446,10 @@ def _transcribe_with_groq(audio_bytes, content_type):
     # extension gets rejected outright with a 400, so this can't just be a
     # fixed placeholder like the other providers tolerate.
     mimetype = (content_type or "audio/webm").split(";")[0].strip().lower()
-    ext = _GROQ_EXT_BY_MIMETYPE.get(mimetype, "webm")
+    # The bytes decide the extension when they're recognisable: clients don't
+    # always label uploads (Dio on iOS sends application/octet-stream for the
+    # chat mic's .m4a, which the mimetype map alone would have named .webm).
+    ext = _sniff_audio_ext(audio_bytes) or _GROQ_EXT_BY_MIMETYPE.get(mimetype, "webm")
     resp = requests.post(
         "https://api.groq.com/openai/v1/audio/transcriptions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -3434,6 +3457,8 @@ def _transcribe_with_groq(audio_bytes, content_type):
         data={"model": "whisper-large-v3-turbo", "response_format": "json"},
         timeout=120,
     )
+    if resp.status_code >= 400:
+        print(f"[stt] Groq {resp.status_code} for {len(audio_bytes)} bytes as .{ext} ({mimetype}): {resp.text[:300]}")
     resp.raise_for_status()
     text = (resp.json().get("text") or "").strip()
     if not text:
@@ -3450,7 +3475,17 @@ def transcribe_audio_bytes(audio_bytes, content_type):
     segments); raises RuntimeError for a missing API key or lets
     requests.RequestException/HTTPError propagate for the caller to handle."""
     if os.getenv("USE_GROQ_STT", "false").strip().lower() == "true":
-        return _transcribe_with_groq(audio_bytes, content_type)
+        try:
+            return _transcribe_with_groq(audio_bytes, content_type)
+        except requests.HTTPError as e:
+            # Groq refusing a file it can't decode (4xx) shouldn't cost the
+            # user their recording when Deepgram, which accepts more
+            # container variants, is configured too.
+            status = e.response.status_code if e.response is not None else None
+            if not (status and 400 <= status < 500 and status not in (401, 429) and os.getenv("DEEPGRAM_API_KEY")):
+                raise
+            print(f"[stt] Groq refused the audio ({status}); retrying with Deepgram")
+            return _transcribe_with_deepgram(audio_bytes, content_type)
     return _transcribe_with_deepgram(audio_bytes, content_type)
 
 
