@@ -59,6 +59,9 @@ const ModeChooser = lazy(() => import('./components/ModeChooser.jsx'));
 // instead of one boundary wrapping all four -- no observable difference
 // since only one section is ever mounted at a time.
 const LAZY_FALLBACK = <div className="detail-pane" style={{ flex: 1 }} />;
+// The public homepage ("/") ships in its own chunk, so visitors don't
+// download the app and the app doesn't carry the homepage.
+const LandingPage = lazy(() => import('./features/landing/LandingPage.jsx'));
 
 function ChatsRoute() {
   const {
@@ -180,7 +183,7 @@ function OsRoute() {
 }
 
 export const router = createBrowserRouter([
-  { path: '/', element: <DefaultRedirect /> },
+  { path: '/', element: <Suspense fallback={null}><LandingPage /></Suspense> },
   {
     path: '/app',
     element: <App />,

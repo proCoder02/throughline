@@ -27,7 +27,9 @@ function PasswordField({ id, value, onChange, autoComplete, label = 'Password' }
 // link, /app?reset_token=...).
 export default function AuthScreen({ auth }) {
   const resetToken = useRef(new URLSearchParams(window.location.search).get('reset_token')).current;
-  const [mode, setMode] = useState(resetToken ? 'reset' : 'login');
+  // ?signup=1 (the homepage's "Get started" buttons) opens on Create account.
+  const [mode, setMode] = useState(resetToken ? 'reset'
+    : new URLSearchParams(window.location.search).has('signup') ? 'register' : 'login');
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
