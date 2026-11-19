@@ -13,15 +13,16 @@
    dark themes. The Settings "Light/Dark" toggle already calls the real
    toggleTheme() -- it just had nothing to react to before this. */
 .tl-os {
-    --bg: #f7f8fa;
+    --bg: #FBF8F3;
     --surface: #ffffff;
-    --surface-2: #f1f3f5;
-    --surface-3: #e8ebef;
-    --text: #111827;
-    --muted: #6b7280;
-    --border: #e5e7eb;
-    --accent: #0d9488;
-    --accent-light: #ccfbf1;
+    --surface-2: #F3EDE4;
+    --surface-3: #EBE3D7;
+    --text: #1B1D24;
+    --muted: #545B66;
+    --border: #E6DED2;
+    --accent: #A85F24;
+    --accent-solid: #A85F24;
+    --accent-light: #F6E7D8;
     --danger: #ef4444;
     --warning: #f59e0b;
     --shadow: 0 8px 30px rgba(15,23,42,.06);
@@ -29,7 +30,7 @@
 
     margin: 0;
     min-height: 100vh;
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+    font-family: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system,
                  BlinkMacSystemFont, "Segoe UI", sans-serif;
     background: var(--bg);
     color: var(--text);
@@ -49,15 +50,16 @@
 }
 
 html:not([data-theme="light"]) .tl-os {
-    --bg: #1e1f22;
-    --surface: #2b2d31;
-    --surface-2: #35373c;
-    --surface-3: #3f4147;
-    --text: #f2f3f5;
-    --muted: #a0a2a7;
-    --border: #1f2023;
-    --accent: #1fc8b4;
-    --accent-light: rgba(31,200,180,.16);
+    --bg: #121A23;
+    --surface: #1B2531;
+    --surface-2: #223040;
+    --surface-3: #2A394A;
+    --text: #F4EFE7;
+    --muted: #B9C3CE;
+    --border: #2A3644;
+    --accent: #E8A86B;
+    --accent-solid: #A85F24;
+    --accent-light: rgba(232,168,107,.16);
     --danger: #ef4444;
     --warning: #f59e0b;
     --shadow: 0 8px 30px rgba(0,0,0,.45);
@@ -68,18 +70,18 @@ html:not([data-theme="light"]) .tl-os {
    given their own dark equivalents rather than left glaring white. */
 html:not([data-theme="light"]) .tl-os .hero {
     background:
-        radial-gradient(circle at 90% 10%, rgba(31,200,180,.12), transparent 35%),
-        linear-gradient(135deg,#2b2d31,#20302e);
+        radial-gradient(circle at 90% 10%, rgba(232,168,107,.12), transparent 35%),
+        linear-gradient(135deg,#1B2531,#223040);
 }
-html:not([data-theme="light"]) .tl-os .nav-item.active { color: #5eead4; }
-html:not([data-theme="light"]) .tl-os .ai-pill { color: #5eead4; }
+html:not([data-theme="light"]) .tl-os .nav-item.active { color: #F0C08F; }
+html:not([data-theme="light"]) .tl-os .ai-pill { color: #F0C08F; }
 html:not([data-theme="light"]) .tl-os .suggestion:hover { color: var(--text); }
 html:not([data-theme="light"]) .tl-os .badge.green { background: rgba(34,197,94,.18); color: #4ade80; }
 html:not([data-theme="light"]) .tl-os .badge.orange { background: rgba(245,158,11,.18); color: #fbbf24; }
 html:not([data-theme="light"]) .tl-os .badge.blue { background: rgba(59,130,246,.18); color: #60a5fa; }
-html:not([data-theme="light"]) .tl-os .heat { background: #2a3330; }
+html:not([data-theme="light"]) .tl-os .heat { background: #263241; }
 html:not([data-theme="light"]) .tl-os .heat:nth-child(3n) { background: #2f4a45; }
-html:not([data-theme="light"]) .tl-os .heat:nth-child(5n) { background: #1fc8b4; }
+html:not([data-theme="light"]) .tl-os .heat:nth-child(5n) { background: #E8A86B; }
 html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradient(145deg,#0c0d10,#17181b); }
 
 .tl-os *, .tl-os *::before, .tl-os *::after {
@@ -134,7 +136,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     width: 34px;
     height: 34px;
     border-radius: 11px;
-    background: var(--accent);
+    background: var(--accent-solid);
     color: white;
     display: grid;
     place-items: center;
@@ -181,7 +183,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
 
 .tl-os .nav-item.active {
     background: var(--accent-light);
-    color: #0f766e;
+    color: #8E4E1B;
     font-weight: 650;
 }
 
@@ -203,7 +205,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     min-width: 20px;
     padding: 1px 6px;
     border-radius: 999px;
-    background: #0f766e;
+    background: #8E4E1B;
     color: #fff;
     font-size: 11px;
     font-weight: 700;
@@ -308,7 +310,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     height: 18px;
     padding: 0 5px;
     border-radius: 999px;
-    background: #0f766e;
+    background: #8E4E1B;
     color: #fff;
     font-size: 10.5px;
     font-weight: 700;
@@ -360,7 +362,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     width: 38px;
     height: 38px;
     border-radius: 50%;
-    background: linear-gradient(135deg,#0d9488,#6366f1);
+    background: linear-gradient(135deg,#A85F24,#D98E4A);
     color: white;
     display: grid;
     place-items: center;
@@ -556,12 +558,12 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
 
 .tl-os .primary-button {
     border: 0;
-    background: var(--accent);
+    background: var(--accent-solid);
     color: white;
     padding: 11px 17px;
     border-radius: 11px;
     font-weight: 650;
-    box-shadow: 0 5px 15px rgba(13,148,136,.2);
+    box-shadow: 0 5px 15px rgba(168,95,36,.2);
 }
 
 .tl-os .secondary-button {
@@ -634,8 +636,8 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     padding: 32px;
     margin-bottom: 22px;
     background:
-        radial-gradient(circle at 90% 10%, rgba(20,184,166,.15), transparent 35%),
-        linear-gradient(135deg,#ffffff,#f3faf9);
+        radial-gradient(circle at 90% 10%, rgba(168,95,36,.15), transparent 35%),
+        linear-gradient(135deg,#ffffff,#F6EFE6);
     border: 1px solid var(--border);
 }
 
@@ -656,7 +658,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     gap: 7px;
     padding: 7px 11px;
     background: var(--accent-light);
-    color: #0f766e;
+    color: #8E4E1B;
     border-radius: 999px;
     font-size: 12px;
     font-weight: 650;
@@ -666,12 +668,12 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: #14b8a6;
-    box-shadow: 0 0 0 5px rgba(20,184,166,.12);
+    background: #C2783A;
+    box-shadow: 0 0 0 5px rgba(168,95,36,.12);
 }
 
 .tl-os .insight-card {
-    background: linear-gradient(135deg,#0f766e,#0d9488);
+    background: linear-gradient(135deg,#8E4E1B,#A85F24);
     color: white;
     border: 0;
 }
@@ -833,7 +835,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
 
 .tl-os .message.me {
     margin-left: auto;
-    background: var(--accent);
+    background: var(--accent-solid);
     color: white;
 }
 
@@ -889,7 +891,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
 }
 
 .tl-os .round-icon-btn.send {
-    background: var(--accent);
+    background: var(--accent-solid);
     color: white;
 }
 
@@ -939,7 +941,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
     place-items: center;
     color: white;
     font-weight: 750;
-    background: linear-gradient(135deg,#14b8a6,#6366f1);
+    background: linear-gradient(135deg,#C2783A,#E8A86B);
 }
 
 .tl-os .person-name {
@@ -1069,7 +1071,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
 }
 
 .tl-os .recording-card {
-    background: linear-gradient(145deg,#111827,#1f2937);
+    background: linear-gradient(145deg,#1B1D24,#1f2937);
     color: white;
     border-radius: 25px;
     padding: 35px;
@@ -1150,7 +1152,7 @@ html:not([data-theme="light"]) .tl-os .recording-card { background: linear-gradi
 
 .tl-os .bar {
     flex: 1;
-    background: linear-gradient(to top,#0d9488,#5eead4);
+    background: linear-gradient(to top,#A85F24,#F0C08F);
     border-radius: 7px 7px 2px 2px;
 }
 

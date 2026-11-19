@@ -18,30 +18,32 @@
    ============================================================ */
 :root {
   /* -- color: surfaces -- */
-  --wa-bg-app: #313338;
-  --wa-panel: #2b2d31;
-  --wa-hover: #35373c;
-  --wa-border: #1f2023;
-  --wa-chat-bg: #313338;
+  /* Brand "night" (the homepage's dark Work section, styles/brand.css). */
+  --wa-bg-app: #1B2531;
+  --wa-panel: #17202B;
+  --wa-hover: #223040;
+  --wa-border: #121922;
+  --wa-chat-bg: #1B2531;
 
   /* -- color: text -- */
-  --wa-text: #f2f3f5;
-  --wa-text-soft: #a0a2a7;
-  --wa-rail-icon: #96989d;
+  --wa-text: #F4EFE7;
+  --wa-text-soft: #B9C3CE;
+  --wa-rail-icon: #9AA6B2;
 
   /* -- color: brand -- matches the Flutter app's AppColors.accent/
      accentDark (lib/theme.dart) so the web app reads as the same product,
      not a differently-branded client. */
-  --wa-accent: #E8A565;
+  --wa-accent: #E8A86B;
   --wa-accent-dark: #D98E4A;
-  --wa-accent-solid: #D98E4A;
-  --wa-accent-solid-hover: #B06B2E;
+  /* brand amber: white text on it ~5:1 (the old #D98E4A was ~2.6:1) */
+  --wa-accent-solid: #A85F24;
+  --wa-accent-solid-hover: #8E4E1B;
   --wa-rail-icon-active: var(--wa-accent);
 
   /* AppColors.dmGradient (dark) -- the warm-wallpaper background the
      Flutter client's drawer and main-tab screens use. */
-  --wa-drawer-grad-1: #1A1410;
-  --wa-drawer-grad-2: #2B1B12;
+  --wa-drawer-grad-1: #141C25;
+  --wa-drawer-grad-2: #22303E;
 
   /* -- color: status -- */
   --wa-danger: #da373c;
@@ -62,15 +64,16 @@
 }
 
 :root[data-theme="light"] {
-  --wa-bg-app: #ffffff;
-  --wa-panel: #f2f3f5;
-  --wa-hover: #e3e5e8;
-  --wa-border: #e3e4e8;
-  --wa-chat-bg: #ffffff;
+  /* Brand paper/ink, same as the homepage (styles/brand.css). */
+  --wa-bg-app: #FBF8F3;
+  --wa-panel: #F3EDE4;
+  --wa-hover: #EBE3D7;
+  --wa-border: #E6DED2;
+  --wa-chat-bg: #FFFFFF;
 
-  --wa-text: #060607;
-  --wa-text-soft: #5c5e66;
-  --wa-rail-icon: #4e5058;
+  --wa-text: #1B1D24;
+  --wa-text-soft: #545B66;
+  --wa-rail-icon: #545B66;
 
   /* Brand amber, same as the homepage (styles/brand.css). The solid fill
      carries white text at ~5:1; the old #D98E4A was ~2.6:1. */
@@ -147,7 +150,8 @@
 
   /* Matches the Flutter app's appHeadlineFont (lib/theme.dart) -- used for
      the same spots it uses it for: screen titles/headlines, not body text. */
-  --font-display: "Archivo Black", -apple-system, BlinkMacSystemFont, sans-serif;
+  /* The homepage's heading face: Plus Jakarta Sans at its heaviest weight. */
+  --font-display: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
 /* ============================================================
@@ -536,7 +540,7 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
 .app-drawer-item.active svg { color: var(--wa-accent-dark); }
 .app-drawer-badge {
   margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px; border-radius: var(--radius-pill);
-  background: var(--wa-accent-dark); color: #fff; font-size: var(--text-2xs); font-weight: 700;
+  background: var(--wa-accent-solid); color: #fff; font-size: var(--text-2xs); font-weight: 700;
   display: flex; align-items: center; justify-content: center;
 }
 .app-drawer-section-title {
@@ -594,7 +598,7 @@ select:focus-visible, [tabindex]:focus-visible, .row:focus-visible {
   color: var(--wa-accent-dark); font-size: 10px; font-weight: 800; letter-spacing: 0.5px;
 }
 .home-rainbow-text {
-  background: linear-gradient(90deg, #FF3B30, #FF9500, #FFCC00, #34C759, #32ADE6, #5E5CE6, #AF52DE);
+  background: linear-gradient(90deg, var(--wa-accent-dark), var(--wa-accent)); /* brand amber, not a rainbow */
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .home-insight-headline { margin-top: 10px; font-size: 19px; font-weight: 800; line-height: 1.25; }

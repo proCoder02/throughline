@@ -5,7 +5,7 @@
   --m-text: var(--wa-text, #111b21);
   --m-soft: var(--wa-text-soft, #667781);
   --m-border: var(--wa-border, #e9edef);
-  --m-accent: #d98e4a;
+  --m-accent: var(--wa-accent-solid);
   --m-danger: #dc3545;
   min-height: 100%;
   background: var(--wa-chat-bg, var(--m-bg));
@@ -96,7 +96,7 @@
 }
 .meet-merge .meet-avatar { width: 84px; height: 84px; font-size: 30px; border: 3px solid var(--m-bg); position: relative; }
 .meet-merge .me { animation: meet-in-left 750ms cubic-bezier(.2, .8, .2, 1) both; margin-right: -18px; }
-.meet-merge .them { animation: meet-in-right 750ms cubic-bezier(.2, .8, .2, 1) both; background: #b06b2e; }
+.meet-merge .them { animation: meet-in-right 750ms cubic-bezier(.2, .8, .2, 1) both; background: var(--wa-accent-solid-hover); }
 @keyframes meet-in-left { from { transform: translateX(-90px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes meet-in-right { from { transform: translateX(90px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes meet-burst { 0% { transform: scale(.6); opacity: 0; } 55% { transform: scale(1.25); opacity: 1; } 100% { transform: scale(1); opacity: .7; } }

@@ -24,6 +24,7 @@ import ProjectsPage from './pages/ProjectsPage.jsx';
 import ProjectPage from './pages/ProjectPage.jsx';
 import TicketsPage from './pages/TicketsPage.jsx';
 import TicketPage from './pages/TicketPage.jsx';
+import BrandMark from '../../components/BrandMark.jsx';
 import './corporate.css';
 
 const NAV = [
@@ -121,7 +122,7 @@ export default function CorporateApp({ auth }) {
     <div className="corp">
       <aside className="corp-sidebar">
         <div className="corp-brand">
-          <span className="corp-brand-mark">T</span>
+          <span className="corp-brand-mark"><BrandMark size={30} /></span>
           <span className="corp-brand-text">Throughline</span>
         </div>
         <ModeSwitch current="corporate" />

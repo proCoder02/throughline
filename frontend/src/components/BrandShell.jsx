@@ -3,16 +3,12 @@
 // header and footer everywhere, so moving from the homepage into the app
 // never looks like a different site. Styles: styles/brand.css.
 import '../styles/brand.css';
+import BrandMark from './BrandMark.jsx';
 
 export function BrandLogo({ href = '/' }) {
   return (
     <a className="br-logo" href={href} aria-label="Throughline home">
-      <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
-        <rect width="32" height="32" rx="9" fill="#A85F24" />
-        <path d="M6 21c5 0 6-9 11-9s5 6 9 6" fill="none" stroke="#fff" strokeWidth="2.6" strokeLinecap="round" />
-        <circle cx="6" cy="21" r="2.4" fill="#fff" />
-        <circle cx="26" cy="18" r="2.4" fill="#fff" />
-      </svg>
+      <BrandMark size={28} tile />
       <span>Throughline</span>
     </a>
   );
