@@ -46,8 +46,8 @@ export default function PersonaOnboarding({ onComplete, onSkip }) {
       <div className="auth-card persona-card" role="dialog" aria-modal="true" aria-labelledby="persona-title">
         <h1 id="persona-title" style={{ fontSize: 24 }}>Personalize Throughline</h1>
         <p className="persona-why">
-          A few answers help Throughline word its replies, reminders and insights for you. Takes about a minute --
-          you can skip it and come back from Home any time.
+          A few answers help Throughline word its replies, reminders and insights for you. It takes about a minute,
+          and you can skip it and come back from Home any time.
         </p>
 
         <label className="auth-label" htmlFor="persona-age">Age</label>

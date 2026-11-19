@@ -3,25 +3,12 @@
 // does stays under /app; the buttons here hand off to its login/sign-up.
 import { useEffect } from 'react';
 import { getToken } from '../../api.js';
+import { BrandLogo as Logo } from '../../components/BrandShell.jsx';
 import './landing.css';
 
 const SIGNUP = '/app?signup=1';
 const LOGIN = '/app';
 const PILOT = '/app/corp?signup=1';
-
-function Logo() {
-  return (
-    <a className="lp-logo" href="/" aria-label="Throughline home">
-      <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
-        <rect width="32" height="32" rx="9" fill="var(--lp-accent)" />
-        <path d="M6 21c5 0 6-9 11-9s5 6 9 6" fill="none" stroke="#fff" strokeWidth="2.6" strokeLinecap="round" />
-        <circle cx="6" cy="21" r="2.4" fill="#fff" />
-        <circle cx="26" cy="18" r="2.4" fill="#fff" />
-      </svg>
-      <span>Throughline</span>
-    </a>
-  );
-}
 
 function Check() {
   return (

@@ -1,23 +1,7 @@
 /* Public homepage. Everything is scoped under .lp so none of it reaches the
    app at /app. Light page with one dark band (Work) and an accent close. */
+/* Brand tokens (--lp-*) come from styles/brand.css. */
 .lp {
-  --lp-ink: #1B1D24;
-  --lp-muted: #545B66;
-  --lp-paper: #FBF8F3;
-  --lp-paper2: #F3EDE4;
-  --lp-card: #FFFFFF;
-  --lp-line: #E6DED2;
-  --lp-accent: #A85F24;
-  --lp-accent-ink: #8E4E1B;
-  --lp-accent-soft: #F6E7D8;
-  --lp-night: #17202B;
-  --lp-night2: #202C39;
-  --lp-night-line: #34424F;
-  --lp-snow: #F4EFE7;
-  --lp-mist: #B9C3CE;
-  --lp-amber: #E8A86B;
-  --lp-done: #1F7A4D;
-  --lp-radius: 18px;
   min-height: 100%;
   background: var(--lp-paper);
   color: var(--lp-ink);
@@ -40,7 +24,6 @@
 .lp-nav { position: sticky; top: 0; z-index: 20; background: rgba(251, 248, 243, 0.88); backdrop-filter: saturate(160%) blur(12px);
   -webkit-backdrop-filter: saturate(160%) blur(12px); border-bottom: 1px solid var(--lp-line); }
 .lp-nav-row { display: flex; align-items: center; gap: 24px; height: 68px; }
-.lp-logo { display: inline-flex; align-items: center; gap: 10px; font-weight: 800; font-size: 19px; letter-spacing: -0.01em; }
 .lp-nav-links { display: flex; gap: 26px; margin-left: 12px; font-size: 15px; font-weight: 600; color: var(--lp-muted); }
 .lp-nav-links a:hover { color: var(--lp-ink); }
 .lp-nav-cta { margin-left: auto; display: flex; gap: 10px; }

@@ -72,10 +72,12 @@
   --wa-text-soft: #5c5e66;
   --wa-rail-icon: #4e5058;
 
-  --wa-accent: #B06B2E;
-  --wa-accent-dark: #8A5423;
-  --wa-accent-solid: #D98E4A;
-  --wa-accent-solid-hover: #B06B2E;
+  /* Brand amber, same as the homepage (styles/brand.css). The solid fill
+     carries white text at ~5:1; the old #D98E4A was ~2.6:1. */
+  --wa-accent: #A85F24;
+  --wa-accent-dark: #8E4E1B;
+  --wa-accent-solid: #A85F24;
+  --wa-accent-solid-hover: #8E4E1B;
 
   /* AppColors.dmGradient (light) -- see the dark block's identical comment. */
   --wa-drawer-grad-1: #FDF8F1;

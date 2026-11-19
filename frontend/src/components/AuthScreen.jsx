@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { post } from '../api.js';
 import { EyeIcon, EyeOffIcon } from '../icons.jsx';
+import BrandShell from './BrandShell.jsx';
 
 function PasswordField({ id, value, onChange, autoComplete, label = 'Password' }) {
   const [show, setShow] = useState(false);
@@ -85,17 +86,21 @@ export default function AuthScreen({ auth }) {
   const titles = {
     login: 'Log in', register: 'Create your account', forgot: 'Reset your password', reset: 'Choose a new password',
   };
+  const hints = {
+    login: 'Welcome back. Pick up where you left off.', register: 'Free during beta. No card needed.',
+    forgot: '', reset: '',
+  };
   const buttons = {
     login: busy ? 'Logging in…' : 'Log in', register: busy ? 'Creating…' : 'Create account',
     forgot: busy ? 'Sending…' : 'Email me a reset link', reset: busy ? 'Saving…' : 'Save new password',
   };
 
   return (
+    <BrandShell headerLink={{ href: '/', label: 'Back to home' }}>
     <main className="auth-screen">
       <div className="auth-card">
-        <h1>Throughline</h1>
-        <p className="hint">Listens once. Remembers everything.</p>
-        <h2 style={{ fontSize: 16, margin: '0 0 4px' }}>{titles[mode]}</h2>
+        <h1>{titles[mode]}</h1>
+        {hints[mode] && <p className="hint">{hints[mode]}</p>}
 
         <form onSubmit={submit} noValidate>
           {(mode === 'login' || mode === 'register') && (
@@ -174,11 +179,8 @@ export default function AuthScreen({ auth }) {
             <button type="button" className="link-button" onClick={() => { if (mode === 'reset') dropResetToken(); switchTo('login'); }}>Back to log in</button>
           )}
         </div>
-        <div className="legal-links" style={{ justifyContent: 'center' }}>
-          <a href="/privacy" target="_blank" rel="noopener">Privacy</a>
-          <a href="/terms" target="_blank" rel="noopener">Terms</a>
-        </div>
       </div>
     </main>
+    </BrandShell>
   );
 }

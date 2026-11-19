@@ -1,0 +1,126 @@
+/* Throughline brand: the one palette, type and button style shared by the
+   homepage (.lp), the entry screens (.br-page: log in / sign up, the
+   Personal-Corporate chooser, the first-run setup) and, as plain values,
+   the server-rendered legal pages (legal/templates/legal/base.html --
+   keep those values in step with these).
+
+   Entry screens are always light, like the homepage, whatever theme the
+   app itself is set to: .br-page remaps the app's --wa-* tokens to brand
+   values, so the existing form/button styles inside pick them up. */
+.lp, .br-page {
+  --lp-ink: #1B1D24;
+  --lp-muted: #545B66;
+  --lp-paper: #FBF8F3;
+  --lp-paper2: #F3EDE4;
+  --lp-card: #FFFFFF;
+  --lp-line: #E6DED2;
+  --lp-accent: #A85F24;
+  --lp-accent-ink: #8E4E1B;
+  --lp-accent-soft: #F6E7D8;
+  --lp-night: #17202B;
+  --lp-night2: #202C39;
+  --lp-night-line: #34424F;
+  --lp-snow: #F4EFE7;
+  --lp-mist: #B9C3CE;
+  --lp-amber: #E8A86B;
+  --lp-done: #1F7A4D;
+  --lp-radius: 18px;
+  --lp-font: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+/* ---- the brand mark, used in every header and footer ---- */
+.br-logo { display: inline-flex; align-items: center; gap: 10px; font-weight: 800; font-size: 19px; letter-spacing: -0.01em;
+  color: var(--lp-ink); text-decoration: none; }
+.br-logo:focus-visible { outline: 3px solid var(--lp-amber); outline-offset: 3px; border-radius: 10px; }
+
+/* ---- entry-screen shell: header, centred content, footer ---- */
+.br-page {
+  --wa-bg-app: var(--lp-paper);
+  --wa-panel: var(--lp-card);
+  --wa-hover: var(--lp-paper2);
+  --wa-border: var(--lp-line);
+  --wa-text: var(--lp-ink);
+  --wa-text-soft: var(--lp-muted);
+  --wa-accent: var(--lp-accent);
+  --wa-accent-dark: var(--lp-accent-ink);
+  --wa-accent-solid: var(--lp-accent);
+  --wa-accent-solid-hover: var(--lp-accent-ink);
+  color-scheme: light;
+  min-height: 100vh; min-height: 100dvh;
+  /* fills its slot even inside the app's row layout (the chooser lives there) */
+  flex: 1 1 auto; align-self: stretch; width: 100%; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--lp-paper); color: var(--lp-ink);
+  font-family: var(--lp-font);
+}
+.br-header { border-bottom: 1px solid var(--lp-line); background: rgba(251, 248, 243, 0.92); }
+.br-header-row, .br-footer-row { max-width: 1160px; margin: 0 auto; padding: 0 24px; display: flex; align-items: center; gap: 16px; }
+.br-header-row { height: 68px; }
+.br-header-link { margin-left: auto; font-size: 15px; font-weight: 600; color: var(--lp-muted); text-decoration: none; }
+.br-header-link:hover { color: var(--lp-ink); }
+.br-main { flex: 1; display: flex; flex-direction: column; }
+.br-footer { border-top: 1px solid var(--lp-line); padding: 24px 0 32px; }
+.br-footer-row { flex-wrap: wrap; gap: 20px; }
+.br-footer-links { display: flex; gap: 20px; font-size: 15px; font-weight: 600; }
+.br-footer-links a { color: var(--lp-muted); text-decoration: none; }
+.br-footer-links a:hover { color: var(--lp-ink); }
+.br-footer-copy { margin: 0 0 0 auto; font-size: 14px; color: var(--lp-muted); }
+
+/* ---- log in / sign up / reset ---- */
+.br-page .auth-screen { flex: 1; height: auto; min-height: 0; padding: 56px 16px 64px; background: transparent; align-items: flex-start; }
+.br-page .auth-card { width: 420px; max-width: 100%; padding: 36px 32px; background: var(--lp-card); border: 1px solid var(--lp-line);
+  border-radius: 22px; box-shadow: 0 1px 2px rgba(27, 29, 36, 0.04), 0 24px 48px -32px rgba(27, 29, 36, 0.35); }
+.br-page .auth-card h1 { font-family: var(--lp-font); font-size: 30px; line-height: 1.15; font-weight: 800; letter-spacing: -0.02em;
+  color: var(--lp-ink); margin: 0 0 6px; }
+.br-page .auth-card p.hint, .br-page .persona-why { font-size: 15px; color: var(--lp-muted); margin: 0 0 18px; }
+.br-page .auth-label { font-size: 14px; font-weight: 700; margin-top: 16px; }
+.br-page .field { height: 48px; padding: 0 14px; border-radius: 12px; border: 1.5px solid var(--lp-line); background: var(--lp-card); font-size: 16px; }
+.br-page select.field { padding-right: 10px; }
+.br-page .field:focus { border-color: var(--lp-accent); box-shadow: 0 0 0 4px var(--lp-accent-soft); }
+.br-page .auth-pw .field { padding-right: 48px; }
+.br-page .btn { height: 50px; border-radius: 12px; font-size: 16px; font-weight: 700; background: var(--lp-accent); color: #fff; }
+.br-page .btn:hover { background: var(--lp-accent-ink); }
+.br-page .btn.secondary { background: var(--lp-card); color: var(--lp-ink); border: 1.5px solid var(--lp-line); }
+.br-page .btn.secondary:hover { border-color: var(--lp-accent); background: var(--lp-card); }
+.br-page .btn:focus-visible, .br-page .link-button:focus-visible { outline: 3px solid var(--lp-amber); outline-offset: 3px; }
+.br-page .link-button { color: var(--lp-accent-ink); font-weight: 700; font-size: 15px; }
+.br-page .link-button:hover { color: var(--lp-accent); }
+.br-page .auth-switch { color: var(--lp-muted); font-size: 15px; margin-top: 20px; }
+.br-page .auth-field-hint { font-size: 13px; color: var(--lp-muted); }
+.br-page .consent-check { font-size: 14px; font-weight: 500; color: var(--lp-muted); }
+.br-page .consent-check a { color: var(--lp-accent-ink); font-weight: 700; }
+.br-page .auth-success { color: var(--lp-done); font-weight: 600; }
+
+/* ---- first-run setup (shown over the app, same look) ---- */
+.br-page .persona-card { width: 520px; max-height: none; overflow: visible; }
+.br-page .persona-chip { border: 1.5px solid var(--lp-line); background: var(--lp-card); padding: 7px 14px; font-weight: 600; }
+.br-page .persona-chip.active { border-color: var(--lp-accent); background: var(--lp-accent-soft); color: var(--lp-accent-ink); }
+.br-page .persona-chip input { accent-color: var(--lp-accent); }
+.br-page .persona-actions { gap: 12px; margin-top: 24px; }
+
+/* ---- Personal / Corporate chooser ---- */
+.br-page .mode-chooser { flex: 1; min-height: 0; background: transparent; padding: 64px 16px 72px; align-items: flex-start; }
+.br-page .mode-chooser-inner { max-width: 760px; }
+.br-page .mode-chooser-eyebrow { font-size: 13px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; color: var(--lp-accent);
+  text-align: center; margin: 0 0 12px; }
+.br-page .mode-chooser h1 { font-family: var(--lp-font); font-size: clamp(28px, 4vw, 40px); line-height: 1.12; font-weight: 800; letter-spacing: -0.02em; }
+.br-page .mode-chooser-sub { font-size: 17px; color: var(--lp-muted); margin-bottom: 36px; }
+.br-page .mode-chooser-options { gap: 20px; }
+.br-page .mode-card { padding: 28px; border-radius: 22px; background: var(--lp-card); border: 1.5px solid var(--lp-line); gap: 10px;
+  box-shadow: 0 1px 2px rgba(27, 29, 36, 0.04); }
+.br-page .mode-card:hover { border-color: var(--lp-accent); box-shadow: 0 18px 40px -28px rgba(168, 95, 36, 0.55); }
+.br-page .mode-card.current { border: 2px solid var(--lp-accent); }
+.br-page .mode-card-icon { width: 48px; height: 48px; border-radius: 14px; background: var(--lp-accent-soft); color: var(--lp-accent-ink); }
+.br-page .mode-card-title { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; }
+.br-page .mode-card-text { font-size: 15.5px; color: var(--lp-muted); }
+.br-page .mode-card-cta { margin-top: 8px; font-size: 15px; font-weight: 700; color: var(--lp-accent-ink); }
+.br-page .mode-card-badge { color: var(--lp-accent-ink); background: var(--lp-accent-soft); border: 0; padding: 3px 10px; font-weight: 700; font-size: 12px; }
+
+@media (max-width: 640px) {
+  .br-header-row, .br-footer-row { padding: 0 16px; }
+  .br-page .auth-screen { padding: 28px 16px 40px; }
+  .br-page .auth-card { padding: 28px 20px; border-radius: 18px; }
+  .br-page .auth-card h1 { font-size: 26px; }
+  .br-page .mode-chooser { padding: 36px 16px 48px; }
+  .br-footer-copy { margin-left: 0; width: 100%; }
+}

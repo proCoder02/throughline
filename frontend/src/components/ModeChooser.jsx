@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { BuildingIcon, HomeIcon } from '../icons.jsx';
 import { fetchMode } from '../lib/mode.js';
 import { useSwitchMode } from './ModeSwitch.jsx';
+import BrandShell from './BrandShell.jsx';
 import '../styles/mode.css';
 
 const OPTIONS = [
@@ -28,8 +29,10 @@ export default function ModeChooser({ username }) {
   useEffect(() => { fetchMode().then(setCurrent).catch(() => {}); }, []);
 
   return (
+    <BrandShell>
     <main className="mode-chooser">
       <div className="mode-chooser-inner">
+        <p className="mode-chooser-eyebrow">Welcome to Throughline</p>
         <h1>How do you want to use Throughline{username ? `, ${username}` : ''}?</h1>
         <p className="mode-chooser-sub">You can switch any time from the menu.</p>
         <div className="mode-chooser-options">
@@ -39,11 +42,13 @@ export default function ModeChooser({ username }) {
               <span className="mode-card-icon" aria-hidden="true"><Icon /></span>
               <span className="mode-card-title">{title}</span>
               <span className="mode-card-text">{text}</span>
+              <span className="mode-card-cta" aria-hidden="true">Continue with {title} →</span>
               {current === mode && <span className="mode-card-badge">Last used</span>}
             </button>
           ))}
         </div>
       </div>
     </main>
+    </BrandShell>
   );
 }

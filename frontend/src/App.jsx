@@ -10,6 +10,7 @@ import { showToast } from './lib/notify.js';
 import { refreshMailStatus, MAIL_PROVIDERS, PROVIDER_KEYS } from './lib/mail.js';
 import AuthScreen from './components/AuthScreen.jsx';
 import PersonaOnboarding from './components/PersonaOnboarding.jsx';
+import BrandShell from './components/BrandShell.jsx';
 import CallOverlay from './components/CallOverlay.jsx';
 import NotificationHost from './components/NotificationHost.jsx';
 import AppDrawer from './components/AppDrawer.jsx';
@@ -262,10 +263,12 @@ export default function App() {
       <ConsentHost key={userId} onLogout={auth.logout} />
       {personaOpen && (
         <div className="persona-overlay">
-          <PersonaOnboarding
-            onComplete={() => { setPersonaCompleted(true); setPersonaOpen(false); }}
-            onSkip={skipPersona}
-          />
+          <BrandShell logoHref="/app">
+            <PersonaOnboarding
+              onComplete={() => { setPersonaCompleted(true); setPersonaOpen(false); }}
+              onSkip={skipPersona}
+            />
+          </BrandShell>
         </div>
       )}
     </div>
