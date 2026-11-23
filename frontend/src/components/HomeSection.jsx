@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiJson, post } from '../api.js';
+import PayOwedCard from './PayOwedCard.jsx';
 import {
   SunIcon, BoltIcon, ChevronRightIcon, BellIcon, SparkleIcon, PlusIcon,
   ChatIcon, MicIcon, TaskIcon, FriendIcon, AttachIcon, ProfileIcon, SendIcon,
@@ -125,6 +126,8 @@ export default function HomeSection({ username, onOpenConversation, onOpenGlobal
         <RemindersCard loaded={loaded} tasks={openTasks || []} onSeeAll={() => onNavigate('/app/tasks')} onComplete={completeTask} />
         <RecentActivityCard loaded={loaded} conversations={conversations || []} onOpen={onOpenConversation} />
       </div>
+
+      <PayOwedCard compact />
 
       <WeeklyInsightCard insights={weeklyInsights} />
 

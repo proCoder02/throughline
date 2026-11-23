@@ -9267,6 +9267,19 @@ except Exception as e:
     print(f"[meet] not registered: {e!r}")
 
 
+# Pay memory (pay/) -- "You owe" from conversations and payee memory for the
+# Pay screen. Self-contained; its tables live in their own pay schema.
+try:
+    from pay import create_pay_blueprint
+    app.register_blueprint(create_pay_blueprint(
+        get_db=get_db, dict_cursor=dict_cursor, login_required=login_required, current_user_id=current_user_id,
+        call_llm=call_llm, normalize_payment_method=_normalize_payment_method,
+    ))
+    print("[pay] enabled")
+except Exception as e:
+    print(f"[pay] not registered: {e!r}")
+
+
 # Throughline Corporate (corporate/) -- organisations, departments, teams,
 # invitations. Self-contained, off unless CORPORATE_ENABLED=true.
 try:

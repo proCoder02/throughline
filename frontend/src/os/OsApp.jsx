@@ -10,6 +10,7 @@ import PhotoViewer from '../components/PhotoViewer.jsx';
 import MailSettingsCard from '../components/MailSettingsCard.jsx';
 import ModeSwitch from '../components/ModeSwitch.jsx';
 import BrandMark from '../components/BrandMark.jsx';
+import PayOwedCard from '../components/PayOwedCard.jsx';
 import AssistantChat from '../components/assistant/AssistantChat.jsx';
 import DeleteAccountCard, { LegalLinks } from '../components/DeleteAccountCard.jsx';
 import EmailSourceLink from '../components/EmailSourceLink.jsx';
@@ -703,6 +704,8 @@ export default function OsApp({ auth, notify, call, theme, toggleTheme, personaP
                   )}
                 </div>
               </div>
+
+              <PayOwedCard />
 
               <div className="grid-4">
                 <div className="card">

@@ -1,0 +1,39 @@
+/* "You owe" card (components/PayOwedCard.jsx): brand theme tokens, so it
+   matches light and dark on the desktop and phone Home alike. */
+.pay-card {
+  background: var(--wa-chat-bg, var(--wa-panel)); color: var(--wa-text);
+  border: 1px solid var(--wa-border); border-radius: 18px; padding: 18px 20px; margin: 0 0 20px;
+}
+.pay-card.compact { margin: 16px 0 0; padding: 14px 16px; background: var(--wa-panel); }
+.pay-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.pay-head h2 { font-size: 18px; font-weight: 700; margin: 0; }
+.pay-head h3 { font-size: 15px; font-weight: 700; margin: 14px 0 0; }
+.pay-sub { font-size: 13px; color: var(--wa-text-soft); }
+.pay-list, .pay-people { list-style: none; margin: 0; padding: 0; }
+.pay-item { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 0; border-top: 1px solid var(--wa-border); }
+.pay-item:first-child { border-top: 0; }
+.pay-main { flex: 1 1 220px; min-width: 0; }
+.pay-title { display: block; font-weight: 700; font-size: 15px; }
+.pay-meta { display: block; font-size: 13px; color: var(--wa-text-soft); margin-top: 2px; overflow-wrap: anywhere; }
+.pay-amount { font-weight: 800; font-size: 17px; white-space: nowrap; }
+.pay-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pay-btn {
+  display: inline-flex; align-items: center; justify-content: center; height: 36px; padding: 0 14px; border-radius: 10px;
+  font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; text-decoration: none;
+  background: var(--wa-hover); color: var(--wa-text); border: 1px solid var(--wa-border);
+}
+.pay-btn.primary { background: var(--wa-accent-solid); color: #fff; border-color: transparent; }
+.pay-btn.primary:hover { background: var(--wa-accent-solid-hover); }
+.pay-btn:disabled { opacity: .6; cursor: progress; }
+.pay-btn:focus-visible, .pay-link:focus-visible { outline: 2px solid var(--wa-accent); outline-offset: 2px; }
+.pay-link { background: none; border: 0; padding: 4px 2px; font: inherit; font-size: 13px; font-weight: 600; color: var(--wa-text-soft); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.pay-link:hover { color: var(--wa-text); }
+.pay-note { font-size: 13px; color: var(--wa-text-soft); margin: 10px 0 0; }
+.pay-people li { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
+.pay-avatar { width: 32px; height: 32px; flex: none; border-radius: 50%; display: grid; place-items: center; font-weight: 700;
+  background: color-mix(in srgb, var(--wa-accent) 18%, transparent); color: var(--wa-accent-dark); }
+.pay-person { flex: 1; min-width: 0; }
+@media (max-width: 640px) {
+  .pay-actions { width: 100%; }
+  .pay-amount { margin-left: auto; }
+}
